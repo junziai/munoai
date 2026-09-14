@@ -1,0 +1,7713 @@
+//! TD-PSOLA — pitch shift with the formant envelope preserved BY CONSTRUCTION.
+//!
+//! Why this exists (and why it is written the way it is): on 2026-07-26 we deleted a Rust PSOLA
+//! because "PSOLA sounds dirty", and the gate that guarded it (`psola_ab.rs`) **only measured
+//! pitch**. The repo already recorded, at that time, that praat's TD-PSOLA is transparent on our
+//! own material (ΔHNR −0.12..+2.68 dB) while *our* implementation lost 5.15–8.57 dB — i.e. the
+//! thing that lost was our implementation, not the algorithm. The old file's own comment (see
+//! `git show b231e4e^:src-tauri/src/inference/vocal_range.rs`, the paragraph above the engine
+//! choice) is even more damning: it measured **the same 5–9 dB loss at ratio 1.000**, no shift at
+//! all — the damage was a flat tax on passing through the resynthesis. A correct TD-PSOLA at
+//! ratio 1.0 is the IDENTITY, and that is the cheapest, least-fakeable gate this module has.
+//!
+//! Every design decision below was made by a gate going red, not by taste (S146):
+//!
+//! 1. **Target pulses come from the analysis marks, not from an independent phase integration.**
+//!    Treat the marks as a phase function Φ(m_k) = k; synthesis mark `s_j = Φ⁻¹(j/r)`, source mark
+//!    `k = round(j/r)`. Copy/discard then needs no branch, |s_j − m_k| ≤ half a period always, the
+//!    time axis is the identity (so the exact-length contract is structural, not patched
+//!    afterwards), and at r = 1 it degenerates to `s_j = m_j` exactly. Integrating a pitch tier
+//!    instead leaves every grain displaced by up to half a period even at r = 1 (measured: the
+//!    identity gate went red at max |Δ| = 1.05).
+//! 2. **Marks are found on the DC-removed signal; grains are cut from the ORIGINAL signal.**
+//!    Mixing the two shifts the whole output by the input's DC (identity gate: max == median ==
+//!    2.277e-3 == mean(x)).
+//! 3. **No mark is ever rejected.** praat drops low-correlation pulses because its PointProcess is
+//!    a standalone object; our Φ(m_k) = k needs *every* period to carry a mark — one missing mark
+//!    makes that stretch synthesize at double the period. Measured gap rate 1.1%, and turning
+//!    rejection on breaks the identity gate (2598 samples over tolerance).
+//! 4. **The bell width is the TARGET neighbour distance, clipped by the SOURCE neighbour distance.**
+//!    Clipping is what actually makes downward shifts change the pitch: without it a down-shifted
+//!    grain spans two source periods and the overlap-add reproduces the input. Measured at −12 st:
+//!    output bit-identical to input, while the envelope / correlation / HNR rulers all read
+//!    "perfect" — only the pitch ruler (the "necessary but not sufficient" one) caught it at
+//!    +1200 cents. Clipping costs exact COLA on the way down; that cost is *reported*
+//!    (`PsolaDiagnostics::cola_gap_frac`) rather than hidden.
+//! 5. **Dry signal (copyFlat) is only ever mixed in OUTSIDE the first..last target pulse.** Inside
+//!    that span a window-sum shortfall is a defect; covering it with the un-shifted input is how
+//!    the 2026-07 implementation produced beating at syllable edges.
+//! 6. **The correlation window is 3 periods** (praat's own source uses 1). Measured on real
+//!    material at +6 st: 1 period ⇒ ΔHNR −3.03, 2 ⇒ −1.77, **3 ⇒ −1.67**, 4 ⇒ −2.41, 6 ⇒ −2.54,
+//!    against a ceiling of −1.66 measured by feeding praat's own pulse train into this same
+//!    synthesizer. Three periods reaches that ceiling.
+//!
+//! Reference readings on the S146 material (炉心融解 bars 28-44 × 东雪莲, the two rescued phrases;
+//! `scripts/range_rulers/`): at +6 st this implementation reads envelope shift +0.50 st /
+//! ΔHNR −1.66 dB against praat's +0.30 / −1.44; at −6, −12 and +12 it is *better* than praat on
+//! ΔHNR. ⛔ praat is NOT a valid reference above about +6 st — its pitch ceiling (1400 Hz) is
+//! breached and its own arm degrades (envelope +2.70, peak correlation 0.661 at +12).
+
+/// What the shift could not do cleanly, reported instead of hidden.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PsolaDiagnostics {
+    /// S162 —— 缓冲区末尾被淡化掉的**裸透传**样本数(0 = 这一刀没触发)。
+    /// ⛔ 读数无条件存在,好让「它有没有真的动手」在日志里可查(S152 那条规矩)。
+    pub tail_fade_samples: usize,
+    /// Voiced islands that carried at least three marks.
+    pub islands: usize,
+    /// Total analysis marks placed.
+    pub marks: usize,
+    /// S159 —— `voiced_islands` 划出来的**候选**岛数(窗过滤**之前**)。
+    ///
+    /// ⛔ 它与 [`islands`](Self::islands) 不是同一个数,而这个区别是**承重**的:
+    /// `islands == 0` 今天让 `vocal_range::apply_inverse` 整条渲染响亮报错
+    /// (`RANGE_INVERSE_NO_PITCH`)。加了窗之后「窗切不到任何岛」也会让 `islands` 变 0,
+    /// 而那**不是**错误 —— 那一遍本来就没东西要救。⇒ 报错的判据必须改看这个数:
+    /// `islands_seen == 0` 才是「真的没有音高」。
+    /// (S129 铁律:「跑不起来」与「被测的东西不对」不许报成同一种红。)
+    pub islands_seen: usize,
+    /// S159 —— 被窗过滤掉的岛数。`keep` 为空(= 整条缓冲)时恒为 0。
+    ///
+    /// ⛔ 它存在的唯一理由是 S147 那次「收益静默减半」:一个**永远不跳岛**的窗谓词
+    /// 会产出逐位相同的音频,与「窗根本没接上」不可分辨。⇒ 这个数必须打进生产日志。
+    pub islands_skipped: usize,
+    /// S159 —— `keep` 覆盖的样本占整条缓冲的比例;`keep` 为空时 1.0。这一刀能省多少的分母。
+    pub keep_frac: f32,
+    /// S159 —— 窗被**忽略**了(见 `psola_shift_win` 的前置条件:LP-PSOLA / WSOLA /
+    /// 包络复原任一开着时,跳岛在数学上不成立 ⇒ 整条缓冲照跑)。
+    ///
+    /// ⛔ 为什么是降级不是报错:那三个旋钮是 A/B 臂用的,拿它们渲一条臂的人要的是**正确的音频**,
+    /// 不是一条红。但降级必须**响**:静默降级 = 收益静默归零而一切读数正常。
+    pub keep_ignored: bool,
+    /// S159 —— 去次声那把刀的**总闸余量**,`10·log10(e_out / e_in)` dB。刀关着时 0.0。
+    ///
+    /// ⛔ 这是「窗内逆变换」唯一一条**不是结构性**的耦合的眼睛。那个闸(`e_out >= e_in`)是在
+    /// **全缓冲**累加之后算的:被跳掉的岛对**修正量**的贡献恒为 0(那一段 `out ≡ x` ⇒ `fo ≡ fi`),
+    /// 但两个能量和是「和的模」而不是「模的和」,岛与岛的支撑重叠时交叉项原则上能把它推翻面 ——
+    /// 而翻面会让窗**内**的低频修正整块开/关。
+    /// ⇒ 余量打出来,就能一眼看出「离翻面还有多远」;写在 doc 里而没有读数 = 没被记录(S148 血训)。
+    pub infrasonic_gate_db: f32,
+    /// Fraction of covered samples whose overlap-add window sum fell below 0.9. Structurally ~0
+    /// when shifting up; on the way down the source-width clipping (see 4 above) makes it large —
+    /// that is the amplitude ripple, and it is the number to watch when a down-shift sounds wobbly.
+    pub cola_gap_frac: f32,
+    /// Median window sum over the covered span (1.0 = exact COLA).
+    pub cola_w_median: f32,
+    /// Window-sum p01 / p99 over the covered span, and the fraction above 1.05.
+    ///
+    /// ⛔ Why these exist: the three fields above were all computed from a **clamped** window sum,
+    /// so `cola_w_median` was structurally ≤ 1.000 and the overlap SURPLUS — the thing that only
+    /// appears when shifting UP, i.e. the production direction — could not be read at all. A
+    /// diagnostic that cannot express the failure it is watching for is an empty criterion
+    /// (S129). The clamp is still applied where it is *used* (the dry-fill gain below); only the
+    /// statistics moved to the raw sum, so the audio is bit-identical.
+    pub cola_w_p01: f32,
+    pub cola_w_p99: f32,
+    pub cola_over_frac: f32,
+    /// S159zj —— **岛边的干填料台阶**:`1 − clamp(wsum/W̄, 0, 1)` 在每条浊音岛边界上的
+    /// p50 / p90,以及岛边总条数(`= 2 × islands`)。
+    ///
+    /// ## ⛔ 它盯的缺陷
+    /// [`covered`] 的边界钉在**第一颗 / 最后一颗合成标记**上(`c0` / `c1`),而窗和要再过
+    /// 约 `win_periods × T_src` 才爬满。于是合成那一段的分支在 `i = c0` 上**突然把干填料
+    /// 整项丢掉**:岛外 `out = acc + (1−w)·carry`,岛内 `out = acc` ⇒ **每条岛边一个
+    /// 单样本宽带阶跃**,幅度就是这里报的这个数。
+    ///
+    /// ⭐ 它是 S156 翻 `WIN_PERIODS_DEFAULT`(0 → 1.0)带进来的:`win_periods == 0` 时
+    /// `W̄ = 1` 且岛边第一颗钟形窗自己就到 1 ⇒ 这个数**解析地恒为 0**。
+    ///
+    /// ## ⛔ 为什么现有的 `cola_*` 看不见它
+    /// 它们是**整遍聚合**的分位数,而岛边样本只占覆盖区的 `2×(1…2 ms)/岛长`。
+    /// 炉心融解那种长音(每岛几百颗标记)上被稀释到读不出来 —— 一个够不着症状轴的读数
+    /// 就是一条空判据(S129)。⇒ 这两个数**逐岛边**取,不受岛长稀释。
+    ///
+    /// ⚠ [`Self::islands`] 统计的是**被窗保留的那批岛**,所以 `keep` 窄的那几遍里这两个数
+    /// 变小是「少做了工序」不是「变好了」。
+    pub edge_step_p50: f32,
+    pub edge_step_p90: f32,
+    pub island_edges: usize,
+    /// RMS(样本) of the sub-sample transport residual **that was discarded**.
+    /// ⭐ 0.0000 at ratio 1.0 · ≈0.41 for whole-sample transport at any other ratio ·
+    /// 0 once `frac_transport` carries it. See `add_bell`.
+    pub transport_residual_rms: f32,
+    /// S150 — how many analysis marks the phase lock actually moved.
+    /// ⛔ Same reason as `wsola_moved`: "the arm is on" and "the arm did something" are two
+    /// different facts, and only the second one is visible in the audio.
+    pub marks_locked: usize,
+    /// S148 — how many grains the WSOLA search actually moved off `src[k]`.
+    /// ⛔ It is the difference between "the arm is on" and "the arm did something": a search that
+    /// never moves a grain produces byte-identical audio, which is indistinguishable from the arm
+    /// being off unless this number is printed. (S147 shipped a change whose benefit was silently
+    /// halved and the only thing that exposed it was a count in a log line.)
+    pub wsola_moved: usize,
+    /// S151 — the fraction of the analysed source span that **no grain ever reads**.
+    ///
+    /// Each grain reads `[s_pos − lw, s_pos + rw)`, and on an UP-shift both half-widths collapse
+    /// to the *target* spacing (`:1027-1028` takes `min(target, source)`), i.e. `T_src / ratio`.
+    /// So the read windows around consecutive source marks stop touching the moment
+    /// **`ratio > 2`, which is exactly `|shift| > 12` semitones**, and from there a slice of every
+    /// pitch period — the low-energy middle, i.e. the formant ring-down, since the locked marks
+    /// sit on the energy peaks — is simply never used. Computed from the real mark train
+    /// (61523 marks, goose donor −7): +7 → 0.00 %, +11 → 0.00 %, **+12 → 0.00 %**, +13 → 4.9 %,
+    /// **+14 → 10.2 %**, +16 → 20.0 %.
+    ///
+    /// ⛔ Why it had to become a field rather than a note: **nothing else can see this.**
+    /// `cola_gap_frac` / `cola_w_*` are computed in the OUTPUT domain where the half-windows equal
+    /// the target spacing by construction (measured 0.00 % / 1.000 at every shift from +7 to +16);
+    /// the in-note envelope-depth ruler reads p50 −0.01 dB at +14; the per-note octave gate reads
+    /// 0.00 % with its positive control at 100 %; and every mark-layer ruler is **ratio-invariant**
+    /// by construction — `analysis_marks` and `lock_phase` do not take `ratio` at all. S148 and
+    /// S150 calibrated this engine only over `|shift| ≤ 7`; the user's 2026-08-18 run reached −14.
+    /// ⚠ It is a coverage number, not an audibility one — there is no ear datum on this axis yet.
+    pub src_uncovered_frac: f32,
+    /// S152 — the share of the OUTPUT's energy that sits below ~50 Hz, **before** any removal.
+    ///
+    /// ⭐ This process **manufactures** it. The donor going in carries 0.001 % there; the output
+    /// carries, per note (goose +7 × akiko, 174 notes with ≥0.3 s of body, median):
+    /// −9 st (ratio 1.68) **10.8 %** · −12 (2.00) **25.5 %** · −14 (2.24) **33.7 %**
+    /// (p90 39.5 / 64.6 / 72.1 %). On the production render the notes that went through a rescue
+    /// group read p50 0.558 % against p50 0.002 % for the ones that did not — a 279× separation.
+    ///
+    /// **Mechanism** — `the_manufactured_baseline_is_the_narrowed_grain_window_s_own_mean`:
+    /// on an up-shift both half-widths collapse to `T_src / ratio` (`:1027-1028` takes the min of
+    /// the target and source spacings), so every grain reads a window **narrower than one period,
+    /// centred on the mark** — and S150's phase lock puts the marks on the energy peaks. The
+    /// bell-weighted mean of a sub-period window centred on a peak is not zero; `wsum ≈ 1` then
+    /// lays that same mean down under every grain. The gate predicts the baseline from that window
+    /// alone and matches the measured value within 3× at +4/+8/+12/+16 st.
+    ///
+    /// ⛔ **A wrong mechanism was written here first and the gate killed it on its first run.**
+    /// The claim was "it needs an ASYMMETRIC waveform (a glottal pulse); a symmetric source
+    /// produces none" — measured: a plain sine at +4 st injects **more** than the asymmetric pulse
+    /// train (0.195 vs 0.104 by |mean|/RMS). Symmetry is not the variable; *being centred on a
+    /// peak with a sub-period window* is the whole of it. ⚠ Keep this paragraph: this file has
+    /// history with confidently-worded wrong comments (one of them kept TD-PSOLA out for four
+    /// months).
+    ///
+    /// ⛔⛔ **"It is inaudible" was written here first and it is only half true.** By *energy* it
+    /// is: 97 % sits below 5 Hz. But the thing that matters is not the steady share, it is the
+    /// **steps** — the baseline jumps, and a step is broadband with a 1/f tail. Measured at the
+    /// four largest jumps (±40 ms), against the ext-off arm: **20-60 Hz is +16 to +24 dB**, and
+    /// that band is audible. Whole song, voiced cells: 1-20 Hz **+28.2 dB**, **20-60 Hz +7.9 dB**,
+    /// 60-200 Hz −1.0, 200-800 Hz +0.3.
+    /// ⇒ the collar that survives is only: **it does not eat headroom** (removing everything under
+    /// 50 Hz moves the whole-song peak by −0.008 dB).
+    ///
+    /// ⭐ How big the steps are: |Δbaseline| per 5 ms, normalised by the ext-off arm's local RMS —
+    /// ext-off has **6** cells over 20 %, today has **1295**, and the worst reads **238 %**
+    /// (at 133.44 s the baseline jumps 0 → **+0.235** while the waveform peaks at 0.5).
+    /// ⭐ It is also visible: the waveform sits off-centre. The user diagnosed it from Audition —
+    /// vertical low-frequency bands in the spectrogram at exactly the places he had been calling
+    /// "seams" / "clicks", plus five-track waveforms where only the ext-off and the HP arm looked
+    /// symmetric. Every ruler in this repo had missed it, because they are all RMS-domain and
+    /// **RMS does not see a DC offset as a defect — it just counts it as signal.**
+    pub infrasonic_frac: f32,
+    /// ⭐ S165 —— 跨周期对消动过的样本数与真的减掉的能量占比（dB）。
+    /// ⛔ 「开着」与「真的做了事」是两回事 —— 与 `infrasonic_removed` 同一条规矩。
+    pub subcancel_samples: usize,
+    pub subcancel_removed_db: f32,
+    /// S152 — how much of that the removal arm actually took out (`before − after`), 0.0 when off.
+    /// ⛔ Same reason as `wsola_moved` / `marks_locked`: "the arm is on" and "the arm did
+    /// something" are different facts and only the second one is visible in the audio.
+    pub infrasonic_removed: f32,
+    /// S155 — the width the cut actually used on this buffer, in ms (0.0 when off).
+    ///
+    /// ⛔ This is not decoration. With [`Infrasonic::PerPeriod`] the width is derived from the f0
+    /// track, so a single bad frame can widen it and **halve the benefit with every other reading
+    /// still green** — that is precisely the S147 silent-halving shape, and this number is the
+    /// only thing that shows it. See [`infrasonic_width_ms`].
+    pub infrasonic_ma_ms: f32,
+    /// S154 — |20·log10(env(out) / env(in))| median over the covered span, 5 ms RMS window, dB.
+    ///
+    /// **This process is a pitch transform. It has no business changing the amplitude envelope.**
+    /// It does: measured on the probe (donor −14, 10 s, same buffer in and out, so the reading is
+    /// the process and nothing else) **p50 1.14 dB · p90 2.05 · max 10.83**, while the same
+    /// reading outside the voiced islands is **exactly 0.00** (there `out ≡ in` by construction —
+    /// that zero is the control that makes the rest of the number mean something).
+    ///
+    /// ⭐ Where it lives: **at the island start**, i.e. the vowel onset. Step across the first
+    /// 20 ms of each island, s14 segment: **−0.49 / −1.76 / −6.09 / −0.48 dB** (4 islands).
+    /// S153 §4k had already found the same concentration from the other side (worst 15 violations
+    /// whole-song: 14 of them within ±35 ms of a vowel onset).
+    ///
+    /// ⛔⛔ **Why it was dropped once, and why that was wrong.** S153 filed it as "real but not the
+    /// click" because it could not rank the user's six annotated points. That inference does not
+    /// hold: *a ruler failing to rank six points* is a fact about **our measurement**, not about
+    /// the world — and the user had reported this very defect from the **waveform** ("波形在进入
+    /// 稳定的长音之前有一个非常突兀的波形尖峰") back in S152, where it was measured as ruler ⑦
+    /// (起音过冲) and dropped for the same reason. Two independent drops of the user's own
+    /// first-hand observation, both because a ranking test failed. ⇒ **Never write "a ruler could
+    /// not separate the marks" as "the phenomenon is not there".**
+    pub env_dev_p50_db: f32,
+    /// S154 — the same median **after** the restoration arm ran, 0.0 when the arm is off.
+    /// ⛔ "The arm is on" vs "the arm did something", same rule as `infrasonic_removed`.
+    pub env_dev_after_db: f32,
+}
+
+const MAX_PERIOD_SECONDS: f64 = 0.02;
+/// See design note 6. Changing this changes the quality readings — re-run
+/// `scripts/range_rulers/compare.py` before and after.
+const CORR_WIN_PERIODS: f64 = 3.0;
+const SEARCH_LO: f64 = 0.8;
+const SEARCH_HI: f64 = 1.25;
+const MIN_ISLAND_SECONDS: f64 = 0.02;
+
+/// S150 — phase locking. Half-width of the energy window used to find the pulse, in periods.
+/// Measured on the akiko donor at +7 (Σ|depth − upper bound| over the 5 registered notes):
+/// T/16 → 1.88 · **T/8 → 1.23** · T/4 → 0.83 · T/2 → 12.03. The T/2 collapse is the tell that
+/// this is a real optimum and not a flat knob: a window that wide stops resolving the pulse.
+const LOCK_ENERGY_HALF: f64 = 0.125;
+/// Loop gain of the phase-locked loop in [`lock_phase`]: how much of each period's measured phase
+/// error is applied. 1.0 = jump straight onto the detected pulse; small = track it slowly.
+///
+/// ⛔⛔ **Two earlier formulations each shipped their own audible artifact**, and the shape of the
+/// failure is what picked this structure — not taste:
+/// * **Correct the marks afterwards** (what S150 shipped first): the correction is bounded by the
+///   search radius while the underlying drift is not, so the correction runs to the edge of the
+///   window and then traverses the *whole* window back — a sawtooth. Measured on the trajectory:
+///   p05..p95 of the correction is exactly ±0.45 periods, i.e. the full search range, and the
+///   envelope modulation spectrum grows a **coherent 10 Hz peak, 44-74×** the median. The user
+///   heard this immediately and named it precisely: the spindles became "one short seam after
+///   another". ⭐ Their reading of *why* was also right — the un-locked engine's scattered phase
+///   was **dithering** that seam, which is why it sounded like slow wobble instead of seams.
+/// * **Snap greedily inside the walk** (jump fully onto the pulse each step): no accumulation, so
+///   no sawtooth — but with a nearly degenerate peak choice (runner-up/winner 0.72-0.99) it
+///   **alternates** between sub-features. Measured: spacing-deviation lag-1 −0.538 (baseline
+///   −0.259) and transient flux 50.4 at the click coordinates (baseline 20.6).
+///
+/// A PLL avoids both by construction: it references the *absolute* pulse every step (so the error
+/// cannot accumulate ⇒ no wrap) and applies only a fraction of it (so a flip-flopping detection is
+/// low-passed ⇒ no alternation). Measured against the two failures and against the gold standard:
+///
+/// | | Σ\|depth−upper\| | spacing jitter p99 | flux at the seams | 10 Hz coherence | worst lag-1 |
+/// |---|---|---|---|---|---|
+/// | untouched engine | 18.94 | 0.1377 | 20.6 | 28.6× @279 Hz | −0.259 |
+/// | correct-afterwards | 2.02 | 0.1382 | 22.1 | **44.5× @10 Hz** | −0.243 |
+/// | greedy in-loop | 0.54 | 0.1888 | **50.4** | 10.2× @350 Hz | **−0.538** |
+/// | **this, β = 0.1** | **0.63** | 0.1393 | 24.8 | 16.0× @350 Hz | −0.287 |
+/// | praat's own marks | 0.02 | 0.0632 | 25.0 | 7.9× @356 Hz | −0.155 |
+const LOCK_BETA: f64 = 0.1;
+
+/// Half-width of the windowed-sinc used to carry the sub-sample transport residual.
+///
+/// ⚠ 32 taps is what S146g measured with; the cost is real but bounded (37.1 s of audio went
+/// 159 ms → 1592 ms = still 23× realtime), and the recovered quality is ~80-85% of the whole
+/// fixed toll. ⛔ **Never substitute linear interpolation here**: it reads BETTER on the HNR
+/// ruler (+0.43…+2.23 dB) purely because it low-passes, and a same-construction control that
+/// only low-passes reads +0.40 on its own — i.e. the ruler is being paid, not the ear.
+const TRANSPORT_SINC_HALF: isize = 16;
+
+/// Read `x` at a fractional position with a Blackman-windowed sinc.
+/// Integer `pos` returns the sample itself to within f64 rounding (sinc(k) = 0 for k ≠ 0).
+fn sinc_read(x: &[f32], pos: f64) -> f64 {
+    let n = x.len() as isize;
+    let c = pos.floor() as isize;
+    let frac = pos - c as f64;
+    let mut acc = 0.0;
+    for k in (-TRANSPORT_SINC_HALF + 1)..=TRANSPORT_SINC_HALF {
+        let idx = c + k;
+        if idx < 0 || idx >= n {
+            continue;
+        }
+        let t = k as f64 - frac; // distance from the tap to the read position
+        let s = if t.abs() < 1e-12 {
+            1.0
+        } else {
+            let pt = std::f64::consts::PI * t;
+            pt.sin() / pt
+        };
+        // Blackman window over the tap span, so the kernel dies smoothly at the edges.
+        let ph = std::f64::consts::PI * (t / (TRANSPORT_SINC_HALF as f64) + 1.0);
+        let w = 0.42 - 0.5 * ph.cos() + 0.08 * (2.0 * ph).cos();
+        acc += f64::from(x[idx as usize]) * s * w;
+    }
+    acc
+}
+
+/// ⭐⭐⭐ S165 —— [`sinc_read`] 的**核**,预先算好一份。
+///
+/// ## ⛔ 它为什么存在(渲染时间)
+/// 出厂路径(`FRAC_TRANSPORT_DEFAULT = true`、κ = 0)上,**每一个输出样本**都要跑一遍
+/// [`sinc_read`],而那里面每个抽头要一次 `sin` + 两次 `cos`(Blackman 窗)
+/// ⇒ **32 抽头 × 3 = 96 次超越函数调用 / 样本**。实测:整条 291 s 的 donor 过一遍逆变换
+/// 要 **41 s**,而生产一次渲染要跑 20 遍(整曲实测 inverse 占 **40 %**,98.6 s)。
+///
+/// ## ⭐ 为什么可以提出来
+/// 在**一颗粒之内** `frac` 是常数([`add_bell`] 的 `delta − d`,与样本下标无关),
+/// 而读点是 `si = i − frac`(`i` 为整数)⇒ `si.floor()` 相对 `i` 的偏移、以及
+/// `frac_ = si − floor(si)` **都是常数** ⇒ 整个核在颗粒内不变,**算一次就够**。
+///
+/// ## ⚠⚠ **如实登记:它【不是】逐位相同的,差 1 ulp**
+/// 求和仍然写成 `x[idx] * s * w`(**两个因子分开存**,不预乘 —— 浮点乘法不结合),
+/// 所以那一层是逐字一致的。**分叉在别处**:直接版算的是 `(i as f64 − frac).floor()`
+/// 与 `pos − c`,而 `i as f64 − frac` 这个减法**本身带舍入**,其误差**随 `i` 变**
+/// (实测 `1.0 − (−0.31) = 1.31` ⇒ `frac_ = 0.310000000000000053`,
+/// 而常数版直接用 `0.31`)⇒ `frac_` 不是严格常数,`sin`/`cos` 的输入差 1 ulp。
+/// ⇒ **想要严格逐位就必须每样本重算 `sin`/`cos`,那正是这一刀要省掉的东西。**
+///
+/// ⭐ 代价的量级:f64 的 1 ulp = 相对 2.2e-16 ≈ **−313 dB**,而输出是 f32(尾数 24 位)
+/// ⇒ 结构上远在 f32 量化地板之下。**但「远在地板之下」是推理,不是测量** ——
+/// 承重的验收是**端到端**那一条:整条 291 s 的真实 donor 过一遍逆变换,
+/// 改前/改后的 f32 输出**逐字节比较**(见 S165 §69)。
+/// 单元判据 `the_cached_sinc_kernel_matches_the_direct_read_to_one_ulp` 钉住数值面。
+struct SincKernel {
+    /// `si.floor() − i`(常数,由 `frac` 的符号决定)。
+    base: isize,
+    /// 每个抽头的 sinc 值与 Blackman 窗值,**分开存**(见上面那段 ⛔⛔)。
+    s: [f64; (2 * TRANSPORT_SINC_HALF) as usize],
+    w: [f64; (2 * TRANSPORT_SINC_HALF) as usize],
+}
+
+impl SincKernel {
+    /// `frac` = [`add_bell`] 里的那个残差(读点 `si = i − frac`)。
+    fn new(frac: f64) -> Self {
+        // 读点相对整数样本 `i` 的位置:`si = i − frac`。
+        // `c = si.floor() = i + base`,`frac_ = si − c = −frac − base`。
+        let base = (-frac).floor() as isize;
+        let frac_ = -frac - base as f64;
+        let mut s = [0.0f64; (2 * TRANSPORT_SINC_HALF) as usize];
+        let mut w = [0.0f64; (2 * TRANSPORT_SINC_HALF) as usize];
+        for k in (-TRANSPORT_SINC_HALF + 1)..=TRANSPORT_SINC_HALF {
+            let j = (k + TRANSPORT_SINC_HALF - 1) as usize;
+            let t = k as f64 - frac_;
+            s[j] = if t.abs() < 1e-12 {
+                1.0
+            } else {
+                let pt = std::f64::consts::PI * t;
+                pt.sin() / pt
+            };
+            let ph = std::f64::consts::PI * (t / (TRANSPORT_SINC_HALF as f64) + 1.0);
+            w[j] = 0.42 - 0.5 * ph.cos() + 0.08 * (2.0 * ph).cos();
+        }
+        Self { base, s, w }
+    }
+
+    /// 读 `x` 在 `i − frac` 处 —— 与 `sinc_read(x, i as f64 - frac)` **逐位相同**。
+    fn read(&self, x: &[f32], i: isize) -> f64 {
+        let n = x.len() as isize;
+        let c = i + self.base;
+        let mut acc = 0.0;
+        for k in (-TRANSPORT_SINC_HALF + 1)..=TRANSPORT_SINC_HALF {
+            let idx = c + k;
+            if idx < 0 || idx >= n {
+                continue;
+            }
+            let j = (k + TRANSPORT_SINC_HALF - 1) as usize;
+            acc += f64::from(x[idx as usize]) * self.s[j] * self.w[j];
+        }
+        acc
+    }
+}
+
+/// S162 —— 按**读取步长**抗混叠的 sinc 读取,给 κ ≠ 0 那一路用。
+///
+/// ## ⛔ 它为什么必须存在
+/// κ ≠ 0 的那一支以前是**线性插值**(`x[k]*(1−f) + x[k+1]*f`),而这个文件里
+/// [`TRANSPORT_SINC_HALF`] 的 doc 逐字写着「**Never substitute linear interpolation here**
+/// … the ruler is being paid, not the ear」—— **同一个文件里两条自相矛盾的做法**。
+/// S148 也登记过「κ>0 把整条渲染送进线性插值分支;整份分析只覆盖 κ=0」
+/// ⇒ **「κ 一开就染色」这个结论,从来没有在 sinc 版的 κ 上验过。**
+///
+/// ## ⭐ 实测代价(相对 FFT 域的理想重采样,真实 donor 素材)
+/// | κ·s | rate | 线性 10-16 kHz | **本函数** |
+/// |---|---|---|---|
+/// | 0.0 | 1.0000 | 0.00 | 0.00(阴性对照)|
+/// | 1.8 | 1.1096 | **−1.97 dB** | **−0.00** |
+/// | 3.6 | 1.2311 | **−1.59** | **−0.00** |
+/// | 6.0 | 1.4142 | **−1.15** | **−0.00** |
+/// ⇒ **换掉它是零代价的。**
+///
+/// ## ⛔ 为什么要按 `stride` 拉宽核
+/// 救援的逆变换 `s > 0` ⇒ `formant_rate = 2^(κ·s/12) > 1` ⇒ 读取步长 > 1 = **下采样**
+/// ⇒ 不只低通,**还混叠**。标准做法:核宽 ×`stride`、截止 `π/stride`。
+/// `stride ≤ 1`(上采样)时退化成定宽核。
+/// ⚠ 归一化用**窗和**而不是除以 `stride`:那样在缓冲两端(核被截断)也不会有增益台阶。
+fn sinc_read_strided(x: &[f32], pos: f64, stride: f64) -> f64 {
+    let scale = stride.max(1.0);
+    let half = ((TRANSPORT_SINC_HALF as f64) * scale).ceil() as isize;
+    let n = x.len() as isize;
+    let c = pos.floor() as isize;
+    let frac = pos - c as f64;
+    let mut acc = 0.0;
+    let mut wsum = 0.0;
+    for k in (-half + 1)..=half {
+        let idx = c + k;
+        if idx < 0 || idx >= n {
+            continue;
+        }
+        let t = (k as f64 - frac) / scale;
+        let s = if t.abs() < 1e-12 {
+            1.0
+        } else {
+            let pt = std::f64::consts::PI * t;
+            pt.sin() / pt
+        };
+        let ph = std::f64::consts::PI * (t / (TRANSPORT_SINC_HALF as f64) + 1.0);
+        let w = 0.42 - 0.5 * ph.cos() + 0.08 * (2.0 * ph).cos();
+        acc += f64::from(x[idx as usize]) * s * w;
+        wsum += s * w;
+    }
+    if wsum.abs() > 1e-12 {
+        acc / wsum
+    } else {
+        acc
+    }
+}
+
+/// S162 —— 缓冲区末尾的**释放期**长度(ms)。
+///
+/// ⛔ 第一版只淡化「裸透传」那 5 ms,结果盲搜峰值 **18.6 → 25.1 dB(更糟)**:
+/// **一个 5 ms 的淡出本身就是宽带瞬变**。⇒ 必须足够长,长到它的谱是低频的。
+/// 80 ms ≈ 一个自然的音尾释放;⛔ 只在缓冲末尾**还在唱**(不是自然收尾/静音)时才刻。
+const TAIL_RELEASE_MS: f64 = 80.0;
+
+/// S162 —— **谱倾斜还原**用的频带中心(Hz)。表与它一一对应。
+const TILT_F: [f32; 9] = [300.0, 550.0, 950.0, 1600.0, 2600.0, 4100.0, 6500.0, 10000.0, 14000.0];
+
+/// ⚙ 出厂默认 = `0.0`(= 关 = 逐位不变)。`UTAI_RANGE_TILT=<0..1>` 打开;`1.0` = 全额还原。
+///
+/// **深救援的「虚/弱」是一条谱【倾斜】,而且它有真值可以还原。**
+///
+/// ## ⛔⛔ 靶子是**浅救援**,不是模型原生唱中音(S162 换过一次,别改回去)
+/// 第一版拿 `base`(模型**原生唱中音**)当靶子,而拟合时 donor 被强制落到**极低音**
+/// (MIDI 59)⇒ 表里混进了「模型唱极低音」那一份。**真实**深救援不是这样:
+/// target 是**高音**(超出 `usable`),donor 落在 `usable` 内的**舒适区**(MIDI 68-74)
+/// ⇒ 并没有那么多低频要压 ⇒ **旧表过冲约 40%**。
+///
+/// ✅ 现在的靶子:S159zzb / S159zzk 的强制深度扫描里,`buf6` 与 `buf8/10/12/14` 是
+/// **同一批音、同一个 target 音高**,只有深度不同 ⇒ **零音高混杂**;
+/// 而膝盖已经认定 `|s| ≤ 6` 是好的(用户耳判:浅救援段「正常」)
+/// ⇒ **还原量 = shape(−6) − shape(−d)**。
+/// ⛔ 只取 target 接近 `usable` 上界的音(MIDI 73-78),落点最接近真实深救援;
+/// 两首谱(鹅妈妈 n=124 / 炉心 n=79)取平均。
+///
+/// ⛔⛔ **验收也必须在同一个 target 音高上比**(强制扫描)。S162 栽过:
+/// 拿真实歌里 4:32-4:38 的深段(target **MIDI 90**)与浅段(**83**)直接比谱形状,
+/// 读到「tilt 让距离从 7.80 变成 10.82 = 方向错了」—— **那是 7 个半音的音高混杂**,
+/// 不是深度造成的。
+///
+/// | 深度 | 300 | 550 | 950 | 1.6k | 2.6k | 4.1k | 6.5k | 10k | 14k |
+/// |---|---|---|---|---|---|---|---|---|---|
+/// | −6 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |(⭐ **按构造** —— 它就是靶子本身)
+/// | −8 | −1.10 | −0.54 | −0.50 | +0.97 | +0.51 | +0.04 | +0.59 | +1.92 | −1.84 |
+/// | −10 | −2.95 | −1.93 | −0.29 | +2.92 | +2.64 | +1.28 | −0.02 | +2.22 | −3.99 |
+/// | −14 | −8.06 | −3.77 | −0.19 | +4.85 | +4.89 | +2.27 | +0.41 | +4.53 | −5.16 |
+///
+/// ⭐ **200-700 Hz 那两档是【压】** ⇒ 与「面状伪影」那条护栏**同向**(次基频跟着被压)。
+///
+/// ## ⭐⭐ 为什么它天然让段与段之间音色一致
+/// 每一段都被拉向**同一个**目标(模型在 target 音区的音色)⇒ 深度不同的相邻两段,
+/// 还原之后落在同一处。⛔ 这正是 κ 做不到的:κ 把共振峰**平移** `κ·s`,不同 s 搬不同量;
+/// 而实测 **α ≈ 0.005**(模型共振峰几乎不随音高移动)⇒ 平移本身就是错的算子。
+///
+/// ## ⛔ 膝盖以内恒等
+/// `|s| ≤ 6` 强度为 0(浅救援今天是好的,不许动);`min(1, (|s|−6)/4)` 淡入,−10 起满额。
+const TILT_TABLE: [(i64, [f32; 9]); 5] = [
+    // ⭐ −6 按构造恒 0 —— **它就是靶子本身** ⇒ 不需要再乘膝盖(那是二次衰减)。
+    (6, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+    (8, [-1.10, -0.54, -0.50, 0.97, 0.51, 0.04, 0.59, 1.92, -1.84]),
+    (10, [-2.95, -1.93, -0.29, 2.92, 2.64, 1.28, -0.02, 2.22, -3.99]),
+    (12, [-4.68, -2.26, -0.65, 3.48, 4.44, 1.12, 0.03, 3.42, -4.84]),
+    (14, [-8.06, -3.77, -0.19, 4.85, 4.89, 2.27, 0.41, 4.53, -5.16]),
+];
+
+/// 按救援深度取还原曲线(dB),含膝盖淡入与表内线性插值。
+/// ⭐⭐ S163 —— tilt 开始淡出的 target MIDI（及以下全额）。
+///
+/// 表在 target **73-78** 上拟，而频带是绝对频率 ⇒ target 越高，谐波越往表的
+/// 最高档（`14k`，系数 **−5.16**）里跑。实测零交叉在 **87** 附近，
+/// 所以 85 以下保持全额（那里实测还是 +2.08…+9.15 的大益）。
+const TILT_FADE_LO: f64 = 85.0;
+
+/// ⭐⭐ S163 —— tilt 归零的 target MIDI。实测 90 上 tilt 把上方谐波压 **−4.01 dB**
+/// （akiko のぴゃ独立读 −3.05），而那正是用户报的那个病。
+const TILT_FADE_HI: f64 = 90.0;
+
+/// 位移 → 频率比。
+///
+/// ⛔ `psola_shift_*` 收到的 `semitones` 是**音频自己要移多少**（`semis = -(shift)`，
+/// 见 `vocal_range.rs` 那一行）—— 救援时 `shift` 是负的（模型唱低），所以这里是 **正**的。
+/// ⇒ target f0 = donor f0 × `2^(semitones/12)`。
+/// ⚠ 第一版写成了 `2^(-s/12)` ⇒ のぴゃ（donor 622 Hz, +13）算出 target 302 Hz / MIDI 62
+/// ⇒ `atten` 恒为 1 ⇒ **淡出根本不触发**（实测读数一字未动）。
+#[inline]
+fn ratio_of(semitones: f64) -> f64 {
+    2f64.powf(semitones / 12.0)
+}
+
+fn tilt_curve(depth_semitones: f64, strength: f64) -> [f64; 9] {
+    let d = depth_semitones.abs();
+    // ⛔ S162:这里**曾经**还乘一个膝盖 `((d − 6)/4).clamp(0,1)`。换表之后它是**二次衰减** ——
+    // 新表的靶子就是**浅救援(−6)**,所以它**按构造在 −6 上恒为 0**,膝盖是多余的;
+    // 留在里面会让 −8 档只施加一半,而留出验证用的是**整表**。
+    // `|s| < 6` 仍然逐位恒等:表的第一行全 0,插值在下界钳到它 ⇒ 曲线全 0 ⇒ 整个函数早退。
+    let knee = strength.clamp(0.0, 1.0);
+    let mut out = [0.0f64; 9];
+    if knee <= 0.0 || d < 6.0 {
+        return out;
+    }
+    let di = d.round() as i64;
+    let (lo, hi) = {
+        let mut lo = TILT_TABLE[0];
+        let mut hi = TILT_TABLE[TILT_TABLE.len() - 1];
+        for w in TILT_TABLE.windows(2) {
+            if w[0].0 <= di && di <= w[1].0 {
+                lo = w[0];
+                hi = w[1];
+                break;
+            }
+        }
+        if di <= TILT_TABLE[0].0 {
+            lo = TILT_TABLE[0];
+            hi = TILT_TABLE[0];
+        }
+        if di >= TILT_TABLE[TILT_TABLE.len() - 1].0 {
+            lo = TILT_TABLE[TILT_TABLE.len() - 1];
+            hi = lo;
+        }
+        (lo, hi)
+    };
+    let t = if hi.0 == lo.0 { 0.0 } else { (d - lo.0 as f64) / (hi.0 - lo.0) as f64 };
+    for i in 0..9 {
+        out[i] = (f64::from(lo.1[i]) + (f64::from(hi.1[i]) - f64::from(lo.1[i])) * t) * knee;
+    }
+    out
+}
+
+/// 施加谱倾斜还原:零相位的**幅度**整形,STFT overlap-add(Hann,hop = N/2,严格 COLA)。
+///
+/// ⛔ 只改**幅度**,相位一个字节不动 ⇒ 不搬共振峰、不动时间结构。
+/// ⛔ 全 0 曲线 ⇒ 逐位恒等(判据钉住)。
+fn apply_spectral_tilt(
+    x: &mut [f32],
+    sample_rate: u32,
+    curve: &[f64; 9],
+    // ⭐⭐⭐ S163 —— **逐帧**的强度衰减（按样本位置）。
+    // ⛔ 为什么必须逐帧：`apply_inverse_windowed` 对**整条 donor 只调一次** psola，
+    //    而 target 音高是**逐音**变的。第一版拿全曲中位 f0 算一个常数，
+    //    结果被低音拉回 1.0，**淡出根本不触发**（实测のぴゃ −36.23 一字未动）。
+    atten_at: &dyn Fn(usize) -> f64,
+) {
+    if curve.iter().all(|v| v.abs() < 1e-9) || x.len() < 4096 {
+        return;
+    }
+    const N: usize = 2048;
+    let hop = N / 2;
+    let win: Vec<f64> = (0..N)
+        .map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / N as f64).cos())
+        .collect();
+    // 逐 bin 增益:在 log-f 上对表插值
+    let sr = f64::from(sample_rate);
+    // ⭐ S163 —— 存 **dB**（不是线性），因为逐帧要乘上 `atten`。
+    let gain_db: Vec<f64> = (0..=N / 2)
+        .map(|k| {
+            let f = k as f64 * sr / N as f64;
+            let g_db = if f <= f64::from(TILT_F[0]) {
+                curve[0]
+            } else if f >= f64::from(TILT_F[8]) {
+                curve[8]
+            } else {
+                let mut v = curve[0];
+                for i in 0..8 {
+                    let (a, b) = (f64::from(TILT_F[i]), f64::from(TILT_F[i + 1]));
+                    if f >= a && f <= b {
+                        let t = (f / a).ln() / (b / a).ln();
+                        v = curve[i] + (curve[i + 1] - curve[i]) * t;
+                        break;
+                    }
+                }
+                v
+            };
+            g_db
+        })
+        .collect();
+    let n = x.len();
+    let mut out = vec![0.0f64; n];
+    let mut wsum = vec![0.0f64; n];
+    let mut buf = vec![0.0f64; N];
+    let mut pos = 0usize;
+    while pos + N <= n {
+        for i in 0..N {
+            buf[i] = f64::from(x[pos + i]) * win[i];
+        }
+        // 实 FFT(朴素 DFT 太慢 ⇒ 用简单的 radix-2)
+        let mut re = buf.clone();
+        let mut im = vec![0.0f64; N];
+        fft_in_place(&mut re, &mut im);
+        // ⭐ **逐帧等响**:先记下这一帧的功率,施加增益后再缩放回去
+        // ⇒ tilt 严格**只改形状,不改响度**。
+        // ⛔ 为什么必须这样:跨模型验收(零渲染噪声,5 组 × 2 档)读到护栏全面改善
+        // (面状 −1.08…−2.53 dB,10/10)但**电平 10/10 上升 +1.83…+4.91 dB** ——
+        // 那样的臂拿去耳判,「更好」会和「更响」分不开(听音测试最经典的混杂),
+        // 而且会和乐句级电平匹配(只压不抬)互相抵消。
+        let p_before: f64 = (0..=N / 2).map(|k| re[k] * re[k] + im[k] * im[k]).sum();
+        // ⭐ S163 —— 这一帧的衰减（按帧中心的 target 音高）。
+        let at = atten_at(pos + N / 2);
+        for k in 0..=N / 2 {
+            let g = 10f64.powf(gain_db[k] * at / 20.0);
+            re[k] *= g;
+            im[k] *= g;
+            if k > 0 && k < N / 2 {
+                re[N - k] *= g;
+                im[N - k] *= g;
+            }
+        }
+        let p_after: f64 = (0..=N / 2).map(|k| re[k] * re[k] + im[k] * im[k]).sum();
+        if p_before > 1e-30 && p_after > 1e-30 {
+            let s = (p_before / p_after).sqrt();
+            for k in 0..N {
+                re[k] *= s;
+                im[k] *= s;
+            }
+        }
+        // 逆变换(共轭法)
+        for v in im.iter_mut() {
+            *v = -*v;
+        }
+        fft_in_place(&mut re, &mut im);
+        let s = 1.0 / N as f64;
+        for i in 0..N {
+            out[pos + i] += re[i] * s * win[i];
+            wsum[pos + i] += win[i] * win[i];
+        }
+        pos += hop;
+    }
+    for i in 0..n {
+        if wsum[i] > 1e-9 {
+            x[i] = (out[i] / wsum[i]) as f32;
+        }
+    }
+}
+
+/// 就地 radix-2 FFT(N 必须是 2 的幂)。⛔ 只给 [`apply_spectral_tilt`] 用。
+fn fft_in_place(re: &mut [f64], im: &mut [f64]) {
+    let n = re.len();
+    let mut j = 0usize;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j |= bit;
+        if i < j {
+            re.swap(i, j);
+            im.swap(i, j);
+        }
+    }
+    let mut len = 2usize;
+    while len <= n {
+        let ang = -2.0 * std::f64::consts::PI / len as f64;
+        let (wr, wi) = (ang.cos(), ang.sin());
+        let mut i = 0usize;
+        while i < n {
+            let (mut cr, mut ci) = (1.0f64, 0.0f64);
+            for k in 0..len / 2 {
+                let (ur, ui) = (re[i + k], im[i + k]);
+                let (vr, vi) = (
+                    re[i + k + len / 2] * cr - im[i + k + len / 2] * ci,
+                    re[i + k + len / 2] * ci + im[i + k + len / 2] * cr,
+                );
+                re[i + k] = ur + vr;
+                im[i + k] = ui + vi;
+                re[i + k + len / 2] = ur - vr;
+                im[i + k + len / 2] = ui - vi;
+                let nr = cr * wr - ci * wi;
+                ci = cr * wi + ci * wr;
+                cr = nr;
+            }
+            i += len;
+        }
+        len <<= 1;
+    }
+}
+
+/// Running RMS of the transport residual that was **discarded** (0 when it is carried).
+/// ⭐ This is a direct, non-vacuous readout of the quantity the fix is about: it is exactly
+/// 0.0000 at ratio 1.0, ≈0.41 samples for whole-sample transport at any other ratio, and 0 once
+/// the residual is carried. A diagnostic that reports the defect itself cannot go quietly stale.
+#[derive(Default)]
+struct ResidualStat {
+    sq: f64,
+    n: usize,
+}
+
+impl ResidualStat {
+    fn push(&mut self, v: f64) {
+        self.sq += v * v;
+        self.n += 1;
+    }
+    fn rms(&self) -> f32 {
+        if self.n == 0 {
+            0.0
+        } else {
+            (self.sq / self.n as f64).sqrt() as f32
+        }
+    }
+}
+
+/// Sub-sample peak of a parabola through three samples.
+fn parabolic(l: f64, m: f64, r: f64) -> f64 {
+    let d = 2.0 * m - l - r;
+    if d.abs() > 1e-30 {
+        0.5 * (r - l) / d
+    } else {
+        0.0
+    }
+}
+
+/// f0 at a sample position, linearly interpolated INSIDE a voiced run; 0 = unvoiced.
+/// Never interpolates across a voiced/unvoiced boundary — a blended 0 would invent a period.
+fn f0_at(f0: &[f32], hop: usize, i: f64) -> f64 {
+    if hop == 0 || f0.is_empty() || i < 0.0 {
+        return 0.0;
+    }
+    let u = i / hop as f64;
+    let k = u as usize;
+    if k >= f0.len() {
+        return 0.0;
+    }
+    let a = f64::from(f0[k]);
+    if !(a > 0.0) {
+        return 0.0;
+    }
+    let b = if k + 1 < f0.len() { f64::from(f0[k + 1]) } else { a };
+    if !(b > 0.0) {
+        a
+    } else {
+        a + (b - a) * (u - k as f64)
+    }
+}
+
+/// Contiguous voiced sample ranges, probed on a coarse grid (the boundaries only need to be
+/// good enough to bracket the mark recursion — the marks themselves come from the waveform).
+fn voiced_islands(f0: &[f32], hop: usize, n: usize, min_samples: usize) -> Vec<(usize, usize)> {
+    const STRIDE: usize = 32;
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        if !(f0_at(f0, hop, i as f64) > 0.0) {
+            i += STRIDE;
+            continue;
+        }
+        let a = i;
+        let mut j = i;
+        while j + STRIDE < n && f0_at(f0, hop, (j + STRIDE) as f64) > 0.0 {
+            j += STRIDE;
+        }
+        let b = (j + STRIDE).min(n);
+        if b - a >= min_samples {
+            out.push((a, b));
+        }
+        i = b + STRIDE;
+    }
+    out
+}
+
+/// S159 —— 去次声**逐岛**滤波向岛外撑出去的支撑,单位样本。
+///
+/// `K` 遍盒滤波各半宽 `half` ⇒ 总支撑 ≈ `K·half`;这里按 `half·CUT_BOX_PASSES + 1` 取,
+/// 与去次声那一段**是同一个表达式**(S159 把它提成函数,免得护栏与刀两处各写一遍再漂开)。
+fn infrasonic_pad_samples(w_ms: f64, sample_rate: u32) -> usize {
+    let half = ((f64::from(sample_rate) * w_ms / 1000.0) as usize / 2).max(1);
+    half * CUT_BOX_PASSES + 1
+}
+
+/// S159 —— 一个岛**能写到岛外多远**(样本)= 窗内逆变换的护栏。
+///
+/// ⛔⛔ **跳岛的判据是「这个岛能写到哪」,不是「这个岛在哪」。**三项之和,每一项都是**上界**:
+/// 1. **标记外走**:`analysis_marks` 最多走出岛外一个本地周期([`island_reach`]);
+/// 2. **颗粒钟形窗**:半宽 ≤ `wmax`(更宽的颗粒被 `lw > wmax ⇒ continue` 整颗跳过)——
+///    ⛔ 传进来的必须是主循环用的**那一个** `wmax`,不许在这里重写一遍表达式;
+/// 3. **去次声逐岛滤波的支撑**:按宽度上限那一档取([`infrasonic_pad_samples`])。
+///
+/// ⚠ 第 3 项在**上移**臂(生产方向)上恒被前两项盖住(`per ≥ T_src` 且 `T_src ≤ wmax`
+/// ⇒ `per + wmax ≥ 2·T_src` = 该臂的支撑),在**下移**臂上才会绑定 —— 而下移时去次声的总闸
+/// 通常把整刀关掉。⇒ 它是给将来的余量;钉住它的是
+/// `the_window_guard_is_the_sum_of_three_measured_bounds`(断言写字面量,不许重算)。
+fn island_guard(
+    f0_hz: &[f32],
+    f0_hop: usize,
+    a: usize,
+    b: usize,
+    sample_rate: u32,
+    wmax: f64,
+) -> usize {
+    island_reach(f0_hz, f0_hop, a, b, f64::from(sample_rate))
+        .saturating_add(wmax.max(0.0) as usize)
+        .saturating_add(infrasonic_pad_samples(INFRASONIC_MS_MAX, sample_rate))
+}
+
+/// S159 —— 一个岛的**标记**最远能走到岛外多少个样本。
+///
+/// `analysis_marks` 的外走判据是 `lo < a − per || hi > b + per`,`per = sr / f0_at(cur)` ⇒
+/// 标记集合 ⊆ `[a − per_max, b + per_max]`,而 `per_max` 由该岛 f0 轨上**最低**的那个
+/// 有声帧决定。返回的是那个 `per_max`(样本),**不含**颗粒窗与去次声的支撑 —— 那两项由
+/// 调用方按各自的上界另加(见 `psola_shift_win` 里 `reach` 那一段)。
+///
+/// ⛔ 为什么不写成一个常数:`f0_hz` 是**谱面的**参数化音高,而且喂进来的时候已经被移调过 ——
+/// 深位移的 donor 上它可以低到几十赫兹(−14 半音把 MIDI 36 压到 22 ⇒ 29 Hz ⇒ 一个周期 34 ms)。
+/// 一个「20 ms 应该够了」的常数会**恰好在最需要它的那一档**失效,而症状是窗边几十毫秒变了样,
+/// 整曲里听不出来。
+/// ⛔ 取不到周期时返回一个**大到永远相交**的数(= 不跳这个岛):失败方向必须是「多做」。
+fn island_reach(f0_hz: &[f32], f0_hop: usize, a: usize, b: usize, sr: f64) -> usize {
+    const NEVER_SKIP: usize = usize::MAX / 4;
+    if f0_hop == 0 || f0_hz.is_empty() {
+        return NEVER_SKIP;
+    }
+    let k0 = (a / f0_hop).min(f0_hz.len());
+    let k1 = (b / f0_hop + 2).min(f0_hz.len());
+    let lowest = f0_hz[k0..k1]
+        .iter()
+        .map(|v| f64::from(*v))
+        .filter(|v| *v > 0.0)
+        .fold(f64::INFINITY, f64::min);
+    if lowest.is_finite() && lowest > 0.0 {
+        (sr / lowest).ceil() as usize
+    } else {
+        NEVER_SKIP
+    }
+}
+
+/// Absolute extremum in `[i0, i1)`, polarity-independent, refined to sub-sample.
+fn find_extremum(x: &[f32], i0: f64, i1: f64) -> f64 {
+    let lo = (i0.max(1.0)) as usize;
+    let hi = (i1.min((x.len() as f64) - 1.0)).max(0.0) as usize;
+    if hi <= lo {
+        return lo as f64;
+    }
+    let mut k = lo;
+    let mut best = -1.0f64;
+    for i in lo..hi {
+        let v = f64::from(x[i]).abs();
+        if v > best {
+            best = v;
+            k = i;
+        }
+    }
+    let s = if x[k] >= 0.0 { 1.0 } else { -1.0 };
+    k as f64
+        + parabolic(
+            s * f64::from(x[k - 1]),
+            s * f64::from(x[k]),
+            s * f64::from(x[k + 1]),
+        )
+}
+
+/// Normalized cross-correlation of the window at `t1` against every integer position in
+/// `[lo, hi]`, with the correlation peak refined to sub-sample. Returns (position, correlation);
+/// on any out-of-range condition it returns `t1` unchanged — callers MUST enforce forward
+/// progress themselves (an earlier version looped forever here).
+fn max_correlation(x: &[f32], t1: f64, period: f64, lo: f64, hi: f64) -> (f64, f64) {
+    let n = x.len();
+    let h = (period * 0.5 * CORR_WIN_PERIODS).round() as isize;
+    if h < 2 {
+        return (t1, 0.0);
+    }
+    let h = h as usize;
+    let a0 = t1.round() as isize - h as isize;
+    if a0 < 0 || a0 as usize + 2 * h > n {
+        return (t1, 0.0);
+    }
+    let a = &x[a0 as usize..a0 as usize + 2 * h];
+    let na: f64 = a.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+    if na <= 1e-30 {
+        return (t1, 0.0);
+    }
+    let lo_i = lo.floor() as isize;
+    let hi_i = hi.ceil() as isize;
+    let mut best_c = -1.0f64;
+    let mut best_i = lo_i;
+    let mut prev = -1.0f64;
+    let mut at_best_prev = -1.0f64;
+    let mut at_best_next = -1.0f64;
+    let mut pending_next = false;
+    for c in lo_i..=hi_i {
+        let b0 = c - h as isize;
+        let v = if b0 < 0 || b0 as usize + 2 * h > n {
+            -1.0
+        } else {
+            let b = &x[b0 as usize..b0 as usize + 2 * h];
+            let mut dot = 0.0f64;
+            let mut nb = 0.0f64;
+            for (p, q) in a.iter().zip(b.iter()) {
+                let (p, q) = (f64::from(*p), f64::from(*q));
+                dot += p * q;
+                nb += q * q;
+            }
+            if nb > 1e-30 {
+                dot / (na * nb).sqrt()
+            } else {
+                -1.0
+            }
+        };
+        if pending_next {
+            at_best_next = v;
+            pending_next = false;
+        }
+        if v > best_c {
+            best_c = v;
+            best_i = c;
+            at_best_prev = prev;
+            pending_next = true;
+        }
+        prev = v;
+    }
+    let off = if best_i > lo_i && best_i < hi_i && at_best_prev >= -1.0 && at_best_next >= -1.0 {
+        parabolic(at_best_prev, best_c, at_best_next)
+    } else {
+        0.0
+    };
+    (best_i as f64 + off, best_c.max(0.0))
+}
+
+/// S148 — per-grain trace for the "spindle" investigation (test-only, env-gated, no production
+/// path). The user named the defect from the waveform: a sustained rescued note breaks into a
+/// string of lens shapes. `cola_w_median` is 1.000 there, so it is not a window-sum gap — it has
+/// to be coherent addition between overlapping grains. What decides that is how far each grain's
+/// own pulse sits from where it is being placed:
+///
+/// ```text
+/// u = j / ratio ;  tgt[j] = interp(src, u)   (smooth)
+///                  ks[j]  = round(u)          (quantised)  <- the only lossy step
+///                  delta  = tgt[j] - src[round(u)]
+/// ```
+///
+/// ⛔ Do not derive the modulation rate from `ratio` on paper — I tried, and the arithmetic
+/// matched the −7 arm (~0.68 s) while missing the −5 arm by 3.5×. Dump it and measure.
+#[cfg(test)]
+static GRAIN_TRACE: std::sync::Mutex<Vec<[f64; 8]>> = std::sync::Mutex::new(Vec::new());
+
+/// ⭐⭐⭐ S163 —— 颗粒**抖动选择**的深度(`UTAI_PSOLA_XDITHER`,0..1)。
+///
+/// **0 = 今天 = `xgrain` 的线性混合 = 逐位不变**;1 = 纯抖动选择。
+///
+/// ## 它治什么
+/// 用户 2026-08-27 标的「除了 f0 剩下的部分都没声了 / 电都没了」= **谐波之间被挖空**。
+/// `inverse_probe` 同一份缓冲进出、78 个音:**`xgrain` 的线性插值一项就占 9.64 dB**
+/// (70/78 个音 >3 dB)。机理:插值 = 加权平均 ⇒ 谐波同相位保留,而**谐波间不相关的噪声
+/// 被压掉**。⛔ 但 `xgrain` 不能关(关掉半频/合唱感恶化 16.60 dB)⇒ 只能换算子。
+///
+/// ⇒ 「混合两颗」换成「**按 `fr` 的概率选一颗**」:期望值与线性插值逐点相同 ⇒ 成对结构照样
+/// 被打散(而且从确定性平滑变成白噪化,打得更彻底),而每一颗都是**完整的源波形**。
+///
+/// ⚠ 与 `xgrain` 是**乘法关系**:`xgrain` 决定「混不混」,`xdither` 决定「混合还是抽签」。
+/// ⭐⭐⭐ S163 —— **读点滑动**（`UTAI_PSOLA_XSLIDE`, 0..1）。
+///
+/// **0 = 今天 = 逐位不变**。1 = 读点在相邻两个源脉冲之间按 `fr` 线性滑动。
+///
+/// ## 为什么需要它（两个目标的冲突）
+/// * `xgrain`（混合两颗）：打散成对 ✓，但**加权平均把谐波间的噪声压掉** ✗（实测 9.64 dB）；
+/// * `xdither`（抽签选一颗）：噪声保住 ✓，但**成对结构回来**了 ✗（半频 +13.86 dB）。
+/// ⇒ 两者都只成一半，而且失败方向相反。
+///
+/// ## 这一刀
+/// **不混合两颗，而是让读点在两个源脉冲之间连续滑动**：
+/// * 每一颗仍然是**完整的源波形** ⇒ 噪声不被平均；
+/// * 读点随 `fr` 连续变化 ⇒ 相邻若干颗不再读**同一段波形** ⇒ 成对被打散。
+/// ⚠ 代价：读点不再对齐到脉冲上（`snap_to_pulse` 想避开的东西）⇒ 重叠相加时
+/// 相位不一致。那正是打破相干性所需的，但它同时会不会伤到谐波主体，**只能实测**。
+/// ⚙ 出厂默认 = 0.0 = 关 = **逐位不变**。
+/// S165 —— `UTAI_PSOLA_SUBCANCEL=<0..1>`:**跨周期自适应对消**,专治颗粒复用漏进输出的
+/// `f_out/2` 那一族(用户 S155 听成「合唱感」、S165 在 4:25.963 的岛边界上点名的那一处)。
+///
+/// ## ⛔ 为什么必须是这一刀,而不是第六个「在两颗源颗粒之间选/混」的算子
+/// S163 §13.5 把那一族**五个**算子放在同一条权衡线上量完了(同一份 `donor_pre`、78 音人群):
+/// `xgrain` 关 / 误差扩散 0.6 / **`xdither` 1.0(交换比 1.31 最优)** / 误差扩散 1.0 /
+/// **`xslide` 1.0(半频 +54.61,炸)**。S165 又在 **cover 轨、−11 度、真实整曲**上复验了两个
+/// (`xdither` 人群 +7.53 dB、`xslide` +37.06)⇒ **方向与量级都对上,门关死了。**
+/// ⛔ 根因是结构性的:颗粒成对产生**所有半整数倍**(0.5/1.5/2.5·f0),**正好就是「谐波之间」**
+/// ⇒ 半频与我们想保住的噪声**占同一个频率区间,滤波分不开**。
+/// ⇒ 唯一的出路不在频率上,而在**相干性**上 —— 那正是这一刀走的路。
+///
+/// ## 机理(三步,每一步都对应一个已知失败模式)
+/// 记输出 `y = H + S + N`:`H` 以 `T`(输出周期)为周期(谐波主体)、
+/// `S` 以 `2T` 为周期且**在 `T` 上反相**(半频那一族)、`N` 不重复(谐波间噪声,**要保住**)。
+///
+/// ⑴ **反周期差**:`d(t) = y(t) − g·y(t−T)` ⇒ `H` 抵消掉、`S` 变成 `2S`、`N` 留下。
+///    ⛔ `g = env(t)/env(t−T)` 是**包络比**,不是 1 —— 释放段本来就在衰减,
+///    不归一的话 `y(t) − y(t−T)` 光靠幅度差就很大,会把真信号当半频减掉。
+///    (这正是这一刀最容易做坏的地方,而 4:25.963 恰恰**就在**释放段。)
+/// ⑵ **跨 `2T` 相干平均**:`S` 每 `2T` 重复、`N` 不重复
+///    ⇒ 把 `d` 在 `m·2T`(`m = 0..PAIRS`)上按包络归一后平均,得到 `2·Ŝ`。
+///    ⚠ 4:25.963 那个释放段只有 15-20 ms ≈ 16-21 个周期 ⇒ 8-10 对 ⇒ `PAIRS = 4` 有余量。
+/// ⑶ **Wiener 自适应增益**:`gain = 相干能量 / (相干 + 不相干)`
+///    ⇒ 全是噪声的地方 `gain → 0`(**不动手**),真有相干半频的地方 `gain → 1`。
+///    ⇒ 这一刀**自己瞄准**,不需要外部的「哪里该修」判据。
+///
+/// ⭐ 交换比:相干的半频被**完全**对消(反相求和 → 0),而不相干的噪声在两抽头上只掉 3 dB
+/// ⇒ 结构上优于那五个算子的 1.31-2.12。
+///
+/// ⛔⛔ **这条轴的规矩(S150 定):只有盲测(或用户自己在整曲渲染上做谱分析)才能翻默认。**
+/// 尺子不许提拔它 —— S148 的 WSOLA 在它自己那把尺子上从 4.80 % 读到 0.38 %,
+/// 却 3/3 被耳判否掉,**因为它在制造一个八度以下的次谐波而尺子把那当成修复**。
+fn subcancel() -> f64 {
+    parse_subcancel(std::env::var("UTAI_PSOLA_SUBCANCEL").ok().as_deref())
+}
+
+/// env 解析写成纯函数 —— 判据不许去碰进程状态。
+fn parse_subcancel(v: Option<&str>) -> f64 {
+    v.and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v: &f64| v.is_finite() && *v >= 0.0 && *v <= 1.0)
+        .unwrap_or(0.0)
+}
+
+/// 相干平均用几对 `2T`。见 [`subcancel`] ⑵。
+const SUBCANCEL_PAIRS: usize = 4;
+
+/// 逐块处理的块长（ms）—— `T` 与 `L` 每块各估一次。
+const SUBCANCEL_BLOCK_MS: f64 = 8.0;
+
+/// 污染相干性的下限：`d` 在 `L` 处的归一化互相关低于它 ⇒ **这一块不动手**。
+/// ⭐ 实测：4:25.963 的爆发段 **0.62**，而健康段在 `2T` 附近只有 **0.02**。
+const SUBCANCEL_MIN_CORR: f64 = 0.40;
+
+/// 包络比的夹子(倍)。⛔ 它是**保险丝**:`env` 在近静音处会给出荒唐的比值。
+const SUBCANCEL_G_CLAMP: f64 = 4.0;
+
+/// 包络平滑的半宽(输出周期数)。
+/// ⛔ S166c —— **v2 那一版不再用它**(改成逐块估 T + Wiener 增益之后,
+/// 包络平滑这一步被块内平均取代了)。留着是因为整把刀已判负、
+/// 下次要再动得先读 [`subcancel`] 那段 doc;加 `allow` 而不是删掉,
+/// 是为了不把那一版的参数取值一并丢掉。
+#[allow(dead_code)]
+const SUBCANCEL_ENV_PERIODS: f64 = 1.5;
+
+/// ⭐⭐⭐ S166 —— 跨周期自适应对消的本体。见 [`subcancel`]。
+///
+/// ## ⛔ 第一版为什么在真实素材上是空刀(三条,全是实测逼出来的)
+/// 合成靶上半频掉 **57.8 dB**,而真实整曲上人群中位只动 **−0.21…−0.24 dB**。三个原因:
+/// ⑴ ⭐⭐⭐ **周期不够准**。第一版拿 `sr / (f0轨 × ratio)` 当 `T`。而差分算子
+///    `A: y ↦ y(t) − y(t−T)` 对第 `k` 次谐波的残留是 `|1 − e^{−j2πkε}| ≈ 2πkε`
+///    ⇒ **`T` 差 2 % 时第 6 次谐波只被压掉 25 %**,`d` 里于是塞满了残余谐波,
+///    Wiener 增益被它们的方差压到 0。⇒ **`T` 必须从输出自身估**(自相关峰,亚样本细化)。
+/// ⑵ **相干平均的滞后也要估**。实测 4:25.963 那一处 `d` 的自相关峰在 **L = 87**,
+///    而 `2·T_out = 84.6` —— 差 2.8 %,四项累积相位误差 61°,相干和退化。
+/// ⑶ ⛔ **减出来的东西必须强制反周期**。`d` 里残留的谐波是 `T` 周期的,因而**也是 `2T` 周期的**
+///    ⇒ 相干平均照样把它提出来,减掉就是**削真谐波**。
+///    ⇒ 末了做一次 `Ŝ ← ½(Ŝ(t) − Ŝ(t−T))`:`T` 周期的成分被它清零,反周期的成分原样保留。
+///    **这一步是谐波主体的保险丝,不是优化。**
+///
+/// ⛔ **FIR,不许就地反馈**:历史一律从 `src`(未被碰过的副本)读。
+///
+/// 返回(动过的样本数, 被减掉的能量占比 dB)—— 「开着」与「真的做了事」是两回事。
+fn cancel_subharmonic(
+    y: &mut [f32],
+    f0_hz: &[f32],
+    f0_hop: usize,
+    sample_rate: u32,
+    ratio: f64,
+    strength: f64,
+) -> (usize, f32) {
+    if !(strength > 0.0) || y.is_empty() || f0_hop == 0 || !(ratio.is_finite() && ratio > 0.0) {
+        return (0, 0.0);
+    }
+    let sr = f64::from(sample_rate);
+    let n = y.len();
+    let src: Vec<f32> = y.to_vec();
+
+    // 包络:滑动均方根,半宽固定 3 ms(只用来做幅度归一,精度要求远低于 `T`)。
+    let env_half = ((0.003 * sr) as usize).max(2);
+    let env: Vec<f64> = {
+        let mut pre = vec![0.0f64; n + 1];
+        for i in 0..n {
+            pre[i + 1] = pre[i] + f64::from(src[i]) * f64::from(src[i]);
+        }
+        (0..n)
+            .map(|i| {
+                let a = i.saturating_sub(env_half);
+                let b = (i + env_half + 1).min(n);
+                (((pre[b] - pre[a]) / (b - a).max(1) as f64).sqrt()).max(1e-9)
+            })
+            .collect()
+    };
+    let env_at = |p: f64| -> f64 {
+        let k = p.round();
+        if k < 0.0 || k >= n as f64 { 1e-9 } else { env[k as usize] }
+    };
+    // 归一化互相关:`src` 在 `c` 处的窗与 `c − lag` 处的窗。
+    let ncorr = |c: usize, lag: f64, half: usize| -> f64 {
+        if (c as f64) - lag - half as f64 - 1.0 < 0.0 || c + half >= n {
+            return -2.0;
+        }
+        let (mut num, mut e1, mut e2) = (0.0f64, 0.0f64, 0.0f64);
+        for k in 0..(2 * half) {
+            let i = c + k - half;
+            let a = f64::from(src[i]);
+            let b = sinc_read(&src, i as f64 - lag);
+            num += a * b;
+            e1 += a * a;
+            e2 += b * b;
+        }
+        if e1 <= 0.0 || e2 <= 0.0 { -2.0 } else { num / (e1 * e2).sqrt() }
+    };
+    // 在 `[lo, hi]` 里找互相关最大的滞后,再用抛物线细化到亚样本。
+    let best_lag = |c: usize, lo: f64, hi: f64, half: usize| -> Option<(f64, f64)> {
+        if !(hi > lo) {
+            return None;
+        }
+        let (mut bl, mut bv) = (0.0f64, -2.0f64);
+        let mut l = lo.floor().max(2.0);
+        while l <= hi {
+            let v = ncorr(c, l, half);
+            if v > bv {
+                bv = v;
+                bl = l;
+            }
+            l += 1.0;
+        }
+        if bv <= -1.5 {
+            return None;
+        }
+        let (a, b, cc) = (ncorr(c, bl - 1.0, half), bv, ncorr(c, bl + 1.0, half));
+        let refined = if a > -1.5 && cc > -1.5 {
+            bl + parabolic(a, b, cc)
+        } else {
+            bl
+        };
+        Some((refined, bv))
+    };
+
+    let mut touched = 0usize;
+    let mut e_before = 0.0f64;
+    let mut e_removed = 0.0f64;
+
+    for (a, b) in voiced_islands(f0_hz, f0_hop, n, (MIN_ISLAND_SECONDS * sr) as usize) {
+        // 逐块处理:块内 `T` 与 `L` 各估一次(它们变得比样本慢得多,而每样本估一次太贵)。
+        let mut blk = a;
+        while blk < b.min(n) {
+            let f_nom = f0_at(f0_hz, f0_hop, blk as f64) * ratio;
+            if !(f_nom > 0.0) {
+                blk += 1;
+                continue;
+            }
+            let t_nom = sr / f_nom;
+            if !(t_nom.is_finite() && t_nom >= 4.0) {
+                blk += 1;
+                continue;
+            }
+            let step = ((SUBCANCEL_BLOCK_MS / 1000.0 * sr) as usize).max(8);
+            let end = (blk + step).min(b).min(n);
+            let half = (t_nom * 1.5) as usize;
+            let c = (blk + end) / 2;
+            // ⑴ `T` 从输出自身估 —— 名义值只用来划搜索范围。
+            let Some((t_hat, _)) = best_lag(c, t_nom * 0.88, t_nom * 1.14, half) else {
+                blk = end.max(blk + 1);
+                continue;
+            };
+            // 需要的历史:`PAIRS` 个 `L` 再加一个 `T`。
+            let need = SUBCANCEL_PAIRS as f64 * 2.2 * t_hat + t_hat + 2.0;
+            if (blk as f64) < need {
+                blk = end.max(blk + 1);
+                continue;
+            }
+            // ⑵ 相干平均的滞后 `L` 也估 —— 在 `2T` 附近搜。
+            //    ⛔ 用 `d` 的自相关而不是 `src` 的:要找的是**污染**的周期。
+            let dsig = |i: f64| -> f64 {
+                let p1 = i - t_hat;
+                let g = (env_at(i) / env_at(p1)).clamp(1.0 / SUBCANCEL_G_CLAMP, SUBCANCEL_G_CLAMP);
+                sinc_read(&src, i) - g * sinc_read(&src, p1)
+            };
+            let dcorr = |lag: f64| -> f64 {
+                let (mut num, mut e1, mut e2) = (0.0f64, 0.0f64, 0.0f64);
+                for k in 0..(2 * half) {
+                    let i = (c + k) as f64 - half as f64;
+                    if i - lag - t_hat < 1.0 || i >= n as f64 - 1.0 {
+                        return -2.0;
+                    }
+                    let (u, v) = (dsig(i), dsig(i - lag));
+                    num += u * v;
+                    e1 += u * u;
+                    e2 += v * v;
+                }
+                if e1 <= 0.0 || e2 <= 0.0 { -2.0 } else { num / (e1 * e2).sqrt() }
+            };
+            let (mut lbest, mut lval) = (2.0 * t_hat, -2.0f64);
+            let mut l = (1.85 * t_hat).floor();
+            while l <= 2.15 * t_hat {
+                let v = dcorr(l);
+                if v > lval {
+                    lval = v;
+                    lbest = l;
+                }
+                l += 1.0;
+            }
+            // ⛔ 污染不够相干 ⇒ 这一块**不动手**(健康段的阴性对照就靠它)。
+            if lval < SUBCANCEL_MIN_CORR {
+                blk = end.max(blk + 1);
+                continue;
+            }
+            for i in blk..end {
+                let ip = i as f64;
+                let mut acc = 0.0f64;
+                let mut sq = 0.0f64;
+                let mut m_used = 0usize;
+                for m in 0..SUBCANCEL_PAIRS {
+                    let p = ip - (m as f64) * lbest;
+                    if p - t_hat < 1.0 {
+                        break;
+                    }
+                    let k = (env_at(ip) / env_at(p)).clamp(1.0 / SUBCANCEL_G_CLAMP, SUBCANCEL_G_CLAMP);
+                    acc += k * dsig(p);
+                    sq += (k * dsig(p)) * (k * dsig(p));
+                    m_used += 1;
+                }
+                if m_used < 2 {
+                    continue;
+                }
+                let mean = acc / m_used as f64;
+                let var = (sq / m_used as f64 - mean * mean).max(0.0);
+                let coh = mean * mean;
+                let gain = if coh + var > 1e-18 { coh / (coh + var) } else { 0.0 };
+                if gain <= 0.0 {
+                    continue;
+                }
+                // ⑶ ⛔ **强制反周期** —— 把 `Ŝ` 里所有 `T` 周期的成分(= 残余谐波)清零。
+                //    做法:同一条估计在 `i` 与 `i − T` 上各算一次,取半差。
+                let mut acc2 = 0.0f64;
+                let mut m2 = 0usize;
+                for m in 0..SUBCANCEL_PAIRS {
+                    let p = ip - t_hat - (m as f64) * lbest;
+                    if p - t_hat < 1.0 {
+                        break;
+                    }
+                    let k = (env_at(ip) / env_at(p)).clamp(1.0 / SUBCANCEL_G_CLAMP, SUBCANCEL_G_CLAMP);
+                    acc2 += k * dsig(p);
+                    m2 += 1;
+                }
+                if m2 < 2 {
+                    continue;
+                }
+                let anti = 0.5 * (mean - acc2 / m2 as f64);
+                let corr = strength * gain * anti * 0.5;
+                if corr.abs() < 1e-12 {
+                    continue;
+                }
+                let before = f64::from(src[i]);
+                y[i] = (before - corr) as f32;
+                e_before += before * before;
+                e_removed += corr * corr;
+                touched += 1;
+            }
+            blk = end.max(blk + 1);
+        }
+    }
+    let db = if e_before > 0.0 {
+        (10.0 * (e_removed / e_before).max(1e-12).log10()) as f32
+    } else {
+        0.0
+    };
+    (touched, db)
+}
+
+fn xslide() -> f64 {
+    std::env::var("UTAI_PSOLA_XSLIDE")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0)
+        .unwrap_or(0.0)
+}
+
+fn xdither() -> f64 {
+    std::env::var("UTAI_PSOLA_XDITHER")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0)
+        .unwrap_or(0.0)
+}
+
+/// ⭐ S163 —— 抖动选择用的确定性 01 哈希(splitmix64)。
+///
+/// ⛔ 为什么不是 RNG:同一份输入必须渲出同一份输出。这条线上「整曲渲染不可复现」已经是
+/// 一层噪声底(S162:同一条 base 渲 7 遍 = 7 个哈希,源头在解码 ONNX),**不许再加一层** ——
+/// 否则任何 A/B 都不可归因。
+#[inline]
+fn dither01(i: u64) -> f64 {
+    let mut h = i ^ 0x9E37_79B9_7F4A_7C15;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
+    h ^= h >> 31;
+    (h >> 11) as f64 / (1u64 << 53) as f64
+}
+
+#[cfg(test)]
+fn grain_trace_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("UTAI_PSOLA_GRAIN_DUMP").is_ok())
+}
+
+/// S148 — pick the SOURCE read position for one grain by waveform similarity with what has
+/// already accumulated (WSOLA). Returns `s0` unchanged unless some offset in `±radius` beats it.
+///
+/// The comparison window is the grain's LEFT half — that is exactly the span where this grain will
+/// overlap the previous one, i.e. the only place where a phase mismatch can cancel. `acc` there is
+/// the previous grain's windowed right half; both sides are normalised, so the previous grain's
+/// window taper does not bias the score.
+///
+/// ⛔ `MARGIN` is not cosmetic: at ratio 1.0 the accumulator **is** the windowed input at this very
+/// position, so offset 0 is the true maximum — but the correlation surface is flat around it and
+/// floating-point noise could hand the win to a neighbour, which would break the identity gate
+/// (`ratio_one_is_the_identity`) that this whole module is built on. Requiring a strict improvement
+/// keeps 0 the winner whenever nothing is actually better.
+fn wsola_pick(x: &[f32], acc: &[f64], s0: f64, tm: f64, lw: f64, radius: f64) -> f64 {
+    const MARGIN: f64 = 1e-4;
+    let r = radius.round() as isize;
+    let n = lw.round() as usize;
+    if r < 1 || n < 8 {
+        return s0;
+    }
+    let ti = tm.round() as isize - n as isize;
+    if ti < 0 || ti as usize + n > acc.len() {
+        return s0;
+    }
+    let a = &acc[ti as usize..ti as usize + n];
+    let anorm = a.iter().map(|v| v * v).sum::<f64>().sqrt();
+    if anorm <= 0.0 {
+        return s0;
+    }
+    let score = |off: isize| -> f64 {
+        let si = s0.round() as isize - n as isize + off;
+        if si < 0 || si as usize + n > x.len() {
+            return f64::NEG_INFINITY;
+        }
+        let b = &x[si as usize..si as usize + n];
+        let bn = b.iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>().sqrt();
+        if bn <= 0.0 {
+            return f64::NEG_INFINITY;
+        }
+        let dot: f64 = a.iter().zip(b).map(|(p, q)| p * f64::from(*q)).sum();
+        dot / (anorm * bn)
+    };
+    let mut best = 0isize;
+    let mut bestv = score(0);
+    if !bestv.is_finite() {
+        return s0;
+    }
+    for off in -r..=r {
+        if off == 0 {
+            continue;
+        }
+        let v = score(off);
+        if v > bestv + MARGIN {
+            bestv = v;
+            best = off;
+        }
+    }
+    s0 + best as f64
+}
+
+/// Energy in `[c-h, c+h)`, clipped at the buffer edges. A shrinking window at the edges is fine:
+/// it only ever competes against its own neighbours a sample away.
+fn window_energy(x: &[f32], c: isize, h: isize) -> f64 {
+    let n = x.len();
+    let lo = c.saturating_sub(h).max(0) as usize;
+    let hi = ((c + h).max(0) as usize).min(n);
+    if hi <= lo {
+        return 0.0;
+    }
+    x[lo..hi].iter().map(|v| f64::from(*v) * f64::from(*v)).sum()
+}
+
+/// Pull ONE position onto the nearest pulse: integer argmax of the local energy within
+/// `±radius_periods · t`, refined to sub-sample with the same parabola the rest of this module
+/// uses. Returns `pos` unchanged when the radius is zero or the search cannot run.
+///
+/// ⭐ Why local ENERGY and not something cleverer: measured on this material, praat's own marks sit
+/// at the argmax of `E(T/8)` (or, indistinguishably, of `|x|`) for **62%** of marks against a
+/// random floor of **9.4%**, while ours manage 35%. The textbook glottal-closure detectors do
+/// *worse*: LPC residual 26%, `|dx/dt|` 19%. So the cheap feature is also the right one here —
+/// don't port the literature over that measurement.
+/// ⚠ The energy argmax of a one-sided (sharp onset, decaying ring) pulse sits *after* the onset by
+/// roughly the window half-width — a constant bias, which is harmless here because what the
+/// synthesis needs is a consistent phase reference, not the glottal closure instant itself.
+fn snap_to_pulse(x: &[f32], pos: f64, t: f64, radius_periods: f64) -> f64 {
+    if !(radius_periods > 0.0) || !(t > 2.0) || !pos.is_finite() {
+        return pos;
+    }
+    let r = ((radius_periods * t).round() as isize).max(1);
+    let h = ((LOCK_ENERGY_HALF * t).round() as isize).max(2);
+    let c = pos.floor() as isize;
+    let (mut best, mut best_v, mut best_i) = (pos, f64::NEG_INFINITY, c);
+    let (mut vm1, mut vp1, mut last) = (f64::NAN, f64::NAN, f64::NAN);
+    let mut have = false;
+    for i in (c - r)..=(c + r) {
+        if i < 0 || i as usize >= x.len() {
+            last = f64::NAN;
+            continue;
+        }
+        let v = window_energy(x, i, h);
+        if have && i == best_i + 1 {
+            vp1 = v;
+        }
+        if !have || v > best_v {
+            have = true;
+            best_v = v;
+            best = i as f64;
+            best_i = i;
+            vm1 = last;
+            vp1 = f64::NAN;
+        }
+        last = v;
+    }
+    if !have {
+        return pos;
+    }
+    if vm1.is_finite() && vp1.is_finite() {
+        let d = parabolic(vm1, best_v, vp1);
+        if d.is_finite() {
+            best += d.clamp(-1.0, 1.0);
+        }
+    }
+    best
+}
+
+/// S150 — **phase locking**: pull each analysis mark onto the nearest glottal pulse.
+/// Returns how many marks actually moved. `radius_periods == 0` ⇒ no-op, marks untouched.
+///
+/// ## Why this exists (S148 root cause, measured — do not re-derive)
+///
+/// The walk in [`analysis_marks`] steps by *correlation*, so its **period is right and its phase
+/// is not**: the step size is accurate (measured spacing median 120.00 samples against praat's
+/// 119.75, and our spacing is actually *smoother* — 0.0013 vs 0.0021 relative variation) while
+/// nothing ever re-anchors the marks to the waveform after the seed. The phase error therefore
+/// accumulates: our marks scatter **±0.42 of a period** around praat's and land where the local
+/// energy is **2.3–4.4 dB lower**.
+///
+/// That costs exactly what the user named by eye ("a string of lens shapes" in a sustained
+/// rescued note): a mark that sits off the pulse makes the `T_out`-wide grain window cut a
+/// different slice of the pulse every period, which writes an envelope modulation that was not in
+/// the input. ⭐ The decisive single-variable experiment: swapping **only** the marks for praat's
+/// reproduced praat's readings on 5 notes × 2 metrics to within 0.02 dB (`[785]` 9.49 → 3.45
+/// against praat's own 3.47) ⇒ the synthesis rules are already correct; 100% of the injected
+/// modulation comes from mark placement. ⭐ And the note that never grows the defect at any shift
+/// (`[86]`) is the one whose marks are already accurate (0.33 dB) — the strongest internal
+/// consistency this chain has.
+///
+/// ## Contract (each clause is a defect that was measured, not a preference)
+///
+/// * **Every mark survives.** Design note 3: Φ(m_k) = k needs one mark per period. Locking only
+///   ever *moves* marks — never adds, drops or merges them.
+/// * **The radius is the LOCAL step, not the island's median.** An island can run 2580 marks
+///   (≈7 s) with the pitch moving inside it, so a median-derived radius can exceed half of a
+///   locally shorter period and snap onto the *neighbouring* pulse — which is how you manufacture
+///   period doubling. The code therefore uses `t = steps[i - 1]`, the walk's own local step.
+///   ⛔ This is not hypothetical caution: S148's WSOLA arm was killed by a blind test precisely
+///   for manufacturing an exact −1200 cent period doubling.
+///   ⛔⛔ **S151 correction — the previous sentence here was wrong, and wrong in the direction
+///   that matters.** It claimed the radius used `min(gap_left, gap_right)` and that this made
+///   overshoot "structurally impossible". Only the LEFT gap is read (`:601`), and the geometry
+///   does not close: snapping one period late needs `0.30·t ≥ 2T − t`, i.e. `t ≥ 1.538·T`, while
+///   the walk's own band (`SEARCH_LO`/`SEARCH_HI` = 0.8/1.25) only bounds consecutive steps to
+///   `t/T ≤ 1.5625`. That is a **1.6 % overlap, not a proof.** What actually makes a bad snap
+///   harmless is [`LOCK_BETA`]: a mark that snaps to the wrong pulse still moves only
+///   `0.1 · 0.30 · t` = **3 % of a period**. Measured end to end on the shipped arm (the two mark
+///   dumps S150 left in `TESTING\s150_marks\work`, 61523 marks / 272 islands): per-island span
+///   ratio locked/unlocked p50 0.999819 = **−0.31 cents**, p05/p95 −3.7/+2.9 cents, and exactly
+///   **1 island of 272** past ±10 cents. ⇒ the claim (no octave manufacture) survives; the reason
+///   given for it did not. Written down because a wrong-but-confident comment in this very file
+///   is what kept TD-PSOLA shut out for four months (`scripts/range_rulers/README.md`).
+/// * **Marks may not cross or collapse** (the same guard, enforced sequentially).
+/// * **The correction is a first-order loop, not a smoother.** `cur = pred + β·(snap − pred)`,
+///   `β =` [`LOCK_BETA`]. ⛔ **S151 correction:** this bullet used to describe a **median smoother
+///   over `LOCK_SMOOTH` marks`** — that constant has not existed since the PLL replaced that arm
+///   (`grep LOCK_SMOOTH` hits this comment and nothing else), and the arm it describes is one of
+///   the two the user's ear rejected. Its readings are kept below, **labelled as the rejected
+///   arm**, because the comparison is what forced this shape.
+/// * ⛔ **"Agreement with praat's marks" is NOT a criterion** — S146 measured an `absmax`
+///   detector with the *highest* agreement (67%) and the *worst* ΔHNR (−5.94) and voiced survival
+///   (52%). The criteria are the rulers in `scripts/range_rulers/` plus f0.
+///
+/// ## Why local energy, and why post-hoc — both measured, neither chosen by taste
+///
+/// **The feature.** praat's own marks sit at the argmax of `E(T/8)` — or, indistinguishably, of
+/// `|x|` — for **62%** of marks against a **9.4%** random floor (jitter praat's marks ±0.5 T and
+/// every feature collapses to 9-10%). Ours manage 35%. The textbook glottal-closure detectors do
+/// *worse*: LPC residual **26%**, `|dx/dt|` **19%**. ⇒ the cheap feature is the right one here;
+/// do not port the literature over that measurement. (praat also actively *avoids* zero crossings:
+/// 4.2% against a 19.7% floor.)
+///
+/// **The shape.** The error is **cumulative, not per-step noise**: per-step median 0.0024 of a
+/// period against an accumulated median of 0.0695 (p90 0.40, worst 3.31), lag-1 autocorrelation
+/// +0.9897, growing monotonically with distance from the seed (0.009 within 2 steps → 0.177 beyond
+/// 80). praat is not cleverer — its search is *weaker* than ours (1-period window vs our 3) — it
+/// re-anchors on every voiced interval while we anchor **once per island**, and our islands run to
+/// 2580 marks. ⇒ That argues for locking *inside* the walk, and it was implemented and measured:
+///
+/// | arm | marks | landing energy | spacing var | Σ\|depth − upper\| | w_p01 at −7 |
+/// |---|---|---|---|---|---|
+/// | today | 61523 | −11.83 | 0.0013 | 18.94 | 0.2915 |
+/// | in-loop α=0.15 | 61518 | −10.91 | 0.0061 | 0.54 | 0.2851 |
+/// | in-loop α=0.45 | **57077** | −10.79 | 0.0062 | 0.54 | 0.2554 |
+/// | post-hoc α=0.45 + smoothing (**rejected by ear**) | **61523** | −10.87 | **0.0028** | **0.45** | **0.2882** |
+/// | upper bound (praat's marks) | 58777 | −10.98 | 0.0021 | 0.02 | 0.2905 |
+///
+/// ⛔ **None of the three candidate rows above is what ships** — the shipped arm is the PLL, and
+/// its own numbers are in [`LOCK_BETA`]. This table is kept because it is the evidence that killed
+/// the two obvious formulations: in-loop fights the walk's mandatory forward-progress check and
+/// **changes the mark count** (−4446 = −7.2% at 0.45), a design-note-3 violation — those stretches
+/// synthesize at double the period; and the post-hoc row, which looked best here on every
+/// instrument, was the one the user's ear returned as **clicks** (v1) and then as a **short seam**
+/// every ~100 ms (v2). ⇒ ⭐ this table IS the "instruments all green, ear says no" sample.
+///
+/// **The negative control that had to be run.** "Depth went down" does not by itself mean "the
+/// marks found the pulses" — any consistent absolute anchor stops the accumulation. So the same
+/// mechanism was run snapping to the energy **minimum**: Σ 18.94 → **9.56** (it does help) but
+/// landing energy collapses to **−22.12 dB** (against −10.87 here and −10.98 for praat) and
+/// spacing jitter quadruples. ⇒ the ruler separates "anchored" from "anchored on the pulse" by
+/// 20×, and the claim survives its own control.
+///
+/// ## ⛔ How to check this for octave errors, and how NOT to
+///
+/// The in-loop arm above does not merely change the mark count — on some notes it lays down an
+/// **alternating long-short spacing**, which is period doubling written into the mark train
+/// itself. Two things about finding it:
+///
+/// * **Per note, never per song.** The same criterion on the same arm reads 34.6% over the two
+///   broken notes, 3.4% over 23 notes and **0.78% over all voiced frames** — diluted 44×. A
+///   whole-song f0 average cannot see a defect that lives on 2 notes out of 23. (S148 already
+///   paid for this once: the r4 positive control only reads its 24.25% inside the right window.)
+/// * **The mark train tells you before the audio does**, and without trusting any pitch tracker —
+///   which matters, because on those notes pyworld and praat disagree. Take the local spacing
+///   ratio `d[i] / median(d[i±10])` and correlate its deviation with itself at lag 1: alternating
+///   long-short shows up as a strongly NEGATIVE lag-1. ⚠ A plain "bad spacing rate" with ±0.5 T
+///   thresholds is structurally blind here — the alternation is 0.7 T / 1.3 T, i.e. *inside* the
+///   band.
+///
+/// Measured, worst note per arm (lag-1 of the spacing deviation / worst-note low-octave rate from
+/// a per-note dio+stonemask pass, positive control = drop every other mark ⇒ 100%):
+/// baseline **−0.259 / 0.00%** · **this arm −0.345 / 0.00%** · praat's marks −0.369 / 0.00% ·
+/// in-loop 0.15 **−0.562** · in-loop 0.45 **−0.654**. ⇒ this arm's worst note sits between the
+/// baseline and the praat-marks arm, and no arm here except the deliberate positive control shows
+/// an octave error at +7 or +12. ⚠ Honest cost: spacing jitter p90 0.054 against praat's 0.012.
+fn lock_phase(x: &[f32], marks: &mut [f64], radius_periods: f64) -> usize {
+    if radius_periods <= 0.0 || marks.len() < 3 {
+        return 0;
+    }
+    // The walk's PERIODS are already right (spacing median 120.00 samples against praat's 119.75);
+    // only the phase is wrong. So the loop predicts from the walk's own step and corrects phase.
+    let steps: Vec<f64> = marks.windows(2).map(|w| w[1] - w[0]).collect();
+    let mut moved = 0usize;
+    for i in 1..marks.len() {
+        let t = steps[i - 1];
+        if !(t > 2.0) {
+            marks[i] = marks[i - 1] + t.max(1.0);
+            continue;
+        }
+        let pred = marks[i - 1] + t;
+        let snapped = snap_to_pulse(x, pred, t, radius_periods);
+        // ⭐ Only a fraction of the measured error — see LOCK_BETA for what each of the two
+        // extremes (correct-afterwards, and beta = 1) sounded like.
+        let next = pred + LOCK_BETA * (snapped - pred);
+        // Strictly increasing is load-bearing for Phi(m_k) = k, so enforce rather than assume.
+        let next = if next > marks[i - 1] + 1.0 { next } else { marks[i - 1] + t };
+        if next != marks[i] {
+            moved += 1;
+        }
+        marks[i] = next;
+    }
+    moved
+}
+
+/// Pitch marks inside one voiced island: seed at the island's midpoint extremum, then recurse
+/// outward maximizing correlation with the previous mark's neighbourhood.
+/// `seed_at`: where to plant the first mark. `None` = the island midpoint, which is what this has
+/// always done.
+///
+/// ⛔⛔ **Why it had to become a parameter (S154).** The seed decides the phase of the *entire* mark
+/// train (everything else walks outward from it), so anything that moves the island edges moves
+/// every grain in that island. Measured when the island-dilation arm first landed: the whole-song
+/// difference against today was **p50 +1.2 dB relative — larger than the signal — in 73 % of voiced
+/// cells**, against a render floor of −28.1 dB. That is a complete re-synthesis, not an edge fix.
+/// ⇒ two things were changing at once: the boundary coverage (what we wanted) and a re-roll of
+/// every note's mark phase (a lottery — S148/S150 are entirely about how much mark placement
+/// matters). Seeding from the **undilated** island keeps the marks put, so the arm changes only
+/// what it is supposed to.
+fn analysis_marks(
+    x: &[f32],
+    sample_rate: u32,
+    f0: &[f32],
+    hop: usize,
+    a: usize,
+    b: usize,
+    seed_at: Option<f64>,
+) -> Vec<f64> {
+    let sr = f64::from(sample_rate);
+    let mid = seed_at.unwrap_or((a + b) as f64 * 0.5);
+    let f_mid = f0_at(f0, hop, mid);
+    if !(f_mid > 0.0) {
+        return Vec::new();
+    }
+    let t0 = sr / f_mid;
+    let seed = find_extremum(x, mid - 0.5 * t0, mid + 0.5 * t0);
+    let mut marks = vec![seed];
+    for dir in [1.0f64, -1.0] {
+        let mut cur = seed;
+        loop {
+            let f = f0_at(f0, hop, cur);
+            if !(f > 0.0) {
+                break;
+            }
+            let per = sr / f;
+            let (lo, hi) = if dir > 0.0 {
+                (cur + SEARCH_LO * per, cur + SEARCH_HI * per)
+            } else {
+                (cur - SEARCH_HI * per, cur - SEARCH_LO * per)
+            };
+            if lo < a as f64 - per || hi > b as f64 + per {
+                break;
+            }
+            let (pos, _corr) = max_correlation(x, cur, per, lo, hi);
+            // Forward progress is mandatory: max_correlation returns `cur` unchanged at the
+            // buffer edges, and without this the loop never terminates.
+            if dir > 0.0 && pos < cur + 0.5 * per {
+                break;
+            }
+            if dir < 0.0 && pos > cur - 0.5 * per {
+                break;
+            }
+            if pos < 0.0 || pos >= x.len() as f64 {
+                break;
+            }
+            marks.push(pos);
+            cur = pos;
+        }
+    }
+    marks.sort_by(f64::total_cmp);
+    marks
+}
+
+/// One grain: rising half-cosine into `t_pos`, falling half out of it, cut from `x` around
+/// `s_pos`.
+///
+/// ⛔⛔ **The comment that used to live here was wrong, and it was load-bearing.** It read
+/// "Transport is by whole samples — praat does the same, and fractional delay would destroy the
+/// ratio-1.0 identity", and it kept the single largest quality fix out of this file for four
+/// months (S146 → S146g). The identity is **structural**, not a consequence of integer transport:
+/// at ratio 1.0 the target pulses ARE the source marks, so `t_pos == s_pos` exactly and the
+/// residual is identically zero however it is transported. Measured with both `frac == 0`
+/// short-circuits removed: worst |Δ| = 5.5e-18 on synthetic and on real material.
+///
+/// ⭐ What integer transport actually costs (S146g, three independent measurements agreeing on
+/// one signature): `d` is a difference of TWO independent roundings, so every grain discards a
+/// sub-sample residual δ. RMS(δ) is **exactly 0.0000 at ratio 1.0** and jumps to **0.41 samples**
+/// the instant the ratio leaves 1.0 — then stays there regardless of depth (+1 → 0.4139,
+/// +6 → 0.4129, +8 → 0.4121). That is precisely the shape of the toll we could not explain:
+/// −0.59 dB HNR for entering the process once, and only −0.37 more from +7 to +8. Depth changes
+/// the grain COUNT, not the rate.
+/// ⚠ The discriminating control: at +12 (ratio 2.0) half the grains land on integer deltas, so
+/// jitter halves while duplicate grains rise to 50%. "Duplicate grains are the problem" predicts
+/// the toll keeps worsening; "jitter is the problem" predicts a plateau. Measured: **plateau**.
+///
+/// `frac_transport` = carry that residual with a windowed-sinc read instead of dropping it.
+///
+/// ⚠⚠ **S157c 把它翻成了生产默认 `true`(`vocal_range.rs` 的 `FRAC_TRANSPORT_DEFAULT`)。**
+/// 下面这段是 2026-08-16 写的,**每一个字都仍然成立**,只是它覆盖不到重开的那条轴:
+/// 它测的是 **~1 dB 的 ΔHNR**、在**窄读窗 + 浅位移**的年代;而 S157c 量的是
+/// **基频附近的谐波间噪声**上的 **10-16 dB**、在 **ratio 2.2449 + 宽读窗**上,
+/// 而且用户先用眼睛报了症状(根因 = 颗粒被放在整数样本上,而 `T_src = 66.89` 不是整数)。
+/// ⇒ ⭐ 重开一条判过负的刀,要证明的是**「这一次不在那次的覆盖面里」**,
+/// 不是「那次判错了」 —— 把一条真实的负结果说成「记错了」是最差的重开理由。
+///
+/// ⛔⛔ **BLIND TEST SAID NO (2026-08-16) —— 对它测过的那条轴,这条结论至今没被推翻。**
+/// Three packages, **7 load-bearing pairs + 3 blank controls**, level-matched to
+/// ±0.000 dB, both arms fed the SAME rendered wav: the user could not tell them apart anywhere —
+/// 东雪莲 at +6, akiko at +7, and the two spots they had themselves named as still-improvable
+/// (bars 169 「たらああ」 at −7, the deepest shift in the song, and bars 189-192 「いだあああ」).
+/// ⭐ The null is load-bearing, not a shrug: the same listener and the same protocol **got both
+/// load-bearing groups right** when S146 swapped the engine, so the setup is demonstrably
+/// sensitive to a real perceptual difference.
+///
+/// What that means, stated so nobody re-derives it: **removing this jitter is worth ~+1.05 dB
+/// ΔHNR and f0 p90 132→24 cents, and NONE of it is audible on this material.** The measurement
+/// was right; the inference "better number ⇒ better sound" was not. Keep the arm — the defect it
+/// removes is real and may matter for other material (deeper shifts, other languages, the cover
+/// lane) — but the burden of proof for turning it on is a blind test that PASSES, not a ruler.
+///
+/// ⚠ Residual difference between the arms, measured: −22.2 dB relative, correlation 0.9970,
+/// worst |Δ| 0.19 — i.e. **an order of magnitude smaller than re-rendering the same command
+/// twice** (worst |Δ| 1.47, SVC is not bit-reproducible). Predicting "inaudible" from that alone
+/// would have been fair; the blind test is what makes it a fact.
+#[allow(clippy::too_many_arguments)]
+/// S152 — half-width of the moving average used to isolate the infrasonic baseline, in ms.
+/// Two passes of a box of this length = a triangular window, whose first null sits at
+/// `1000 / INFRASONIC_MA_MS` Hz and whose stop-band then falls as 1/f².
+///
+/// ## ⛔⛔ This number was picked twice against a **broken reference** before it was picked right
+///
+/// The question is "how much of the low band did this process ADD", so it needs a reference that
+/// is the same performance minus the process. Two wrong answers came first:
+/// 1. **20 ms**, chosen because 97 % of the injected *energy* is below 5 Hz ⇒ "inaudible".
+///    That reasoning is about the steady share, and the audible part is the **steps**.
+/// 2. **12 ms**, chosen by matching the **ext-off** arm. ⛔ The user caught this one:
+///    *"无扩在很多地方都失声了毫无参考意义"* — the un-rescued arm is silent on exactly the notes
+///    that get rescued, so part of "today is +7.9 dB louder in 20-60 Hz" is simply
+///    **the rescue giving those notes a voice**, which is not a defect. Same trap this session's
+///    adversarial pass had already written down as a rule, and it caught me anyway.
+///
+/// ## The reference that works: the donor against **itself**
+///
+/// `mg_render_sovits` with `UTAI_MG_INVERSE=0` vs `=1` is the same render with and without this
+/// process. Band RMS over voiced 50 ms cells, after aligning the two arms on 400-4000 Hz (each
+/// gets its own `peak_normalize`, which is a fake difference otherwise). ⚠ Judge on **20-60 Hz
+/// only**: a voice's f0 cannot live there (that is MIDI 24-34), while 60-150 Hz really does carry
+/// the raw arm's fundamental (it is the whole song transposed down) and is therefore not
+/// comparable.
+///
+/// | cut | −9 st | −12 st | −14 st | cost at 400-4k |
+/// |---|---|---|---|---|
+/// | injected (no removal) | +13.2 | +14.5 | +14.7 | — |
+/// | 20 ms | +10.8 | +12.2 | +12.3 | −0.002 dB |
+/// | 12 ms | +6.0 | +7.4 | +7.6 | −0.005 |
+/// | **8 ms** | **+0.6** | **+2.0** | **+2.2** | **−0.013** |
+/// | 6 ms | −3.7 | −2.4 | −2.2 (now cutting real signal) | −0.021 |
+///
+/// ⇒ 8 ms lands on the target at all three ratios and costs 0.013 dB where the voice actually is.
+///
+/// ## ⚠⚠ S155 — this constant is now a **RULER, not the cut**
+///
+/// The removal's width is [`Infrasonic::PerPeriod`], derived **per voiced island** from the
+/// source periods of the grains actually synthesised there (⛔ **not** from the f0 track — see
+/// that function for why that was wrong twice), and it uses [`CUT_BOX_PASSES`] box passes, not 2.
+/// This 8 ms stays as the fixed width of the *reading* [`PsolaDiagnostics::infrasonic_frac`], and that
+/// is deliberate: every historical number on this line (S152's 10.8/25.5/33.7 %, S154's tables,
+/// S155's 8.84/23.00/17.27 %) was taken with this ruler, and a ruler whose scale follows the
+/// knob is not a ruler.
+///
+/// ## ⛔ Two corrections to what this doc used to say
+///
+/// 1. It claimed «at an output f0 of 110 Hz this filter takes **−0.38 dB** off the fundamental.
+///    That is measured, not hypothetical». **It is the 12 ms number.** Re-measured: 12 ms costs
+///    −0.3673 dB at 110 Hz, the shipped 8 ms costs **−0.1540**. The sentence survived the
+///    12 → 8 ms change with its number attached — the exact shape of stale doc this repo has
+///    been burned by before, and it was caught by a forensic pass, not by a test.
+/// 2. It said the up-shift path is "far away" from trouble. It is (score path: lowest output f0
+///    on six installed records × the calibration song is MIDI 61 = **277 Hz**). ⛔ But
+///    `cover_dead_plan` emits a **positive** shift (audio moved DOWN) and every installed record
+///    has `usable.0 == 36`, i.e. the dead notes are at the **bottom** ⇒ output f0 below
+///    **65.41 Hz**, where a fixed 8 ms cut takes **−3.98 dB** off the fundamental, and the
+///    structural floor (MIDI 12 = 16.35 Hz) reaches **−25.18 dB**.
+///    ⚠ Also: the response is oscillatory ABOVE the first null — 178.69 Hz (MIDI 53.4, the middle
+///    of a male range) still costs −0.42 dB.
+///    ⇒ this is why the width had to become adaptive before the default could be flipped, and
+///    why "≈ 3 periods" from the old note became **one period of the lowest fundamental in each
+///    island** (measured: over 31.7-830 Hz the adaptive rule costs the fundamental
+///    −0.0000…−0.0005 dB).
+const INFRASONIC_MA_MS: f64 = 8.0;
+
+/// S155 — the narrowest and widest the adaptive cut is allowed to get, in ms.
+///
+/// The narrow end is a backstop against an f0 track that reports something absurd; the wide end
+/// is where the cut stops doing anything useful anyway (a null at 20 Hz).
+const INFRASONIC_MS_MIN: f64 = 1.0;
+const INFRASONIC_MS_MAX: f64 = 50.0;
+
+/// S155 — how (and whether) to subtract the infrasonic baseline this process manufactures.
+///
+/// ⛔ Why this is an enum and not the `bool` it replaced: the width **is** the whole question.
+/// A fixed 8 ms removes the part that only shows up in the waveform (the ride off-centre) and
+/// leaves **+9 dB at 20-50 Hz and +12 dB at 50-125 Hz** of manufactured energy standing — which
+/// is the band the user reported seeing as "200 Hz 以下的极低频亮带". Measured on the probe
+/// (zero render floor), s14 residual against the input's own low band:
+///
+/// | cut | 0.5-20 Hz | 20-50 | 50-125 | 125-200 |
+/// |---|---|---|---|---|
+/// | none | +42.0 | +22.8 | +14.6 | +3.6 |
+/// | fixed 8 ms | +1.7 | **+8.9** | **+11.6** | **+3.3** |
+/// | a 2.9 ms cut (2-pass) | −0.5 | +0.1 | +2.1 | +0.8 |
+///
+/// ⚠ **That table is the 10 s PROBE, 2 box passes, one width for the whole buffer** — i.e. the
+/// first thing S155 shipped, not what runs today. Two things changed after it, both because the
+/// user heard/saw something the table cannot show:
+/// * the cut is **4 box passes** (`CUT_BOX_PASSES`) — 2 passes leak the donor's own pitch through
+///   the −27 dB first sidelobe, which he reported as 「合唱感」;
+/// * the width is **per island**, not per buffer.
+/// ⇒ for what production actually does, read the whole-song numbers in
+///   `TESTING/s155_knives/au_s155e/看哪里.md`. ⛔ Do not quote this table as "today".
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Infrasonic {
+    /// Off — byte-for-byte the arm without this step.
+    Off,
+    /// Width = **one period of the lowest fundamental in each voiced island**, input or output,
+    /// taken from the grains actually synthesised there. See [`infrasonic_width_ms`] for why that
+    /// is the right width, why it must be per island, and where the f0 must NOT come from.
+    PerPeriod,
+    /// A fixed width in ms — for A/B renders and for reproducing an older arm.
+    FixedMs(f64),
+}
+
+/// S155 — the cut's width for **one island**: one period of the lowest fundamental *in that
+/// island*, measured from the source periods of the grains actually synthesised there.
+///
+/// ## What picks this number
+///
+/// The removal is `out -= LP(out) − LP(in)`, so `LP` is applied to the *input* too. That is what
+/// keeps ratio 1.0 bit-exact (see [`psola_shift_env`]), and it is also the whole risk: whatever
+/// `LP` passes of the **input** gets added into the output — and the input is the donor singing
+/// the same words 9-14 semitones lower. Feeding a low-passed copy of *that* into a rescued note
+/// is the same family of defect as the un-transposed attack S154 spent a session removing.
+///
+/// ⇒ the width must put the low-pass's **first null on the donor's own fundamental**, so the
+/// filter structurally cannot carry the voice. Two boxes of `L` ms have their first null at
+/// `1000/L` Hz ⇒ `L = 1000 / f0_lowest`.
+///
+/// ⛔ **Which f0.** On an up-shift the input is the lower one; on a down-shift (the cover path,
+/// `cover_dead_plan` emits +22 ⇒ audio moved DOWN 22 semitones) the *output* is. Taking the
+/// minimum of the two is what makes one rule safe on both, and it is not hypothetical: at an
+/// output f0 of 110 Hz a fixed 3 ms cut takes **−10.1 dB** off the fundamental (measured,
+/// `s155_knives/width_sweep.py`).
+///
+/// ## ⛔⛔ Where the f0 must NOT come from (this cost two commits)
+///
+/// **The f0 track is not the pitch content of this buffer.** Production hands the whole song's
+/// `note_hz_full` to every rescue pass, while `score2svc.rs` zero-fills the audio of every chunk
+/// that pass does not intersect — and it **never masks the f0 track** (the S151 note in
+/// `vocal_range.rs` was written about exactly this asymmetry). A percentile over the raw track is
+/// therefore a percentile over **notes that are digital silence here**, and those are never the
+/// notes being rescued. Measured: at −14 st the raw p01 gives **6.03 ms** where the rescued notes
+/// call for **2.70**, leaving **+8.5…+9.6 dB** standing in 50-125 Hz and removing **0.16 dB** in
+/// 125-200 Hz — i.e. nothing, in the exact band the user reported.
+///
+/// ⛔ **And no reading showed it**: `infrasonic_frac` is the fixed 8 ms ruler whose energy is
+/// 99.4 % below 20 Hz, so 6.03 ms and 8.00 ms read the same "removed 18.8 pts". Only
+/// [`PsolaDiagnostics::infrasonic_ma_ms`] differed, and nobody compared it to the width the
+/// decision had been made on. **That is the S147 silent-halving shape, entering through a door
+/// this function's own doc comment described.**
+///
+/// Masking the track by "this frame's audio is not silence" was still not enough: a *rendered*
+/// chunk also carries the notes this pass does **not** rescue, and they are lower. ⇒ the only
+/// quantity that needs no outside knowledge of "which notes get rescued" is the **source period
+/// of each grain this process actually laid down**, per island.
+///
+/// ## Measured (whole song, per-island, production)
+///
+/// Median island width per pass: **1.98 / 3.09 / 2.70 ms** at −9 / −12 / −14 — and 2.70 is
+/// exactly what an independent derivation from "only the 62 notes actually rescued at −14" gives.
+///
+/// ⚠ The chosen width is reported in [`PsolaDiagnostics::infrasonic_ma_ms`] (the median over
+/// islands) precisely so that a silent widening stays visible.
+/// ⚠ The failure direction of a too-low estimate is *less removal*, never damage.
+fn infrasonic_width_ms(src_periods: &[f64], sample_rate: u32, ratio: f64) -> f64 {
+    // S155 笔4 —— 用**真的被合成出来的颗粒自己的源周期**,而不是 f0 轨的分位数。
+    //
+    // ⛔ 笔3 先用「这一帧的音频不是数字静音」掩 f0 轨,那挡掉了铺零的 chunk
+    //    (−14 上 6.03 → 5.41 ms),但**没到位**:S147 之后 donor 只渲相交的 chunk,而一个被渲
+    //    的 chunk 里同样有**这一遍不救**的低音 —— 它们的音频是真的、f0 也是真的。
+    // ⇒ 唯一不需要「哪些音会被救」这条外部知识的量,就是**这道工序此刻真的在搬的那段波形**
+    //    的周期。它逐颗粒都在手边(`src_l`),而且它本来就是这把刀要保护的那个基频。
+    // ⚠ 收集端还要再挡一次静音:S151 实测**铺零区照样会被铺满标记**(去 DC 之后常数上处处
+    //    相关 = 1.0,间距恒为标称周期),所以按**这一颗粒的源读窗里有没有音频**过滤。
+    if src_periods.is_empty() {
+        return INFRASONIC_MS_MAX;
+    }
+    let mut v = src_periods.to_vec();
+    v.sort_by(f64::total_cmp);
+    // ⛔ p90 而不是 p99/max:S155 笔6 改成**逐岛**之后,一个岛只有几十颗粒,
+    // p99 实际上就是 max —— 而岛首尾那两颗粒的邻距是**外推**出来的、偏大。
+    // 实测:200 Hz 与 400 Hz 两个岛的夹具上,p99 给出 6.31 ms(= 158 Hz),两个都不对。
+    // ⚠ 失败方向仍然安全:偏窄只会少削一点或多漏一点,而 4 遍盒把漏压在 −53 dB 以下。
+    let t = v[((v.len() - 1) as f64 * 0.90).round() as usize];
+    let f_src = f64::from(sample_rate) / t.max(1.0);
+    // Up-shift ⇒ 源更低;down-shift ⇒ 输出更低。
+    let lowest = f_src * ratio.min(1.0);
+    return (1000.0 / lowest.max(1.0)).clamp(INFRASONIC_MS_MIN, INFRASONIC_MS_MAX);
+}
+
+
+/// S155 — what `psola_probe` runs when an arm's env var is **unset**: the production defaults.
+///
+/// ## ⛔⛔ Why this table exists
+///
+/// The probe used to hard-code `0.0` for every arm. That was fine while every production default
+/// *was* zero, and it silently stopped being fine the moment one was flipped: after S154 the
+/// production arm is `bridge = 30 ms` and `phase_lock = 0.30`, so anyone re-running the S154 probe
+/// script today would get **the pre-S154 arm** and file it as "today" — with no line of output
+/// saying otherwise. Same family as the two hard-coded `false`s this probe already shipped
+/// (`frac_transport`, S148; `remove_infrasonic`, S155): *the arm is wired* and *the arm carries
+/// production's value* are different facts.
+///
+/// ⛔ This is a **mirror**, so it can drift. `vocal_range`'s `the_probe_defaults_are_the_production
+/// _defaults` binds it to the real knobs — flip a default there without touching this table and
+/// that test goes red. (Same shape as `RANGE_ALGO_VERSION` ↔ `audition_cache_tag`.)
+///
+/// Booleans are 0.0 / 1.0; the rest are the knob's own unit (ms, periods, fraction).
+/// S159zzf —— **读点用【局部理想】的标记,而不是实际抖动的那个。**`0.0` = 关 = 今天,逐位不变。
+///
+/// # ⛔⛔ 判负(S159zzf 当天实测)—— 旋钮留着只为把下面那张受控实验表留在原地
+///
+/// | alpha | [1035] | [515] | 全曲中位 Δ | 变脏% | 梳深 Δ |
+/// |---|---|---|---|---|---|
+/// | 0(出厂) | −1.72 | −2.76 | — | — | — |
+/// | 0.25 | −1.74 | −2.51 | **+0.01** | 64 % | −0.20 |
+/// | 1.00 | −1.72 | **−1.79**(更差) | **+0.11** | 72 % | −1.03 |
+///
+/// ⇒ **一点用都没有,而且 [515] 反而变差。**音高闸全程 98.7-99.1 %(设计如此),所以不是臂坏了。
+///
+/// ⭐ **它错在哪(这条比读数值钱)**:抖动在**波形内容自己的周期**里,不在**我们把读窗放哪儿**里。
+/// 挪读点**不会**让内容的周期变规整 —— 只会让窗偏离脉冲(`lock_phase` 正是为了避免这个),
+/// 于是收益为零、代价照付。**真要去抖必须把音频【时间弯曲】,不是挪读点。**
+/// ⇒ 下一步该验的是「把 donor 按标记重采样成恒定周期 → PSOLA → 再弯回去」,而不是再调这个 alpha。
+///
+/// ## 机理(受控实验证出来的,不是推的)
+///
+/// 同一个源周期被连续用 `ratio` 次;**换到下一个源周期时**,若 `T_k ≠ T_{k+1}`,铺排就出现
+/// 一次相位跳变 —— 在 2-4 kHz 上几个样本的错位就是几十度,于是那一处忽强忽弱。
+/// 这些跳变以 `F_src` 的速率出现、幅度随机 ⇒ 序列带限在 `F_src/2`(≈185 Hz)
+/// ⇒ **正好落在 `envmod` 量的 20-200 Hz**。
+///
+/// ⭐ 受控实验(合成元音,固定共振峰,**只改源周期抖动**;`inverse_probe` +14;
+/// 读数 = 输出在 2-4 kHz 的 `envmod`):
+///
+/// | 抖动 | 0 % | 0.5 % | 1 % | 2 % | 4 % |
+/// |---|---|---|---|---|---|
+/// | 输出调制 | **−39.1** | −12.3 | −6.3 | −2.8 | −2.2 |
+///
+/// ⇒ **抖动为零时 PSOLA 几乎不产生调制**;抖动一上来就产生。
+/// ⛔ 阴性对照在**每一个** ratio 上都成立(+2…+16,抖动 0 那一列一律 ≤ −39 dB)。
+/// ⚠ 真实 donor 的周期抖动实测:原生 MIDI 76-78 **2.63 %**,−2 **2.85** · −6 **2.65** ·
+/// −12 **2.99** · **−14 4.30 %**(p90 7.60)—— 与上表对照,量级正好落在「油」的读数上。
+/// ⛔ 合成台只用来标定机理,**永远不许拿它判算法好坏**(`range_rulers/README.md` A 档那条)。
+///
+/// ## 这一刀做什么
+///
+/// 把标记序列在**「下标 ↔ 时间」**上做局部线性拟合,得到「理想」位置(= 局部恒定周期),
+/// 读点按 `alpha` 在实际与理想之间插值。**局部拟合保平均间距 ⇒ 音高按构造不变**
+/// (`inverse_probe` 的音高闸会当场验它)。
+///
+/// ⛔ **只改读【点】,不碰几何**:`tgt`(输出摆放)、`src_l`/`src_r`、`wmax`、`lw`/`rw`
+/// 全部仍按原来的 `src` 算 —— 输出时基一个字节不动。
+/// ⛔ 与 WSOLA 的**根本区别**:那个做**相似度搜索**,而最像的就是源自己的下一个周期
+/// ⇒ 它会把 PSOLA 退化成恒等变换(S159zze 实测 −1228 cents)。这里**没有搜索**,
+/// 位置由拟合定死,偏移的均值结构上为零 ⇒ 音高不可能漂。
+///
+/// ⚠ 已知代价:读窗不再精确压在脉冲上(偏移约等于抖动本身,2-4 % 个周期)。
+/// `lock_phase` 把标记钉在脉冲上正是为了避免这个 ⇒ 这是一笔**取舍**,`alpha` 是它的旋钮。
+fn dejitter_marks(src: &[f64], alpha: f64, span: usize) -> Vec<f64> {
+    if alpha <= 0.0 || src.len() < 3 {
+        return src.to_vec();
+    }
+    let n = src.len();
+    let h = span.max(1);
+    (0..n)
+        .map(|i| {
+            let lo = i.saturating_sub(h);
+            let hi = (i + h + 1).min(n);
+            let m = (hi - lo) as f64;
+            let mean_x = (lo..hi).map(|j| j as f64).sum::<f64>() / m;
+            let mean_y = src[lo..hi].iter().sum::<f64>() / m;
+            let sxy: f64 = (lo..hi).map(|j| (j as f64 - mean_x) * (src[j] - mean_y)).sum();
+            let sxx: f64 = (lo..hi).map(|j| (j as f64 - mean_x).powi(2)).sum();
+            if sxx <= 0.0 {
+                return src[i];
+            }
+            let ideal = mean_y + (sxy / sxx) * (i as f64 - mean_x);
+            src[i] + alpha * (ideal - src[i])
+        })
+        .collect()
+}
+
+/// 局部拟合的半宽(标记数)。⚠ 太宽会把**颤音**也当成抖动抹掉:5 个标记在 350 Hz 上是 14 ms,
+/// 远短于任何颤音周期(≥100 ms),而足够长于逐周期抖动。
+const DEJITTER_SPAN: usize = 5;
+
+pub const PROBE_ARM_DEFAULTS: [(&str, f64); 11] = [
+    // S157c —— 翻成默认开:整曲实测被救高音的谐波间噪声 −7.0 dB(1000-2100 Hz,地板 0.13)。
+    ("UTAI_PSOLA_FRAC", 1.0),
+    ("UTAI_PSOLA_WSOLA", 0.0),
+    ("UTAI_PSOLA_LOCK", 0.30),
+    ("UTAI_PSOLA_HP", 1.0),
+    ("UTAI_PSOLA_HP_MS", 0.0),
+    ("UTAI_PSOLA_ENVFIX", 0.0),
+    // S160j —— 30 → 120(用户 2026-08-24 耳判拍板)。理由与两段读数在 vocal_range 的
+    // `BRIDGE_UNVOICED_MS_DEFAULT` 的 doc 上。
+    ("UTAI_PSOLA_BRIDGE", 120.0),
+    ("UTAI_PSOLA_WIN", 1.0),
+    ("UTAI_PSOLA_XGRAIN", 1.0),
+    // S157b —— LP-PSOLA 的阶数。⚠ 它是 f64 只因为这张表是 f64;读的时候取整。
+    ("UTAI_PSOLA_LPC", 0.0),
+    // S159zzf —— 读点去抖的强度。0 = 关。
+    ("UTAI_PSOLA_DEJITTER", 0.0),
+];
+
+// ── S157b —— LP-PSOLA:把颗粒搬运挪进【残差域】 ───────────────────────────────
+//
+// ## 为什么(机理 + 实测的余量)
+//
+// `ratio` 不是整数时,相邻两颗输出颗粒会读**同一个源标记**却放在不同的相位上
+// (`k = round(j/ratio)`)⇒ 被复制的不是一个脉冲,而是「脉冲 ⊛ 声道冲激响应」的**一整条长尾**
+// ⇒ 尾巴之间非相干叠加 ⇒ **谐波之间出现噪声**。而**残差**几乎就是一串脉冲(尾巴被 `A(z)`
+// 拿走了),复制/插值它是良性的 —— 这正是 Moulines & Charpentier 1990 自己给的答案。
+//
+// ⭐ 余量是量出来的(S157b,**真 ぴゃ donor**,f0 659 Hz,`TESTING\s157_knives\probe_pya.sh`;
+// 同一段音频只改 ratio,1000-2100 Hz 上 **PSOLA 自己加的**谐波间噪声):
+//
+// | ratio | 2.0000 | 2.1189 | **2.2449** | 2.3784 | 2.5198 |
+// |---|---|---|---|---|---|
+// | 加了 | +7.68 | +10.28 | **+12.53** | +15.40 | +15.43 |
+//
+// ⇒ **每个半音约 +2.5 dB**,而用户 2026-08-20 正是在这条带上看见「合唱感又回来了、
+// 而且不止一条」。同一场的 2×2 取证:模型在 MIDI 76 上给的 donor 比 78 那档干净 **9.1 dB**
+// (同一带),而这道工序在 ratio 2.2449 上加了 **12.75 dB** ⇒ **把模型给的好处全还回去了**。
+//
+// ## ⭐ 恒等是**结构性**的,不是短路
+//
+// 接线写成**差分式**:`y = x + Synth(OLA(r) − r)`。
+// ratio 1.0 上 `OLA(r) ≡ r`(与今天 `OLA(x) ≡ x` 是同一段代码同一条路径,那条 `assert_eq!`
+// 已经证过)⇒ 差**恒为 0** ⇒ 零输入零初值 ⇒ `y ≡ x` **逐位**。与 S155 的差分式去次声同构。
+// ⛔ 它顺带解决了**岛边界的滤波器状态**:差在岛外恒为 0,合成滤波器不会从边界抖出东西来。
+//
+// ## ⚠ 三件故意不做的
+//
+// 1. **标记仍然在【语音】上找**(`analysis_marks` 读的还是 `dc_free(x)`)。S156 §8 担心的
+//    「残差的峰比语音尖得多 ⇒ `LOCK` 与 `T/8` 要重标定」因此**不成立**:这一笔只换
+//    **搬什么**,不换**搬到哪**。
+// 2. **用格型(lattice)而不是直接型**:反射系数 `|k| < 1` ⇒ 合成滤波器**必然稳定**,
+//    而且逐样本**线性插值 `k`** 仍然满足 `|k| < 1`(插值直接型系数会失稳,这是经典坑)。
+//    ⭐ 而且分析格型与合成格型在同一条 `k` 轨迹上是**逐样本精确互逆**的。
+// 3. **阶数是旋钮不是常数**:Roebel & Rodet 2005 明写「一旦移调不是整数倍,变换后的声音
+//    就带 whistling artifacts」,根因是**高音上谐波稀疏 ⇒ 全极点去拟合谐波而不是包络**。
+//    ⇒ 阶数要按素材扫,别写死。
+
+/// LPC 分析帧:窗 30 ms / 跳 5 ms。⚠ 这两个数不是调出来的,是语音 LPC 的教科书值;
+/// 若将来发现它们要紧,那说明该去看素材,不是去调它们。
+const LPC_FRAME_MS: f64 = 30.0;
+const LPC_HOP_MS: f64 = 5.0;
+
+/// 滞后加窗的带宽,Hz。见 `lpc_reflections` 里那一段:没有它这把刀在高音 donor 上是负结果。
+/// ⚠ 60 Hz 是语音 LPC 的教科书值(等价于给每个极点 60 Hz 的最小带宽);
+/// ⛔ 它**不是**调出来的 —— 若发现它要紧,那说明该去看素材(或改用 true envelope),不是调它。
+const LPC_LAG_WINDOW_HZ: f64 = 60.0;
+
+/// 每帧的反射系数(Levinson-Durbin)。`|k| < 1` 由正定自相关保证 ⇒ 合成必然稳定。
+///
+/// ⚠ 自相关加了 `1e-6 · r[0]` 的白噪底(经典 ridge):没有它,一段数字静音或一段
+/// 严格周期信号会让 Levinson 除零 —— 而这两种输入在本文件的夹具里都有。
+fn lpc_reflections(x: &[f32], sample_rate: u32, order: usize) -> (Vec<Vec<f64>>, usize) {
+    let sr = f64::from(sample_rate);
+    let win = ((LPC_FRAME_MS * sr / 1000.0) as usize).max(order * 2 + 2);
+    let hop = ((LPC_HOP_MS * sr / 1000.0) as usize).max(1);
+    let nframes = x.len().div_ceil(hop) + 1;
+    let w: Vec<f64> = (0..win)
+        .map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / win as f64).cos())
+        .collect();
+    let mut out = Vec::with_capacity(nframes);
+    let mut buf = vec![0.0f64; win];
+    for f in 0..nframes {
+        // 帧心对齐到 `f * hop`,两边各取半窗(越界补零 —— 端点的包络本来就没有定义)。
+        let c = f * hop;
+        for (i, b) in buf.iter_mut().enumerate() {
+            let p = c as isize + i as isize - (win / 2) as isize;
+            *b = if p >= 0 && (p as usize) < x.len() { f64::from(x[p as usize]) * w[i] } else { 0.0 };
+        }
+        let mut r = vec![0.0f64; order + 1];
+        for (lag, rv) in r.iter_mut().enumerate() {
+            *rv = buf[lag..].iter().zip(buf.iter()).map(|(a, b)| a * b).sum();
+        }
+        // S157b —— **滞后加窗**(lag windowing):自相关按 `exp(−½(2π·F_BW·lag/sr)²)` 衰减,
+        // 等价于把每个极点的带宽撑开 `F_BW` Hz。
+        //
+        // ⛔ 没有它这一整刀是**负结果**,而且负得很难看:实测(真 ぴゃ donor,f0 659 Hz,+14,
+        // 1000-2100 Hz 上 PSOLA 自己加的谐波间噪声)order 0 = +12.53 dB,而
+        // 8/12/16/20/24/32 = +15.73/+16.69/+16.44/+15.43/+13.44/+15.05,**order 48 = +51.20**。
+        // ⭐ 那正是 Roebel & Rodet 2005 点名的失效模式,也是 S156 §8 寄存这条候选时就写下的风险:
+        // **高音上谐波稀疏 ⇒ 全极点去拟合【谐波】而不是【包络】** ⇒ 合成滤波器的极点尖到会振铃,
+        // 而那些极点钉在 **donor 的**谐波上,移调之后与输出谐波对不齐 ⇒ 谐波之间全是它。
+        for (lag, rv) in r.iter_mut().enumerate() {
+            let w = (2.0 * std::f64::consts::PI * LPC_LAG_WINDOW_HZ * lag as f64 / sr).powi(2);
+            *rv *= (-0.5 * w).exp();
+        }
+        let mut k = vec![0.0f64; order];
+        if r[0] > 1e-30 {
+            r[0] *= 1.0 + 1e-6;
+            let mut a = vec![0.0f64; order + 1];
+            let mut e = r[0];
+            for m in 1..=order {
+                let mut acc = r[m];
+                for j in 1..m {
+                    acc -= a[j] * r[m - j];
+                }
+                let km = if e > 1e-30 { acc / e } else { 0.0 };
+                // 数值安全带:理论上 |k| < 1,但一段病态输入不许让合成滤波器爆掉。
+                let km = km.clamp(-0.999_999, 0.999_999);
+                k[m - 1] = km;
+                let prev = a.clone();
+                a[m] = km;
+                for j in 1..m {
+                    a[j] = prev[j] - km * prev[m - j];
+                }
+                e *= 1.0 - km * km;
+                if e <= 1e-30 {
+                    break;
+                }
+            }
+        }
+        out.push(k);
+    }
+    (out, hop)
+}
+
+/// 某个样本位置上的反射系数(帧间**线性插值**)。见上面第 2 条:插的是 `k` 不是直接型系数。
+#[inline]
+fn lpc_k_at(ks: &[Vec<f64>], hop: usize, i: usize, m: usize) -> f64 {
+    let t = i as f64 / hop as f64;
+    let f0 = (t as usize).min(ks.len() - 1);
+    let f1 = (f0 + 1).min(ks.len() - 1);
+    let a = t - f0 as f64;
+    (1.0 - a) * ks[f0][m] + a * ks[f1][m]
+}
+
+/// 分析格型:`x → 残差`。FIR,恒稳。
+fn lattice_analyse(x: &[f32], ks: &[Vec<f64>], hop: usize, order: usize) -> Vec<f32> {
+    let mut g = vec![0.0f64; order + 1]; // 上一样本的后向误差
+    let mut out = vec![0.0f32; x.len()];
+    let mut gn = vec![0.0f64; order + 1];
+    for (i, o) in out.iter_mut().enumerate() {
+        let mut f = f64::from(x[i]);
+        gn[0] = f;
+        for m in 1..=order {
+            let k = lpc_k_at(ks, hop, i, m - 1);
+            let fm = f - k * g[m - 1];
+            gn[m] = g[m - 1] - k * f;
+            f = fm;
+        }
+        g.copy_from_slice(&gn);
+        *o = f as f32;
+    }
+    out
+}
+
+/// 合成格型:`残差 → 信号`。与 [`lattice_analyse`] 在同一条 `k` 轨迹上逐样本精确互逆。
+fn lattice_synthesise(r: &[f32], ks: &[Vec<f64>], hop: usize, order: usize) -> Vec<f32> {
+    let mut g = vec![0.0f64; order + 1];
+    let mut gn = vec![0.0f64; order + 1];
+    let mut out = vec![0.0f32; r.len()];
+    for (i, o) in out.iter_mut().enumerate() {
+        let mut f = f64::from(r[i]);
+        for m in (1..=order).rev() {
+            let k = lpc_k_at(ks, hop, i, m - 1);
+            f += k * g[m - 1];
+            gn[m] = g[m - 1] - k * f;
+        }
+        gn[0] = f;
+        g.copy_from_slice(&gn);
+        *o = f as f32;
+    }
+    out
+}
+
+/// Box filter with a running prefix sum; the window shrinks at the two ends rather than
+/// zero-padding (zero-padding would manufacture a step exactly where the buffer starts).
+fn box_average(x: &[f64], half: usize) -> Vec<f64> {
+    let n = x.len();
+    let mut pre = Vec::with_capacity(n + 1);
+    let mut s = 0.0f64;
+    pre.push(0.0);
+    for v in x {
+        s += *v;
+        pre.push(s);
+    }
+    (0..n)
+        .map(|i| {
+            let a = i.saturating_sub(half);
+            let b = (i + half + 1).min(n);
+            (pre[b] - pre[a]) / (b - a) as f64
+        })
+        .collect()
+}
+
+/// S154 — **bridge short unvoiced gaps in the fed f0 so the islands cover the whole note.**
+///
+/// ## The defect this exists for
+///
+/// This process only shifts **inside voiced islands**; outside them the input is passed through
+/// *bit for bit* (measured on the probe: residual −341 … −385 dB, i.e. float noise). The fed f0
+/// is zeroed on unvoiced phones, so the island boundary lands **exactly on the vowel onset** —
+/// and the join between the two is **0.25 … 3 ms** wide (measured: the residual against the input
+/// collapses from −13 dB to −348 dB within 1 ms of the edge).
+///
+/// ⇒ every rescued note keeps a fragment of **un-shifted, 9-14 semitones too low** audio at each
+/// end, butted against the shifted body across a sub-millisecond join. In the spectrogram every
+/// harmonic **steps** at that instant — which is a broadband vertical line — and in the waveform
+/// the attack stands off from the body as an abrupt spike.
+///
+/// ⭐ How much leaks, at the notes the user annotated (outside-island peak ÷ inside-island peak,
+/// and outside/inside energy): 698 "normal" **0.30× / −22.8 dB** · ぴゃ "no line here" **0.27× /
+/// −21.5** · 719 "abnormal" **0.65× / −16.9** · 781 "abnormal" **1.35×** · 753 "abnormal"
+/// **2.09× / −1.06**. ⇒ **the first quantity on this line that orders the user's labels**, and it
+/// separates *within* a single shift (698 vs 719, both −9), so it is not just a ratio proxy.
+///
+/// ⭐ It also matches every negative control the user gave by ear: signalsmith has **no islands**
+/// (it shifts the whole stream) ⇒ no boundary ⇒ no defect; the donor that never went through
+/// PSOLA has no boundary either; the defect is at note heads **and** tails (an island has two
+/// ends) and **never in the middle of a note** (there is no boundary there).
+///
+/// ## What the knob does
+///
+/// Fill zero runs **shorter than `max_ms`, and interior only**, by interpolating the neighbouring
+/// voiced values, before the islands are cut. A real rest is longer than the bound and stays a
+/// rest. `0.0 = off = byte-for-byte the pre-S154 arm.`
+///
+/// ⚠ It moves `analysis_marks`' seed (that function seeds at the island **midpoint**), so the
+/// whole mark train shifts phase. S153 rejected a whole-track version of this for exactly that
+/// reason — but that rejection was about comparing the island **interiors**; the **boundary** is
+/// what this is for, and it is the one thing that comparison can answer cleanly.
+fn bridge_unvoiced(
+    f0: &[f32],
+    hop: usize,
+    sample_rate: u32,
+    max_ms: f64,
+    valley: Option<&[f32]>,
+) -> Vec<f32> {
+    // ⛔⛔ **First version filled only the zero runs BETWEEN two voiced runs, bounded by `max_ms`.**
+    // Measured on the real material: it changed **nothing** — island count 7→7 and 5→5 at 40/80 ms.
+    // The gaps here are longer than 150 ms; the un-shifted attack is not a short consonant wedged
+    // between islands, it sits inside a long unvoiced stretch belonging to the note itself.
+    // ⇒ what the defect needs is a **dilation**: grow every voiced run outward, holding that run's
+    // own edge value, so the island covers the note's own onset and release.
+    //
+    // ⛔⛔ **Second version let the two sides meet, and that merged islands.** On 炉心融解 a 30 ms
+    // dilation merges nothing (96 → 96); on the goose score, whose unvoiced gaps are far shorter,
+    // it collapsed **458 → 143** — it was fusing neighbouring notes into a single rescue. Covering
+    // a note's own onset is the job; merging notes is not (S151 paid for the general form of this:
+    // "merging across a SUNG note drags a passenger into the rescue").
+    // ⇒ each gap is split at its midpoint and **at least one frame is always left unvoiced**, so
+    // the island count is preserved on every material and at every width.
+    // ⚠ On 炉心融解 this guard is inert (its gaps are ≫ 2 × 30 ms), so the render the user
+    // confirmed by ear is untouched — checked against the probe, not assumed.
+    let ext = if hop == 0 {
+        0
+    } else {
+        ((max_ms / 1000.0) * f64::from(sample_rate) / hop as f64).round().max(0.0) as usize
+    };
+    if ext == 0 {
+        return f0.to_vec();
+    }
+    let n = f0.len();
+    let mut out = f0.to_vec();
+    let mut i = 0usize;
+    while i < n {
+        if f0[i] > 0.0 {
+            i += 1;
+            continue;
+        }
+        let a = i;
+        let mut b = i;
+        while b < n && !(f0[b] > 0.0) {
+            b += 1;
+        }
+        let len = b - a;
+        // ⛔ Interior only: a leading or trailing run has no anchor on one side, and inventing a
+        // pitch where the score says there is none is not this function's business.
+        let left = if a > 0 { Some(f0[a - 1]) } else { None };
+        let right = if b < n { Some(f0[b]) } else { None };
+        // The frame that must stay unvoiced so the two islands never touch.
+        let keep = a + len / 2;
+        // S163 §40 —— **膨胀停在能量谷，而不是停在固定的 `ext`**。
+        //
+        // 固定宽度把岛边界撂在清辅音的**任意**位置（往往正是爆破上），而那道边界只有
+        // 0.25-3 ms 宽、两侧差 5-17 个半音 ⇒ 宽带瞬变。实测（鹅妈妈 × yachiyo，同一次 run）：
+        // PSOLA 造的 0-1k 竖线距岛边界 p50 **45 ms** vs 随机对照 158 ms（富集 3.5×），
+        // 其中 **9/12 条该处 f0 = 0**（清音段内）。
+        //
+        // 清辅音的能量剖面是「闭塞期(低) → 爆破(高) → 送气 → 元音(高)」，
+        // 谷就在爆破**之前** ⇒ 边界挪到谷上，音头(爆破+元音)照样在岛内
+        // （S160j 那条耳判拍板的效果不丢），接缝却落在能量最低处。
+        // ⛔ 只**收窄**不放宽：谷只在 `[.., ext]` 之内找 ⇒ 覆盖范围永远 ⊆ 固定 `ext` 的那一版。
+        let cell = hop.max(1);
+        let frame_rms = |k: usize| -> f64 {
+            let Some(x) = valley else { return f64::NAN };
+            let (lo, hi) = (k.saturating_mul(cell), (k + 1).saturating_mul(cell).min(x.len()));
+            if lo >= hi {
+                return f64::NAN;
+            }
+            let s: f64 = x[lo..hi].iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+            (s / (hi - lo) as f64).sqrt()
+        };
+        // 右侧（= 后一个音的**音头**方向，治 S154 音头碎片的就是它）：
+        // 在 `[b-ext, b)` 里找能量最低帧，膨胀区取 `(j_r, b)`。
+        let j_r = if valley.is_some() && right.is_some() && b > a {
+            let lo = b.saturating_sub(ext).max(keep + 1).max(a);
+            (lo..b)
+                .filter(|k| frame_rms(*k).is_finite())
+                .min_by(|p, q| frame_rms(*p).total_cmp(&frame_rms(*q)))
+                .unwrap_or_else(|| b.saturating_sub(ext))
+        } else {
+            b.saturating_sub(ext)
+        };
+        // 左侧（= 前一个音的**释放**方向）：对称地在 `[a, a+ext)` 里找谷。
+        let j_l = if valley.is_some() && left.is_some() {
+            let hi = (a + ext).min(keep).min(b);
+            (a..hi)
+                .filter(|k| frame_rms(*k).is_finite())
+                .min_by(|p, q| frame_rms(*p).total_cmp(&frame_rms(*q)))
+                .map_or(a + ext, |k| k + 1)
+        } else {
+            a + ext
+        };
+        // ⛔ 谷可能把两侧推到相接 ⇒ 退回固定宽度，`keep` 那一帧照旧保证不浊。
+        let (j_l, j_r) = if j_l >= j_r { (a + ext, b.saturating_sub(ext)) } else { (j_l, j_r) };
+        for (k, slot) in out.iter_mut().enumerate().take(b).skip(a) {
+            if k == keep {
+                continue;
+            }
+            if k < keep {
+                if let Some(v) = left {
+                    if k < j_l {
+                        *slot = v;
+                    }
+                }
+            } else if let Some(v) = right {
+                if k > j_r {
+                    *slot = v;
+                }
+            }
+        }
+        i = b.max(a + 1);
+    }
+    out
+}
+
+/// S154 — the midpoint of the **undilated** island that a dilated island grew out of, so the mark
+/// train keeps the phase it had before. `None` (no raw islands, i.e. the arm is off, or no overlap)
+/// falls back to the dilated island's own midpoint = the legacy behaviour.
+///
+/// ⚠ Overlap, not containment: a dilated island can swallow more than one raw island (that is the
+/// bridging case). Seed from the **first** one — arbitrary but stable, and stability is the whole
+/// point of this function.
+fn seed_mid(raw: &[(usize, usize)], a: usize, b: usize) -> Option<f64> {
+    raw.iter().find(|(ra, rb)| *rb > a && *ra < b).map(|(ra, rb)| (*ra + *rb) as f64 * 0.5)
+}
+
+/// S154 — the window the **readout** [`PsolaDiagnostics::env_dev_p50_db`] uses, in ms.
+/// Fixed so the number is comparable across runs and knob settings; the *fix* takes its own width.
+const ENV_READ_MS: f64 = 5.0;
+
+/// S154 — how far the restoration gain may ever move a sample, dB. A guard rail, not a parameter:
+/// a real envelope violation on this line is 0.5-11 dB, so ±12 only ever catches a division by an
+/// envelope that has collapsed (silence, a mis-detected island edge) — the case where a corrective
+/// gain would otherwise explode.
+const ENV_RESTORE_CLAMP_DB: f64 = 12.0;
+
+/// Short-time RMS envelope, window `2*half+1` samples, shrinking at the two ends.
+/// Prefix-sum, so it is O(n) and — unlike a per-sample loop over a slice — does not change cost
+/// with the window width.
+fn rms_envelope(x: &[f32], half: usize) -> Vec<f64> {
+    let n = x.len();
+    let mut c = vec![0.0f64; n + 1];
+    for i in 0..n {
+        let v = f64::from(x[i]);
+        c[i + 1] = c[i] + v * v;
+    }
+    let mut e = vec![0.0f64; n];
+    for (i, slot) in e.iter_mut().enumerate() {
+        let a = i.saturating_sub(half);
+        let b = (i + half + 1).min(n);
+        *slot = ((c[b] - c[a]) / (b - a) as f64).max(0.0).sqrt();
+    }
+    e
+}
+
+/// Median |env(out) / env(in)| in dB over `covered`, ignoring anything more than 40 dB under the
+/// input's peak (there the ratio is noise-on-noise and says nothing).
+fn env_dev_p50_db(ey: &[f64], ex: &[f64], covered: &[bool]) -> f64 {
+    let peak = ex.iter().fold(0.0f64, |m, v| m.max(*v));
+    if peak <= 0.0 {
+        return 0.0;
+    }
+    let floor = peak * 10f64.powf(-40.0 / 20.0);
+    let mut v: Vec<f64> = Vec::new();
+    for i in 0..ey.len().min(ex.len()).min(covered.len()) {
+        if covered[i] && ex[i] > floor && ey[i] > 0.0 {
+            v.push((20.0 * (ey[i] / ex[i]).log10()).abs());
+        }
+    }
+    if v.is_empty() {
+        return 0.0;
+    }
+    v.sort_by(f64::total_cmp);
+    v[v.len() / 2]
+}
+
+/// S154 — **make the process keep the amplitude envelope it was given.**
+///
+/// Inside the covered span only, rescale the output so its short-time RMS envelope matches the
+/// input's. Outside it the samples are not touched at all, so the covered/uncovered boundary
+/// cannot be moved by this arm (that boundary is where the defect lives, so it matters that the
+/// fix does not manufacture a second one).
+///
+/// ⚠ **What this must not do**: a gain that varies fast IS a modulation, and if the window is
+/// short enough to track individual source periods the division re-injects the *donor's* f0 into
+/// the output. Measured on the probe (donor-f0 leakage, harmonics of `f0_don` that do not
+/// coincide with `f0_out`): today −34.7 dB, and after restoration at 2 / 5 / 10 / 20 ms
+/// **−31.6 / −32.8 / −34.1 / −34.3** ⇒ under about 10 ms the cost starts to show. Pick the width
+/// with that in mind; the knob is in milliseconds precisely so the trade is explicit.
+/// ⛔⛔ **Two things here are not decoration, they are what makes the arm not backfire.**
+///
+/// 1. **The gain is smoothed before it is applied.** `env(g·y) == g·env(y)` only holds while `g`
+///    is constant across the window; a raw per-sample `ex/ey` is not, so applying it lands
+///    somewhere near — but not at — the target, and the miss is a *new* fast amplitude wobble.
+/// 2. **Two passes.** One pass leaves the residue from (1). Measured on the very fixture that
+///    caught this: at +1 st, where the violation is only 0.37 dB to begin with, a single
+///    unsmoothed pass made the deviation **worse** (0.37 → 1.05 dB). ⇒ a corrective arm has to be
+///    tested at the shifts where there is almost nothing to correct, not just where the defect is
+///    big — otherwise "it helps" is only ever measured where it cannot lose.
+/// S159i —— 包络还原的窗宽**以 donor 的周期计,不是毫秒**,而且**逐岛**算。
+///
+/// ## ⛔ 为什么不能是一个毫秒常数(这条是量出来的,不是设计出来的)
+/// 真素材上 donor 的参数化基频(yachiyo/RVC,生产计划,四个位移)最低到 **123-185 Hz**
+/// ⇒ 一个周期 **5.4-8.1 ms**。而窗宽与代价的关系整条是**按周期**走的
+/// (真 donor 缓冲 + 生产 f0 的扫描,`TESTING\s159i_knob\`):
+///
+/// | 宽度 | 交界坑 dB(目标 = donor 自己的 1.00 / 2.05) | donor 基频泄漏 |
+/// |---|---|---|
+/// | 关 | 4.63 / 3.78 | −48.8 / −46.9 |
+/// | 0.2 ms(≈0.07 周期) | 1.01 / 2.25 | **−16.6 / −16.1** |
+/// | 1 ms(≈0.35 周期) | 0.92 / 2.07 | −40.7 / −34.4 |
+/// | 2 ms(≈0.70 周期) | 0.91 / 2.02 | −45.6 / −46.9 |
+/// | **3-5 ms(1.0-1.7 周期)** | **0.93-0.95 / 2.03-2.10** | **−48.8 / −46.8**(= 关掉时同档) |
+/// | 8 / 10 / 20 ms(2.8-7 周期) | 1.47 / 2.33 / **5.00** | 同上 |
+///
+/// ⇒ 甜区 ≈ **1-2 个 donor 周期**:再窄开始漏 donor 基频,再宽收益迅速掉光(20 ms 比**关掉还差**)。
+/// ⚠ 一个固定 5 ms 在 123 Hz 的 donor 上只有 **0.62 个周期** —— 正好落在泄漏区。
+/// ⚠ S154 的 doc 写「10 ms 以下代价就开始显」,在这份素材上**偏保守**:拐点在 ~2 ms。
+///   两处口径不同(那次是 659 Hz 的 ぴゃ donor),⇒ 两个读数都留着,别互相覆盖。
+///
+/// ## ⛔ 为什么必须逐岛
+/// 用**整条缓冲**里最低的那个 f0 定宽,等于让全曲最低的一个音把每个岛的窗都撑宽:
+/// 上表里 12 ms 只剩 3.30 dB(收益掉了七成)。而末句那个岛自己的最低 donor 基频是 262 Hz
+/// ⇒ 1.5 周期 = 5.7 ms,正好在甜区。
+///
+/// ⭐ 顺带,逐岛**也是**这一刀能和窗内逆变换共存的原因:增益不再跨岛抹平
+/// (见 `psola_shift_win` 的前置条件那一段)。
+const ENV_RESTORE_PERIODS: f64 = 1.5;
+
+/// 逐岛窗宽的上限(毫秒)—— 防病态,不是调音旋钮。
+const ENV_RESTORE_MS_CAP: f64 = 30.0;
+
+/// 这个岛的包络还原窗半宽(样本):`max(floor, ENV_RESTORE_PERIODS / f0_min(岛))`,封顶。
+///
+/// ⛔ 取不到周期时**退回 floor**(而不是「不做」):这一刀只在 `covered` 上乘一个被夹住的增益,
+/// 做过头的失败方向是收益变小,不是产出新的东西。
+fn env_restore_half(
+    f0_hz: &[f32],
+    f0_hop: usize,
+    a: usize,
+    b: usize,
+    sr: f64,
+    floor: usize,
+) -> usize {
+    let cap = ((ENV_RESTORE_MS_CAP * sr / 1000.0) as usize).max(4);
+    let mut h = floor;
+    if f0_hop > 0 && !f0_hz.is_empty() {
+        let k0 = (a / f0_hop).min(f0_hz.len());
+        let k1 = (b / f0_hop + 2).min(f0_hz.len());
+        let lowest = f0_hz[k0..k1]
+            .iter()
+            .map(|v| f64::from(*v))
+            .filter(|v| *v > 0.0)
+            .fold(f64::INFINITY, f64::min);
+        if lowest.is_finite() && lowest > 0.0 {
+            h = h.max((ENV_RESTORE_PERIODS * sr / lowest) as usize);
+        }
+    }
+    h.clamp(4, cap)
+}
+
+/// S159za —— `give_up`:**需要的校正超过 [`ENV_RESTORE_CLAMP_DB`] 时,干脆不动这个样本**
+/// (增益取 1.0),而不是像今天这样抬满 +12 dB。
+///
+/// ⛔ 为什么:用户 2026-08-22 报的咔哒是唱音内部 **20-70 dB** 的凹陷。这把刀够不着它们
+/// (夹子 ±12 dB、谷底 −60 dB 以下直接跳过、校正被平滑到 12-28 ms 而凹陷宽 2-40 ms),
+/// 却会在坑**附近**把增益抬满 —— 把残留的毛刺一起放大。
+/// 实测(S159za,炉心融解 +7 × yachiyo,只改这一个旋钮):整把关掉 envfix 之后
+/// 咔哒点读 92.6 → 76.6、深窗候选 149 → 143、泄漏深 p90 −22.98 → −27.12(阴性对照不动),
+/// **但音符交界塌陷从 9.85 恶化到 13.21 dB** —— 那是这把刀原本买到的东西。
+/// ⇒ `give_up` 想两头都要:交界塌陷只有 2-4 dB(远在夹子以内)⇒ 照修;
+///   深坑需要 20-70 dB ⇒ 超出夹子 ⇒ 不动。
+///
+/// ⛔⛔ **它到今天为止一条臂都没跑过 —— 上面那句「想两头都要」是【设计意图】,不是读数。**
+/// 那一批消融被 `LNK1104`(一个遗留的 `utai_lib` 测试进程锁死链接器)整批空跑掉了;
+/// 随后 S159zb 从另一条路找到了根因(**重复计数**,见 `score2svc.rs` 的 `valley_adaptive`),
+/// 这把旋钮就没有再排期。⇒ **要用它,先自己跑一遍带阴性对照的消融;别引用这段 doc 当证据。**
+/// ⚠ 默认关 ⇒ 今天它对输出**逐位无影响**(`env_give_up()` 未设时返回 false)。
+fn restore_envelope_with(
+    out: &mut [f32],
+    x: &[f32],
+    covered: &[bool],
+    half: usize,
+    give_up: bool,
+) {
+    let ex = rms_envelope(x, half);
+    let peak = ex.iter().fold(0.0f64, |m, v| m.max(*v));
+    if peak <= 0.0 {
+        return;
+    }
+    let floor = peak * 10f64.powf(-60.0 / 20.0);
+    let lo = 10f64.powf(-ENV_RESTORE_CLAMP_DB / 20.0);
+    let hi = 10f64.powf(ENV_RESTORE_CLAMP_DB / 20.0);
+    for _pass in 0..2 {
+        let ey = rms_envelope(out, half);
+        let raw: Vec<f64> = (0..out.len())
+            .map(|i| {
+                if covered[i] && ex[i] > floor && ey[i] > floor {
+                    let r = ex[i] / ey[i];
+                    // S159za —— 修不动就别硬修(见 `restore_envelope_with` 的 doc)。
+                    if give_up && (r > hi || r < lo) {
+                        1.0
+                    } else {
+                        r.clamp(lo, hi)
+                    }
+                } else {
+                    1.0
+                }
+            })
+            .collect();
+        // ⛔ The gain is smoothed **wider than the measurement window** on purpose: it may only
+        // carry the SLOW part of the correction. A step at an island start is 10-40 ms wide;
+        // anything faster than that is period-scale, and a gain that tracked it would be
+        // re-injecting the donor's fundamental (see the leakage numbers on this function).
+        let g = box_average(&raw, half * 4);
+        for i in 0..out.len() {
+            if covered[i] {
+                out[i] = (f64::from(out[i]) * g[i]) as f32;
+            }
+        }
+    }
+}
+
+/// S159za —— 今天的行为(`give_up = false`),保留给所有既有调用点与判据。
+fn restore_envelope(out: &mut [f32], x: &[f32], covered: &[bool], half: usize) {
+    restore_envelope_with(out, x, covered, half, env_give_up());
+}
+
+/// S159za —— `UTAI_PSOLA_ENVGIVEUP=0/1`。**默认 0 = 与今天逐位相同。**
+fn env_give_up() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("UTAI_PSOLA_ENVGIVEUP").ok().as_deref().map(str::trim),
+            Some("1" | "true" | "on" | "yes")
+        )
+    })
+}
+
+/// The infrasonic baseline of `x` at the **ruler's** shape (2 box passes = a triangular
+/// low-pass). ⛔ The **cut** uses [`CUT_BOX_PASSES`]; see [`infrasonic_baseline_passes`]. See
+/// [`INFRASONIC_MA_MS`] for the measured response.
+fn infrasonic_baseline(x: &[f32], sample_rate: u32) -> Vec<f64> {
+    infrasonic_baseline_ms(x, sample_rate, INFRASONIC_MA_MS)
+}
+
+/// Same, with the width given explicitly — the constant has to be **scannable by a criterion**,
+/// or "someone widened it back to 20 ms" and "the arm works" look identical from every test here.
+/// (Measured: with the width hard-coded, changing 8 → 20 ms left the whole file green while the
+/// benefit halved. That is the S147 silent-halving shape.)
+fn infrasonic_baseline_ms(x: &[f32], sample_rate: u32, ms: f64) -> Vec<f64> {
+    infrasonic_baseline_passes(x, sample_rate, ms, RULER_BOX_PASSES)
+}
+
+/// S155 笔5 —— **几遍盒**。`RULER_BOX_PASSES` 是那把**尺子**([`PsolaDiagnostics::infrasonic_frac`])
+/// 的遍数,永远是 2;[`CUT_BOX_PASSES`] 是**刀**的遍数。
+///
+/// ## ⛔⛔ 为什么刀非得是 4 遍(用户听出来的,而且我事先量到过又照样上线)
+///
+/// 差分式 `out -= LP(out) − LP(in)` 里的 `+LP(in)` 是**一份低通过的 donor**,而 donor 唱得更低。
+/// 两遍盒的**第一个旁瓣只有 −27 dB**,所以只要被救的那个音的基频落在旁瓣上,
+/// 它就会被原样加回输出 ⇒ 输出里多出**第二个音高** ⇒ 用户 2026-08-19 的原话:
+/// 「f0 附近偏下多了一道有点时长的共振峰伪影,听起来甚至有一点**合唱感**」。
+///
+/// ⭐ 排序是他先听出来的,仪器完全对上(用户点名的 244.9-245.96 s,落在 −12 窗 ⇒
+/// donor 基频 = f_out/2 = 310.6 Hz;该带能量相对各自 400-4000 Hz):
+///
+/// | 臂 | f_out/2 附近 |
+/// |---|---|
+/// | 无扩展(根本没有这道工序) | −48.7 dB |
+/// | 不开这把刀 | −42.8 |
+/// | 固定 8 ms | −33.8 |
+/// | **自适应 4.36 ms(shipped)** | **−25.7** |
+///
+/// 渲染地板(同设置两跑)只有 **0.19 dB**。解析对拍:两遍盒在 310.6 Hz 上
+/// 4.36 ms 读 −27.05 dB、8.0 ms 读 −35.73 dB ⇒ 预言两臂差 **+8.68 dB**,实测 **+8.10**。
+///
+/// ⛔ **根因不是宽度选错了**:宽度规则把第一个零点放在**这段缓冲里最低**的基频上,而**被救的
+/// 那个音**的基频比它高 ⇒ 落在旁瓣里。旁瓣有多深是滤波器的性质,不是宽度的性质。
+/// ⇒ 4 遍盒把「被救音的基频高 1.5 倍」这一档从 **−26.8 dB** 压到 **−53.6 dB**(解析),
+/// 零地板探针上实测:s14 不加刀 −41.42 → 2 遍 **−34.31**(漏了 +7.1)→ 4 遍 **−41.44**(漏没了)。
+/// ⚠ 代价:同宽度下拿掉量少 **2-3 dB**(20-125 Hz)。⭐ 但用户已经确认那条底部亮带在
+/// 拿掉量更少的「固定 8 ms」臂上就已经消失了 ⇒ 余量充足,而合唱感是他明确说更糟的那一条。
+fn infrasonic_baseline_passes(x: &[f32], sample_rate: u32, ms: f64, passes: usize) -> Vec<f64> {
+    let half = (((f64::from(sample_rate) * ms / 1000.0) as usize) / 2).max(1);
+    let mut v: Vec<f64> = x.iter().map(|s| f64::from(*s)).collect();
+    for _ in 0..passes {
+        v = box_average(&v, half);
+    }
+    v
+}
+
+/// The **ruler**'s box passes. ⛔ Never change it: every historical `infrasonic_frac` on this line
+/// (S152's 10.8/25.5/33.7 %, S154's tables, S155's 8.84/23.00/17.27 %) was taken with 2 passes,
+/// and a ruler whose shape follows the knob is not a ruler.
+const RULER_BOX_PASSES: usize = 2;
+/// The **knife**'s box passes. See [`infrasonic_baseline_passes`] for why it is 4 and not 2.
+const CUT_BOX_PASSES: usize = 4;
+
+fn add_bell(
+    x: &[f32],
+    acc: &mut [f64],
+    wsum: &mut [f64],
+    s_pos: f64,
+    t_pos: f64,
+    lw: f64,
+    rw: f64,
+    formant_rate: f64,
+    frac_transport: bool,
+    // S156 —— 这一颗粒的增益。`xgrain` 把一颗粒拆成**相邻两个源脉冲**的加权和时用它。
+    // ⛔ `gain == 1.0` 时 `v * w * 1.0` 与 `v * w` 在 IEEE 下**逐位相同** ⇒ 今天不变。
+    gain: f64,
+    residual: &mut ResidualStat,
+) {
+    let n = x.len() as isize;
+    // The true displacement, and the part of it the integer index can express.
+    let delta = t_pos - s_pos;
+    // ⚠ `delta.round()` vs `round(t) − round(s)` on the carrying arm is **conditioning, not
+    // correctness**: either choice leaves `si = i − frac` at the same source position, it only
+    // changes how big `frac` gets (≤0.5 vs ≤1.0) and therefore how far off-centre the sinc read
+    // sits. Don't write a test asserting this line — it would be asserting a preference.
+    let d = if frac_transport {
+        delta.round() as isize
+    } else {
+        t_pos.round() as isize - s_pos.round() as isize
+    };
+    // What is left on the table. `frac_transport` applies it below, so it only accumulates into
+    // the diagnostic when we are actually throwing it away.
+    let frac = delta - d as f64;
+    residual.push(if frac_transport { 0.0 } else { delta - (t_pos.round() - s_pos.round()) });
+    // ⭐ S165 —— 核在这一颗粒内是常数(见 [`SincKernel`]);只有真的会用到时才算。
+    let kern = (formant_rate == 1.0 && frac != 0.0 && frac_transport).then(|| SincKernel::new(frac));
+    for (w0, w1, rise) in [(-lw, 0.0, true), (0.0, rw, false)] {
+        let i0 = (s_pos + w0).round() as isize;
+        let i1 = (s_pos + w1).round() as isize;
+        if i1 <= i0 {
+            continue;
+        }
+        let len = (i1 - i0) as f64;
+        for i in i0..i1 {
+            let ti = i + d;
+            if ti < 0 || ti >= n {
+                continue;
+            }
+            let ph = ((i - i0) as f64 + 0.5) / len * std::f64::consts::PI;
+            let w = if rise {
+                0.5 * (1.0 - ph.cos())
+            } else {
+                0.5 * (1.0 + ph.cos())
+            };
+            // κ = 0 (formant_rate == 1) keeps the whole-sample path: no interpolation at all, so
+            // the ratio-1.0 identity stays bit-exact. Only a non-zero formant move reads the
+            // source at a stride, which is what scales the spectral envelope by that stride.
+            // The source position that maps onto output `ti`. Integer transport reads `i`;
+            // carrying the residual reads `i - frac` (⇒ `frac == 0` collapses to the same read,
+            // which is why ratio 1.0 stays bit-exact either way).
+            let si = i as f64 - if frac_transport { frac } else { 0.0 };
+            let v = if formant_rate == 1.0 {
+                if frac == 0.0 || !frac_transport {
+                    // ⚠ Fast path kept for bit-exactness, NOT for speed. Removing it leaves the
+                    // identity intact to 5.5e-18 (measured), but `assert_eq!` is a stronger gate
+                    // than an epsilon and this line is what lets us keep it.
+                    if i < 0 || i >= n {
+                        continue;
+                    }
+                    f64::from(x[i as usize])
+                } else if let Some(k) = kern.as_ref() {
+                    // ⭐ S165 —— 与 `sinc_read(x, si)` 逐位相同,只是核不再逐样本重算。
+                    k.read(x, i)
+                } else {
+                    sinc_read(x, si)
+                }
+            } else {
+                // κ ≠ 1 scales the read stride about `s_pos`, which is what moves the spectral
+                // envelope. The residual composes INSIDE that map — correcting it afterwards
+                // would be corrected by the wrong factor.
+                let sp = s_pos + (si - s_pos) * formant_rate;
+                if sp < 0.0 || sp >= (n - 1) as f64 {
+                    continue;
+                }
+                // S162 —— ⛔ 这里以前是**线性插值**,而本文件 `TRANSPORT_SINC_HALF` 的 doc
+                //   逐字写着「Never substitute linear interpolation here」。实测线性在
+                //   10-16 kHz 掉 **1.2-2.0 dB**,而 sinc **0.00** ⇒ 换掉是零代价的。
+                //   救援时 `formant_rate > 1` = 下采样 ⇒ 必须**按步长抗混叠**。
+                //   见 [`sinc_read_strided`]。
+                sinc_read_strided(x, sp, formant_rate)
+            };
+            acc[ti as usize] += v * w * gain;
+            wsum[ti as usize] += w * gain;
+        }
+    }
+}
+
+/// Shift `x` by `semitones` (positive = up) keeping duration and formants. `f0_hz` is the
+/// per-frame fundamental of `x` itself (0 = unvoiced), `f0_hop` its stride in samples.
+/// Output length always equals input length.
+pub fn psola_shift(
+    x: &[f32],
+    sample_rate: u32,
+    semitones: f64,
+    f0_hz: &[f32],
+    f0_hop: usize,
+) -> Vec<f32> {
+    psola_shift_diag(x, sample_rate, semitones, f0_hz, f0_hop).0
+}
+
+/// As [`psola_shift`], plus what it could not do cleanly.
+pub fn psola_shift_diag(
+    x: &[f32],
+    sample_rate: u32,
+    semitones: f64,
+    f0_hz: &[f32],
+    f0_hop: usize,
+) -> (Vec<f32>, PsolaDiagnostics) {
+    psola_shift_formant(x, sample_rate, semitones, 0.0, f0_hz, f0_hop)
+}
+
+/// As [`psola_shift_diag`], but the formant envelope is additionally moved by
+/// `formant_semitones` **relative to the input** — the same convention the Signalsmith arm used
+/// (`FormantPin::semitones`), so the κ slider keeps its meaning across the engine change:
+/// `formant_semitones = κ · semitones`, κ=0 keeps the source timbre (the default, and the arm
+/// the user A/B'd), κ=1 makes the formants follow the pitch (the plain transpose / chipmunk).
+///
+/// Keeping the whole κ range inside ONE engine is deliberate: routing κ>0 to a second engine
+/// would put a cliff in the middle of a user-facing slider and two engines on a shared surface
+/// (`apply_inverse` serves score and cover, S85: "fixing A ≠ leaving B unharmed").
+pub fn psola_shift_formant(
+    x: &[f32],
+    sample_rate: u32,
+    semitones: f64,
+    formant_semitones: f64,
+    f0_hz: &[f32],
+    f0_hop: usize,
+) -> (Vec<f32>, PsolaDiagnostics) {
+    psola_shift_opts(x, sample_rate, semitones, formant_semitones, f0_hz, f0_hop, false)
+}
+
+/// Same, with the S146g sub-sample transport switch.
+/// ⚠ `frac_transport = false` is byte-for-byte the pre-S146g behaviour — production still runs
+/// that arm until a blind test settles it (the rulers cannot: `TRANSPORT_SINC_HALF`).
+#[allow(clippy::too_many_arguments)]
+pub fn psola_shift_opts(
+    x: &[f32],
+    sample_rate: u32,
+    semitones: f64,
+    formant_semitones: f64,
+    f0_hz: &[f32],
+    f0_hop: usize,
+    frac_transport: bool,
+) -> (Vec<f32>, PsolaDiagnostics) {
+    psola_shift_wsola(x, sample_rate, semitones, formant_semitones, f0_hz, f0_hop, frac_transport, 0.0)
+}
+
+/// S148 — additive: an optional **bounded waveform-similarity search on the SOURCE side** (WSOLA).
+///
+/// ## What it is for
+///
+/// Measured on real material at +7 st (akiko donor, the production caliber): **3.9–4.3 % of voiced
+/// frames come out more than 4 dB below the input**, while praat on the *same input at the same
+/// ratio* does that on **0.2 %** — a 20× gap, so it is not inherent to TD-PSOLA. Five candidate
+/// causes were each killed by measurement: the input's own properties (f0-matched controls: every
+/// difference ≈ 0), the analysis marks (99.82 % of spacings within 0.7–1.3 × the f0 period, **0.0 %
+/// anomaly rate at the notch frames**), the grain displacement δ (`corr(Δlevel, |δ|) = +0.07`), the
+/// fed-f0 source (score-parametric vs measured: 3.91 % vs 4.29 % — measured is no better), and the
+/// island count (272 vs 88 islands, same notch rate).
+///
+/// What the diagnostics say is that **the window sum is intact where the notches are**
+/// (`cola_gap_frac` = 0.0 %, `cola_w_median` = 1.000 on both arms) ⇒ the level is not lost to a
+/// COLA hole, it is lost to **grain-to-grain signal cancellation**.
+///
+/// And there is a structural asymmetry behind that: [`max_correlation`] is used **only in the
+/// analysis pass** (to place the marks). The synthesis pass places every grain *blindly* at
+/// `src[k]` — nothing ever checks that the grain about to be added is in phase with what has
+/// already accumulated. `wsola_frac > 0` adds exactly that check.
+///
+/// ## Contract
+///
+/// * `wsola_frac` is the search radius **as a fraction of the grain's left half-width**, so it is
+///   always < one period and cannot alias onto the neighbouring pitch pulse.
+/// * ⛔ **Only the SOURCE read position moves.** The synthesis pulse `tm` is untouched, so the
+///   output pitch and the exact-length contract are structurally unaffected — moving `tm` instead
+///   would jitter the pitch by the search radius.
+/// * The search must **beat the unshifted position by a margin** to move, so ratio 1.0 (where the
+///   accumulator already *is* the windowed input at that position) keeps `s == src[k]` and the
+///   identity gate stays honest. `wsola_frac = 0.0` is byte-for-byte the pre-S148 behaviour.
+#[allow(clippy::too_many_arguments)]
+pub fn psola_shift_wsola(
+    x: &[f32],
+    sample_rate: u32,
+    semitones: f64,
+    formant_semitones: f64,
+    f0_hz: &[f32],
+    f0_hop: usize,
+    frac_transport: bool,
+    wsola_frac: f64,
+) -> (Vec<f32>, PsolaDiagnostics) {
+    psola_shift_locked(
+        x, sample_rate, semitones, formant_semitones, f0_hz, f0_hop, frac_transport, wsola_frac, 0.0,
+    )
+}
+
+/// S150 — additive: **phase-lock the analysis marks** onto the glottal pulses before synthesis.
+///
+/// `phase_lock` is the search radius in periods; **0.0 = off = byte-for-byte the pre-S150 arm**,
+/// which is what production still runs until a blind test says otherwise (S146 protocol: blind
+/// test first, flip after — and S148's WSOLA is why that protocol is not negotiable).
+///
+/// ## What it buys, measured
+///
+/// The defect is the one the user named from the waveform, and S148 traced it to a single input:
+/// our marks have the right period and the wrong phase (see [`lock_phase`]). Locking them at
+/// `0.45` closes essentially the whole gap to the "upper bound" arm (= our synthesis fed praat's
+/// marks, the arm that won a blind group in S148's u1):
+///
+/// | | `[785]` | `[685]` | `[800]` | `[791]` | `[86]` |
+/// |---|---|---|---|---|---|
+/// | today | 9.49 | 5.38 | 5.25 | 4.99 | 1.14 |
+/// | **locked 0.45** | **3.51** | **0.80** | **0.85** | **1.26** | 0.95 |
+/// | upper bound (praat's marks) | 3.45 | 0.83 | 0.69 | 1.20 | 1.13 |
+///
+/// Population, not just the 5 registered notes — all 23 non-rest notes ≥0.8 s, "modulation this
+/// process ADDED to the input", median/p90: today **+2.09 / +5.94 dB**, locked **+0.00 / +0.26**,
+/// praat's marks **+0.02 / +0.35**. It holds across the whole shift range in both directions
+/// (−7 −5 −2 +1 +3 +5 +7) and on a second material (the registered 东雪莲 fixture at +6, where
+/// praat *is* a valid reference: injection +2.86 → +0.88 against praat's own +1.49).
+///
+/// The four registered rulers agree (goose +7, all 23 windows): envelope shift +0.30 → +0.20
+/// (praat +0.20), peak correlation 0.976 → **0.981** (praat 0.979), voiced survival 87.4% →
+/// **89.4%** (praat 89.5%), ΔHNR −1.58 → **−1.34** (praat −0.94), >4 kHz share unchanged.
+///
+/// ⚠ What is NOT settled: **whether it is audible**. The depth ruler has exactly one audibility
+/// data point (S148 u1: ~2.7 dB heard, ≤0.46 dB not), from a single load-bearing group.
+#[allow(clippy::too_many_arguments)]
+pub fn psola_shift_locked(
+    x: &[f32],
+    sample_rate: u32,
+    semitones: f64,
+    formant_semitones: f64,
+    f0_hz: &[f32],
+    f0_hop: usize,
+    frac_transport: bool,
+    wsola_frac: f64,
+    phase_lock: f64,
+) -> (Vec<f32>, PsolaDiagnostics) {
+    psola_shift_infra(
+        x, sample_rate, semitones, formant_semitones, f0_hz, f0_hop, frac_transport, wsola_frac,
+        phase_lock, Infrasonic::Off,
+    )
+}
+
+/// S152 — additive: optionally **subtract the infrasonic baseline this process manufactures**.
+///
+/// `remove_infrasonic = false` is byte-for-byte the pre-S152 arm and is what production runs
+/// until a blind test settles it (S146 protocol; S148's WSOLA is why that protocol is not
+/// negotiable — it read 4.80 % → 0.38 % on its own ruler and was 3/3 rejected by ear).
+///
+/// ## What it is for
+///
+/// See [`PsolaDiagnostics::infrasonic_frac`] for the measurement and the mechanism. Short form:
+/// an up-shift narrows every grain's read window to less than one period while keeping it centred
+/// on a (phase-locked, i.e. peak-aligned) mark, that window's own mean is not zero, and
+/// `wsum ≈ 1` lays it down as a wandering baseline — up to a third of a rescued note's energy at
+/// −14 st. ⚠ It is NOT a property of asymmetric waveforms; a sine does it too (see the gate).
+///
+/// ## What it buys
+///
+/// ⛔ The first version of this paragraph said "it is not an audibility fix". That was wrong for
+/// the reason spelled out on [`PsolaDiagnostics::infrasonic_frac`]: the energy share is
+/// inaudible, but the **steps** put **+16 to +24 dB into 20-60 Hz** at exactly the moments the
+/// user calls seams. With the cut at 12 ms this arm puts that band back within **0.4 dB** of the
+/// un-rescued render while moving the fundamental by **0.02 dB**.
+/// It also stops every RMS-domain ruler we own from silently counting a DC offset as signal, and
+/// stops the waveform riding off-centre (the shape the user named "波形甚是诡异" on `[685]`).
+///
+/// ## Contract (S155 rewrote this section — the two ⛔ lines below used to say the opposite)
+///
+/// * The removal is `out -= LP(out) - LP(in)`: **differential**, not `out -= LP(out)`.
+///   Linear, zero-phase, band-limited; width per [`Infrasonic`].
+/// * ⭐ It **is** bit-exact at ratio 1.0. The earlier version of this paragraph said a linear
+///   filter never is, and that was true of the non-differential form — which is why the arm was
+///   off by default and why `ratio_one_is_the_identity` (the cheapest non-self-certifying gate on
+///   this line; it killed three designs in S146 that "looked right") could not survive turning it
+///   on. The differential form settles it structurally instead of by exemption: at ratio 1.0
+///   `out ≡ x`, so `LP(out)` and `LP(x)` are the same bytes through the same code and the
+///   correction is **exactly 0.0**. ⛔ Note what this is NOT: a `semitones == 0` short-circuit.
+///   That shortcut would make the gate vacuously true, which is the exact shape that let the
+///   2026-07 implementation through (see the note at the top of [`psola_shift_env`]).
+/// * ⭐ Outside the voiced islands the correction is ≈0 for the same reason (`out ≡ x` there,
+///   bit-for-bit), so the un-transposed pass-through donor keeps its own low end — and it gets
+///   that **without a mask**, which would put a step at the island boundary, i.e. exactly the
+///   defect S154 spent a session removing.
+/// * The gate for the arm being ON is still
+///   `the_infrasonic_arm_leaves_everything_above_the_fundamental_alone`, and it is now joined by
+///   `ratio_one_is_the_identity_even_with_the_infrasonic_arm_on`.
+#[allow(clippy::too_many_arguments)]
+pub fn psola_shift_infra(
+    x: &[f32],
+    sample_rate: u32,
+    semitones: f64,
+    formant_semitones: f64,
+    f0_hz: &[f32],
+    f0_hop: usize,
+    frac_transport: bool,
+    wsola_frac: f64,
+    phase_lock: f64,
+    infrasonic: Infrasonic,
+) -> (Vec<f32>, PsolaDiagnostics) {
+    psola_shift_env(
+        x, sample_rate, semitones, formant_semitones, f0_hz, f0_hop, frac_transport, wsola_frac,
+        phase_lock, infrasonic, 0.0, 0.0, 0.0, 0.0, 0)
+}
+
+/// S154 — additive: optionally **restore the amplitude envelope** the process was handed.
+///
+/// `env_restore_ms = 0.0` is byte-for-byte the pre-S154 arm and is what production runs.
+/// See [`PsolaDiagnostics::env_dev_p50_db`] for what it is for and [`restore_envelope`] for the
+/// contract and the measured cost of a too-short window.
+///
+/// ⛔ Why it is a **width in milliseconds** and not a bool: the width is the whole trade. Too long
+/// and it cannot follow an attack (which is where the violation is); too short and the gain starts
+/// tracking individual source periods, which puts the donor's fundamental back into the output.
+#[allow(clippy::too_many_arguments)]
+pub fn psola_shift_env(
+    x: &[f32],
+    sample_rate: u32,
+    semitones: f64,
+    formant_semitones: f64,
+    f0_hz: &[f32],
+    f0_hop: usize,
+    frac_transport: bool,
+    wsola_frac: f64,
+    phase_lock: f64,
+    infrasonic: Infrasonic,
+    env_restore_ms: f64,
+    bridge_unvoiced_ms: f64,
+    win_periods: f64,
+    // S156 —— 颗粒内容在相邻两个源脉冲之间的**插值深度**,0…1。
+    // `0.0` = 今天 = 最近邻 `k = round(u)` = 逐位不变;`1.0` = 完全线性插值。
+    // 它存在的理由与它为什么在 ratio 1.0 上对任何深度都恒等,写在主循环里那一段。
+    xgrain: f64,
+    // S157b —— **LP-PSOLA 的阶数**。`0` = 关 = 今天,逐位不变;`>0` = 颗粒搬运挪进残差域。
+    // 机理、实测余量、以及「恒等为什么是结构性的」写在文件上方 LP-PSOLA 那一段。
+    lpc_order: usize,
+) -> (Vec<f32>, PsolaDiagnostics) {
+    psola_shift_win(
+        x, sample_rate, semitones, formant_semitones, f0_hz, f0_hop, frac_transport, wsola_frac,
+        phase_lock, infrasonic, env_restore_ms, bridge_unvoiced_ms, win_periods, xgrain, lpc_order,
+        &[],
+    )
+}
+
+/// S159 —— [`psola_shift_env`] 再加一条:**只把与 `keep` 相交的浊音岛送进工序**,其余岛原样透传。
+///
+/// `keep` = 一批**输出样本区间**(半开,可乱序、可重叠),空 = 整条缓冲 = [`psola_shift_env`]
+/// = **逐位同今天**。
+///
+/// ## ⛔ 它为什么存在
+/// 生产里一遍 donor 只有 1-30% 的音频会被拼回去(`vocal_range::apply_dead_only_windows` 只从
+/// donor 上切走「窗 ± 余量」那几段),而 S147 B2 之后**其余的 chunk 是铺零的** —— 可
+/// 喂给这里的 f0 是**整曲**的谱面音高,与音频无关 ⇒ `voiced_islands` 在铺零区照样划岛、
+/// `analysis_marks` 照样铺标记、颗粒照样合成。实测(S151 侦察):把一个 4.06 s 的浊音岛整段
+/// 铺零,该岛标记数 **1363 → 1439**(比真音频还密)。⇒ 这一整块工作量的产物**在拼接层被丢掉**。
+///
+/// ## ⛔⛔ 为什么是「逐岛 continue」而不是「把 buffer 切出来」
+/// 切 buffer 会同时改掉两族**全缓冲**量,而它们都是承重的:
+/// * `mean` / `dc_free` —— 标记是在去 DC 的信号上找的,DC 一变**全曲每一个标记**都会挪;
+/// * `x.len()` —— `find_extremum` / `max_correlation` / `analysis_marks` / `add_bell` 里五处
+///   边界判定挂在它上面,切口附近会**静默换分支**。
+///
+/// ## 保证与它的边界
+/// **保证**:`keep` 里的每一个样本与 `keep` 为空时**逐位相同**。
+/// **不保证**:`keep` 之外的样本(那里输出的是未移调的原始 donor)、以及**每一个诊断读数**
+/// (`islands` / `marks` / `cola_*` / `src_uncovered_frac` / `infrasonic_*` / `env_dev_*` 全部
+/// 换了统计样本集 ⇒ 会变,而且多半会「变好看」—— ⛔ 那是少做了工序,不是修好了什么)。
+///
+/// ## ⛔ 前置条件(任一不满足 ⇒ 忽略 `keep`,整条缓冲照跑,并置 `diag.keep_ignored`)
+/// 两条跨岛耦合会让「跳岛」在窗内**不再逐位相同**,而它们今天都靠出厂默认关着:
+/// 1. `lpc_order > 0` —— `lattice_synthesise` 是**全缓冲的 IIR 递归**,被跳掉的岛在今天会往
+///    激励里写东西,那条激励的振铃尾会传进后面的岛(岛外 `d` 恒为 0,但**零输入不等于零输出**);
+/// 2. `wsola_frac > 0` —— `wsola_pick` 读的是**已经累加的 `acc`** = 跨岛状态;
+///
+/// ⭐ **S159i:曾经的第三条(`env_restore_ms > 0`)已经不在这张表上。**当时它跨岛,是因为
+/// `restore_envelope` 在**整条缓冲**上算增益、再经 `box_average(raw, half*4)` 跨样本抹平,
+/// 而 `raw` 在非 `covered` 处是 1.0 ⇒ 跳掉一个岛会改变邻岛边上的增益。
+/// 现在它**逐岛**做(每个岛只看自己那一段 `out`/`x`/`covered`,窗宽由该岛自己的最低 donor
+/// 基频定,见 [`ENV_RESTORE_PERIODS`])⇒ 增益不再跨岛,窗与它可以同时开着。
+/// ⛔ 判据 `envelope_restore_is_per_island_and_therefore_window_safe` 盯着这条性质;
+///    ⚠ 别把它读成「跨岛耦合可以将就」—— 另外两条仍然是硬的。
+///
+/// ⚠ **还剩一条不是结构性的**:去次声的总闸 `e_out >= e_in` 是在**全缓冲**累加之后算的。
+/// 被跳掉的岛对**修正量**的贡献恒为 0(它那一段 `out ≡ x` ⇒ `fo ≡ fi`),但两个能量和是
+/// 「和的模」不是「模的和」,交叉项原则上能把这个闸推翻面,而那会让窗内的低频修正**整块**开/关。
+/// ⇒ 余量已作为 `diag.infrasonic_gate_db` 打进日志(生产口径上实测的余量见 S159 记录),
+/// 判据 `the_window_keeps_the_infrasonic_correction_bit_identical_inside` 盯着它。
+#[allow(clippy::too_many_arguments)]
+pub fn psola_shift_win(
+    x: &[f32],
+    sample_rate: u32,
+    semitones: f64,
+    formant_semitones: f64,
+    f0_hz: &[f32],
+    f0_hop: usize,
+    frac_transport: bool,
+    wsola_frac: f64,
+    phase_lock: f64,
+    infrasonic: Infrasonic,
+    env_restore_ms: f64,
+    bridge_unvoiced_ms: f64,
+    win_periods: f64,
+    xgrain: f64,
+    lpc_order: usize,
+    keep: &[(usize, usize)],
+) -> (Vec<f32>, PsolaDiagnostics) {
+    psola_shift_edge(
+        x, sample_rate, semitones, formant_semitones, f0_hz, f0_hop, frac_transport, wsola_frac,
+        phase_lock, infrasonic, env_restore_ms, bridge_unvoiced_ms, false, win_periods, xgrain,
+        lpc_order,
+        // ⛔ 最后一个 `false` = `tail_fade`:这个老的公开口**逐位不变**(测试在用)。
+        // 生产走的是 `psola_shift_edge`,那边由 `vocal_range::tail_fade()` 决定。
+        keep, false, 0.0, 0.0, false,
+    )
+}
+
+/// S159zj —— [`psola_shift_win`] 再加一个 `edge_fill`:**把岛边那段交叉淡化补完**。
+///
+/// ## 缺陷(实测,鹅妈妈 +7 × 东雪莲,全曲 1212 条岛边)
+///
+/// [`covered`] 的边界钉在**第一颗/最后一颗合成标记**上,而窗和要再爬约 `win_periods × T_src`
+/// 才满。合成那一段的分支于是在 `i = c0` 上**突然把干填料整项丢掉**:
+/// 岛外 `out = acc + (1−w)·carry`,岛内 `out = acc` ⇒ **每条岛边一个单样本宽带阶跃**,
+/// 幅度 = [`PsolaDiagnostics::edge_step_p50`]:
+///
+/// | 逆变换 | 岛边条数 | 台阶 p50 |
+/// |---|---|---|
+/// | +2 | 742 | 0.080 |
+/// | +7 | 200 | 0.160 |
+/// | +12 | 20 | 0.498 |
+/// | +14 | 50 | 0.538 |
+///
+/// ⭐ 它是 S156 把 `WIN_PERIODS_DEFAULT` 翻成 1.0 带进来的:`win_periods == 0` 时 `W̄ = 1`
+/// 且岛边第一颗钟形窗自己就到 1 ⇒ 这个台阶**解析地恒为 0**。
+///
+/// ## ⛔ 它**不是**「岛内短缺也糊上去」
+///
+/// 文件上方第 5 条与合成分支旁边的注释都写着:**岛内的窗和短缺是真缺陷,拿未移调音频盖住
+/// 它就是拍频不是修复。**这一刀只动**两端那段由【窗宽定义】造成的爬坡** ——
+/// 那一段的语义本来就是「交叉淡化」,岛外那半边已经在这么做了,这里只是把它做完。
+///
+/// ⇒ 三条硬门,少一条这一刀就会去碰真缺陷:
+/// ⑴ `edge_fill` 开着;⑵ `win_periods > 0`(否则爬坡宽度是 0,没有可补的);
+/// ⑶ **`ratio > 1`** —— 下移臂(cover 车道)`lw = rw = T_src`、`W·ratio < 1` 被 `.max(1.0)`
+///    夹住,那里的短缺**就是**真缺陷,而且 cover 那条线 S159k-o 已经收线,不许被这一刀碰。
+///
+/// ⚠ 爬坡宽度取**第一颗/最后一颗真的落下去的颗粒**的 `lw`/`rw`(被 `wmax` 跳过的不算),
+/// 否则「窗宽护栏跳过了颗粒」会让这一刀去补一段根本没有颗粒的区间。
+#[allow(clippy::too_many_arguments)]
+pub fn psola_shift_edge(
+    x: &[f32],
+    sample_rate: u32,
+    semitones: f64,
+    formant_semitones: f64,
+    f0_hz: &[f32],
+    f0_hop: usize,
+    frac_transport: bool,
+    wsola_frac: f64,
+    phase_lock: f64,
+    infrasonic: Infrasonic,
+    env_restore_ms: f64,
+    bridge_unvoiced_ms: f64,
+    // S163 §40 —— 桥接的膨胀**停在能量谷**而不是停在固定的 `bridge_unvoiced_ms`。
+    // `false` = 逐位同旧。见 [`bridge_unvoiced`] 里那一段。
+    bridge_valley: bool,
+    win_periods: f64,
+    xgrain: f64,
+    lpc_order: usize,
+    keep: &[(usize, usize)],
+    edge_fill: bool,
+    // S159zzf —— 读点去抖的强度(0…1)。`0.0` = 关 = 逐位不变。见 [`dejitter_marks`]。
+    dejitter: f64,
+    // S162 —— 谱倾斜还原的强度(0…1)。`0.0` = 关 = **逐位不变**。见 [`TILT_TABLE`]。
+    tilt: f64,
+    // ⛔⛔ S162 —— **缓冲区末尾被截断的那半个岛,不许原样透传**(`false` = 关 = 逐位不变)。
+    // 用户 2026-08-26:「歌曲结尾也会造出一个很明显的竖条纹伪影」。
+    // 归因(同一次 run 的转储逐层比):`donor_post` 的末尾 **232 样本(5.26 ms)与 `donor_pre`
+    // 逐位相同** ⇒ PSOLA 完全没碰它 ⇒ 那 5 ms 是**没被移调的原音高**(低 12 个半音),
+    // 而它顶在文件末尾、前面是低 10 dB 的合成音 ⇒ 阶跃 + 错音高 = 那条竖线。
+    // 详细机理与三条硬门见函数体里那一段。
+    tail_fade: bool,
+) -> (Vec<f32>, PsolaDiagnostics) {
+    let n = x.len();
+    let mut diag = PsolaDiagnostics::default();
+    let mut residual = ResidualStat::default();
+    // NOTE: deliberately no `semitones == 0 => return x` shortcut. That shortcut would make the
+    // ratio-1.0 identity gate vacuously true, which is the exact shape of gate that let the 2026-07
+    // implementation through. The caller (`vocal_range::apply_inverse`) owns the shift==0 fast path.
+    if n == 0 || !semitones.is_finite() || sample_rate == 0 || f0_hop == 0 {
+        return (x.to_vec(), diag);
+    }
+    let sr = f64::from(sample_rate);
+    let ratio = 2f64.powf(semitones / 12.0);
+    if !(ratio.is_finite() && ratio > 0.0) {
+        return (x.to_vec(), diag);
+    }
+    if !formant_semitones.is_finite() {
+        return (x.to_vec(), diag);
+    }
+    // Exactly 1.0 for κ=0 so the whole-sample (bit-exact) grain path is taken.
+    let formant_rate = if formant_semitones == 0.0 {
+        1.0
+    } else {
+        2f64.powf(formant_semitones / 12.0)
+    };
+    if !(formant_rate.is_finite() && formant_rate > 0.0) {
+        return (x.to_vec(), diag);
+    }
+    let mean = x.iter().map(|v| f64::from(*v)).sum::<f64>() / n as f64;
+    let dc_free: Vec<f32> = x.iter().map(|v| (f64::from(*v) - mean) as f32).collect();
+
+    // S157b —— LP-PSOLA。⛔ `lpc_order == 0` 时 `carry` 就是 `x`,下面每一处都逐位同旧。
+    // ⚠ 残差在**整个缓冲**上算(不是逐岛):`A(z)` 的估计要连续,而差分式接线保证岛外的差
+    //    恒为 0,所以「整缓冲」不会把岛外的东西带进来。
+    let (lpc_ks, lpc_hop) = if lpc_order > 0 {
+        let (k, h) = lpc_reflections(x, sample_rate, lpc_order);
+        (Some(k), h)
+    } else {
+        (None, 1)
+    };
+    let lpc_resid: Option<Vec<f32>> =
+        lpc_ks.as_ref().map(|k| lattice_analyse(x, k, lpc_hop, lpc_order));
+    let carry: &[f32] = lpc_resid.as_deref().unwrap_or(x);
+
+    // S154 —— 岛的划法。⛔ 默认 0 = 不膨胀 = 逐位同旧;见 `bridge_unvoiced` 的说明。
+    // `islands_raw` 是**膨胀前**的岛,只用来给标记播种(见 `analysis_marks` 的 `seed_at`)。
+    let min_island = (MIN_ISLAND_SECONDS * sr) as usize;
+    let islands_raw: Vec<(usize, usize)> = if bridge_unvoiced_ms > 0.0 {
+        voiced_islands(f0_hz, f0_hop, n, min_island)
+    } else {
+        Vec::new()
+    };
+    let bridged: Vec<f32>;
+    let f0_hz: &[f32] = if bridge_unvoiced_ms > 0.0 {
+        bridged = bridge_unvoiced(
+            f0_hz,
+            f0_hop,
+            sample_rate,
+            bridge_unvoiced_ms,
+            if bridge_valley { Some(x) } else { None },
+        );
+        &bridged
+    } else {
+        f0_hz
+    };
+
+    let mut acc = vec![0.0f64; n];
+    let mut wsum = vec![0.0f64; n];
+    let mut covered = vec![false; n];
+    // S159zj —— 岛边那段**由窗宽定义造成的爬坡**,`edge_fill` 开着时按岛外同一条式子填。
+    // ⛔ 与 `covered` 分开:统计口径一个字不动(见 [`PsolaDiagnostics::edge_step_p50`])。
+    let mut edge = vec![false; n];
+    // S159zj —— 每条浊音岛的覆盖边界,给 [`PsolaDiagnostics::edge_step_p50`] 用。
+    // ⛔ 在这里收而不是事后从 `covered` 上找边:相邻两个岛的覆盖区可以相接,
+    //    那样找出来的「边」会少掉中间那两条,而它们恰恰是快音上最密的一批。
+    let mut island_edges: Vec<(usize, usize)> = Vec::new();
+    // S155 笔4/笔6 —— 每颗粒的源周期,只收**读窗里真的有音频**的那些,而且**逐岛分开收**。
+    // 见 `infrasonic_width_ms`(为什么用颗粒的周期)与去次声那一段(为什么必须逐岛)。
+    // 每条 = (岛的覆盖起点, 覆盖终点, 该岛所有颗粒的源周期)。
+    let mut islands_periods: Vec<(usize, usize, Vec<f64>)> = Vec::new();
+    let mut this_island_periods: Vec<f64> = Vec::new();
+    let max_period = MAX_PERIOD_SECONDS * sr;
+    // 颗粒钟形窗半宽的上界(超过它的颗粒被整颗跳过)。⛔ 与 `island_guard` 共用同一个数。
+    let wmax = max_period * win_periods.max(1.0);
+    // S151 源覆盖率的累加器(见 `PsolaDiagnostics::src_uncovered_frac`)。
+    let (mut uncovered, mut span) = (0.0f64, 0.0f64);
+    // S159i —— **真的跑过**的岛(不是 `voiced_islands` 给的全部):包络还原逐岛做,
+    // 而「哪些岛跑过」正是窗决定的那件事。⛔ 用 `voiced_islands` 会把被跳掉的岛也还原一遍,
+    // 那等于把窗跳过的工序又做了回来。
+    let mut restored: Vec<(usize, usize)> = Vec::new();
+
+    // ── S159 窗内逆变换:`keep` 的归一化与前置条件 ────────────────────────────────
+    // 见 `psola_shift_win` 的 doc。⛔ 三条跨岛耦合任一活着 ⇒ 忽略窗(整条照跑),而且**要响**。
+    let keep_blocked = lpc_order > 0 || wsola_frac > 0.0;
+    diag.keep_ignored = !keep.is_empty() && keep_blocked;
+    let keep: Vec<(usize, usize)> = if keep.is_empty() || keep_blocked {
+        Vec::new()
+    } else {
+        // 夹进缓冲、丢掉空区间、排序合并 —— 后面每个岛都要扫一遍它,先做小。
+        let mut v: Vec<(usize, usize)> =
+            keep.iter().map(|&(s, e)| (s.min(n), e.min(n))).filter(|(s, e)| e > s).collect();
+        v.sort_unstable();
+        let mut m: Vec<(usize, usize)> = Vec::with_capacity(v.len());
+        for (s, e) in v {
+            match m.last_mut() {
+                Some((_, pe)) if s <= *pe => *pe = (*pe).max(e),
+                _ => m.push((s, e)),
+            }
+        }
+        m
+    };
+    diag.keep_frac = if keep.is_empty() {
+        1.0
+    } else {
+        (keep.iter().map(|(s, e)| e - s).sum::<usize>() as f64 / n as f64) as f32
+    };
+
+    for (a, b) in voiced_islands(f0_hz, f0_hop, n, (MIN_ISLAND_SECONDS * sr) as usize) {
+        diag.islands_seen += 1;
+        // ── S159 —— 这个岛**能写到哪**,而不是「这个岛在哪」。三项全部是上界,不是估计:
+        //   ⑴ 标记最多走出岛外**一个本地周期**(`analysis_marks`:`lo < a − per || hi > b + per`);
+        //   ⑵ 颗粒的钟形窗半宽 ≤ `wmax`(更宽的颗粒被 `continue` 整颗跳过);
+        //   ⑶ 去次声逐岛滤波的支撑 = `half·CUT_BOX_PASSES + 1`。
+        // ⛔ 用「岛与窗相交」而不是这个,窗边最多 20 ms(颗粒)到 100 ms(去次声)会变,
+        //    而那一段**恰好落在拼接的 10 ms 交叉淡化区里** —— 耳朵在整曲里几乎抓不到。
+        if !keep.is_empty() {
+            let reach = island_guard(f0_hz, f0_hop, a, b, sample_rate, wmax);
+            let (lo, hi) = (a.saturating_sub(reach), b.saturating_add(reach));
+            if !keep.iter().any(|&(s, e)| lo < e && s < hi) {
+                diag.islands_skipped += 1;
+                continue;
+            }
+        }
+        // S154 —— 播种点用**没膨胀**的岛的中点(见 `analysis_marks` 的说明):
+        // 膨胀只该改「哪些样本被移调」,不该把每个音的标记相位重掷一次。
+        let seed = seed_mid(&islands_raw, a, b);
+        let mut src = analysis_marks(&dc_free, sample_rate, f0_hz, f0_hop, a, b, seed);
+        if src.len() < 3 {
+            continue;
+        }
+        // S150 — marks are found on the DC-free signal, so they are locked on it too.
+        diag.marks_locked += lock_phase(&dc_free, &mut src, phase_lock);
+        diag.islands += 1;
+        diag.marks += src.len();
+        restored.push((a, b));
+        let last = (src.len() - 1) as f64;
+        // ⚠ S154 —— 一条**试过并且没成的**修法,留着免得下一个人再试一遍:
+        // 给合成栅格加一个常数相位、让它仍然穿过膨胀前的种子标记 —— **做不到保住岛内**。
+        // 原因是结构性的:岛变长 ⇒ 合成脉冲**多了几颗** ⇒ 整条脉冲串的相位必然跟着走,
+        // 除非「多出来的颗数 × ratio」正好是整数。⇒ 「只改边界、岛内逐位不变」在这条路上不存在。
+        // ⭐ 但**分析标记**是保住了的(见 `analysis_marks` 的 `seed_at`),动的只有合成栅格的相位,
+        //    而脉冲串的绝对相位听不见 —— 判据应当是「远离岛边处**包络**变没变」,不是「波形变没变」。
+        let count = (last * ratio) as usize;
+        let (mut island_first, mut cover_end) = (f64::NAN, f64::NAN);
+        let mut tgt: Vec<f64> = Vec::with_capacity(count + 1);
+        let mut ks: Vec<usize> = Vec::with_capacity(count + 1);
+        // S156 —— `xgrain` 要的是 `u` 本身(它在源标记的**下标**轴上的小数部分),
+        // 而 `ks` 已经把它四舍五入掉了。⚠ 别想着从 `tm` 反查:那是 `bench.py` 的做法,
+        // 在源周期抖动时与这里的 `u` 不是同一个数。
+        let mut us: Vec<f64> = Vec::with_capacity(count + 1);
+        for j in 0..=count {
+            let u = j as f64 / ratio;
+            if u > last {
+                break;
+            }
+            let lo = u as usize;
+            let hi = (lo + 1).min(src.len() - 1);
+            tgt.push(src[lo] + (src[hi] - src[lo]) * (u - lo as f64));
+            ks.push(u.round() as usize);
+            us.push(u);
+        }
+        if tgt.len() < 3 {
+            continue;
+        }
+        let c0 = tgt[0].round().max(0.0) as usize;
+        let c1 = (tgt[tgt.len() - 1].round().max(0.0) as usize).min(n);
+        island_edges.push((c0, c1));
+        // S159zj —— 爬坡宽度取**第一颗/最后一颗真的落下去**的颗粒(被 `wmax` 跳过的不算),
+        // 否则这一刀会去补一段根本没有颗粒的区间。见 `psola_shift_edge` 的 doc。
+        // S159zzf —— 这条岛的**去抖读点表**(几何仍然用 `src`,见 [`dejitter_marks`])。
+        let src_rd = dejitter_marks(&src, dejitter, DEJITTER_SPAN);
+        let (mut first_lw, mut last_rw) = (f64::NAN, f64::NAN);
+        // ⭐⭐⭐ S163 —— `xdither` 的**误差扩散**状态。
+        // ⛔ 独立随机抽签失败的原因：连续两颗有 ~50% 概率选到**同一颗**
+        // ⇒ 成对结构回来（实测半频 +13.86 dB）。误差扩散保证：
+        // ① 局部平均**严格等于** `fr`（期望值与线性插值相同 ⇒ 半频照压）；
+        // ② **不出现长游程**（不会连续选同一颗超过必要）⇒ 成对被打散；
+        // ③ 而每一颗仍然是**完整的源波形** ⇒ 谐波间的噪声不被加权平均掉。
+        // ⚠ 纯时域，**没有任何频率参数** ⇒ 不会因为 f0 不同而失效（用户 2026-08-27：
+        //   「这个音 2f0 是 2kHz 那其他音呢？你这样硬切那不还是烂完了」）。
+        let mut dith_err = 0.0f64;
+        for s in covered.iter_mut().take(c1).skip(c0) {
+            *s = true;
+        }
+        for i in 0..tgt.len() {
+            let tm = tgt[i];
+            let tl = if i > 0 { tgt[i - 1] } else { tm - (tgt[1] - tm) };
+            let tr = if i + 1 < tgt.len() {
+                tgt[i + 1]
+            } else {
+                tm + (tm - tgt[tgt.len() - 2])
+            };
+            let k = ks[i].min(src.len() - 1);
+            let src_l = if k > 0 { src[k] - src[k - 1] } else { tm - tl };
+            let src_r = if k + 1 < src.len() { src[k + 1] - src[k] } else { tr - tm };
+            // S155 —— 读窗。**今天** `lw = rw = min(T_out, T_src)`,而上移时 `T_out = T_src/ratio`
+            // ⇒ 读窗总宽 = **2/ratio 个源周期**(逐颗粒实测 p05-p95:位移 −9 → 1.189、
+            // −12 → **1.000**、−14 → **0.891**)。教科书 TD-PSOLA 是 ±1 个源周期 = 总宽 **2.000**。
+            //
+            // ⭐ 这个自由度是**高次共振峰**那条线的头号候选,而且是被**干预**证明的,不是相关:
+            //   同一段音频、同一批颗粒、同一个比值,只改窗宽(离线台子,自检 −85…−93 dB),
+            //   谱包络对比度相对 donor 的损失(dB,越接近 0 越好):
+            //
+            //   | ratio 2.0 (ぴゃ 那一档) | 2-4 kHz | 4-6 kHz | 6-8 kHz | 8-12 kHz |
+            //   |---|---|---|---|---|
+            //   | 今天(半宽 0.50) | −0.834 | −0.666 | −0.606 | −0.866 |
+            //   | 教科书(半宽 1.00) | **−0.360** | **−0.209** | **−0.189** | **−0.277** |
+            //   | 今天窗宽 + 除 wsum | −0.949 | −0.673 | −0.577 | −0.871 |
+            //
+            //   ⭐ 最后一行是把自由度分离开的那条对照:**「除 wsum」单独什么也不做,是窗宽**。
+            // ⛔ 但它是**取舍不是纯赚**:同一组臂上谐波间噪声(300-2500 Hz)从 −2.78 掉到 −0.86 dB
+            //   (三条臂 +1…+2 dB),而 300-2500 Hz 正是「咔哒」那条带。
+            //   ⇒ 这种取舍只有耳朵能裁(S146 协议),所以这里**默认 0 = 今天**,逐位不变。
+            //
+            // ⭐⭐ S156 用一把**零插值**的判据把上面两条都重量了一遍(位移 +12 ⇒ ratio 恰好 2.0
+            //   ⇒ 输出第 k 根谐波与 donor 第 2k 根**逐根重合**,不需要倒谱平滑也不需要 lifter;
+            //   ⛔ S155 那把尺子的 lifter 是按各自 f0 取的,而它的「零点验过」是 ratio 1.0 那条臂 ——
+            //   那里 f_out == f_in ⇒ 那条偏置在结构上恰好为 0,所以那个零点根本没检验过它;
+            //   合成夹具上实测偏置 −1.0…−5.4 dB,与它报的「损失」同量级同方向):
+            //
+            //   | 臂 | 形状 rms(2-12k) | 8-12k 相对 300-1k 的倾斜 | 岛内 rms | 0.5·f_out |
+            //   |---|---|---|---|---|
+            //   | 今天 | 3.87 | **−5.14** | 0.00 | −37.9 |
+            //   | 半宽 1.0 **不除 wsum** | **0.83** | **−1.07** | **+0.49** | −33.6 |
+            //   | 半宽 1.0 除 wsum | 0.83 | −1.07 | **−5.53** | −33.5 |
+            //
+            //   ⇒ ⑴ 收益比 S155 记的大得多(形状偏差 4.7×,而不是「拉回 57-69%」);
+            //   ⑵ **「除 wsum」与「不除」的谱形状读数一模一样,只差 20log10(ratio) 的常数**
+            //      ⇒ 那 −5.53 dB 是**除 wsum 的代价**,不是宽窗的代价 ⇒ S156 改成不除(见下面输出合成那段);
+            //   ⚠⚠ **S157c 更正**：下面这段机理**只在 `frac_transport` 关着时才是主因**。
+            //   整曲实测（旧出厂臂，318 个死音按位移分组）ratio 2.000 那一档反而是
+            //   干净的（−44.9），峰在 1.68-1.78 与 2.245 —— 与「ratio 2.0 时成对」对不上。
+            //   ⭐ 真正的主因是**颗粒被放到整数样本上**（见 `add_bell` 里 `d` 那两行
+            //   取整与 `frac_transport`）：`T_src` 不是整数个样本 ⇒ 每颗最多 ±0.5 样本的误差。
+            //   翻成默认之后同一张表全曲 p50 −35.6 → −39.3，−14 那档 −31.3 → −40.7。
+            //   ⇒ `xgrain` 仍然值钱（真 ぴゃ donor 上它把 0.5·f_out 从 −61.7 压到 −78.7，
+            //   而高频代价只有 0.65 dB），但它**不是**这条轴的主因。
+            //   ⑶ 剩下的真代价是 **0.5·f_out 上多出来的 +4.3 dB = donor 自己的音高**
+            //      —— 正是用户在 S155 笔5 听成「合唱感」的那一条。机理:ratio 2.0 时相邻两颗输出颗粒
+            //      读**同一个源标记**(`k = round(j/ratio)`)⇒ 颗粒成对 ⇒ 输出带着周期 `2·T_out = T_src`
+            //      的结构。⇒ 这就是 `xgrain`(相邻源脉冲线性插值)存在的理由,见下面 `xgrain` 那一段。
+            let (lw, rw) = if win_periods > 0.0 {
+                (win_periods * src_l, win_periods * src_r)
+            } else {
+                ((tm - tl).min(src_l), (tr - tm).min(src_r))
+            };
+            // ⚠ 上界要跟着窗宽走,否则宽窗臂会**静默地把颗粒全部跳过** —— 那是「干预没生效」
+            //   被读成「干预无效」的形状(S148 的 `frac_transport` 写死成 false 是同一族)。
+            // S159 —— `wmax` 提到循环外了(它与岛无关),因为**窗的护栏必须用同一个数**:
+            //   两处各写一遍这个表达式 = 一处改了另一处不改,而症状是窗边几十毫秒静默变样。
+            if lw <= 1.0 || rw <= 1.0 || lw > wmax || rw > wmax {
+                continue;
+            }
+            if first_lw.is_nan() {
+                first_lw = lw;
+            }
+            last_rw = rw;
+            // S148 WSOLA(默认 0 = 关,生产逐位不变):只挪【源】读点,不挪合成脉冲 tm。
+            let s_pos = if wsola_frac > 0.0 && i > 0 {
+                wsola_pick(x, &acc, src[k], tm, lw, wsola_frac * lw)
+            } else {
+                src[k]
+            };
+            if s_pos != src[k] {
+                diag.wsola_moved += 1;
+            }
+            #[cfg(test)]
+            if grain_trace_on() {
+                let t_src = if k + 1 < src.len() { src[k + 1] - src[k] } else { src_l };
+                GRAIN_TRACE.lock().unwrap().push([
+                    tm,                       // 这颗粒被放在哪(样本)
+                    s_pos,                    // 从哪读的
+                    tm - s_pos,               // δ:自身脉冲点与放置点的偏差
+                    t_src,                    // 该处的源周期
+                    (tm - s_pos) / t_src,     // δ 归一到周期 = 相位误差
+                    lw,
+                    rw,                       // ⚠ 重放 OLA 必须要它:窗是 [s−lw, s) ∪ [s, s+rw)
+                    k as f64,
+                ]);
+            }
+            // S151 —— **源覆盖率**:这一颗粒从源上读的是 `[s_pos − lw, s_pos + rw)`。上移时
+            // `lw = rw = T_src / ratio`(上面那两个 `min` 取的是目标邻距),所以一旦
+            // `ratio > 2`(= |位移| > 12 半音),相邻两个读窗之间就留下一段**永远不进任何颗粒**
+            // 的源波形。见 `SRC_UNCOVERED` 的注释:这是唯一直接看得见它的读数。
+            // S156 —— **xgrain**:颗粒的**内容**在相邻两个源脉冲之间插值,而不是四舍五入到最近的那个。
+            //
+            // ⛔ 为什么需要它:`k = round(u)` 让相邻若干颗输出颗粒**读同一个源标记**(ratio 2.0 时
+            //   正好成对)⇒ 输出带着周期 `2·T_out = T_src` 的结构 ⇒ **donor 自己的音高**出现在
+            //   `0.5·f_out` 上。窗一放宽,成对的两颗重叠更多,这条就更响:离线台子实测(s12,+12,
+            //   相对各自 400-4000 Hz)今天 **−37.9** → 半宽 1.0 **−33.6**(差 +4.3 dB),
+            //   而 donor 输入自己的结构地板是 −45.5。⭐ 那正是用户在 S155 笔5 亲耳听成
+            //   **「合唱感」**的那一维(他当时的描述:在 f0 附近偏下 · 有一点时长 · 不在底部)。
+            //   开 xgrain 之后同一条读 **−38.7** ⇒ 宽窗引来的那 4.3 dB 被消掉,回到今天的水平。
+            //
+            // ⭐ 为什么它在 `ratio == 1.0` 上**结构性**恒等,而且对**任何**深度都成立:
+            //   那时 `u = j` 是整数 ⇒ `fr = 0` ⇒ 最近邻权重与线性权重**是同一个向量** `(1, 0)`
+            //   ⇒ 两者的任意凸组合还是它。(这一点比 `win_periods` 强 —— 那个只在 1.0 上恒等。)
+            //
+            // ⚠ `xgrain == 0.0` 时走的是**原来那一行**,不是「权重 (1,0) 的两颗粒」——
+            //   后者依赖 `round()` 与 `fr < 0.5` 的等价性,而我不想让逐位恒等挂在那个等价性上。
+            // S159zzf —— 读点去抖(见 [`dejitter_marks`])。⛔ 只换读点,几何仍用 `src`。
+            let rd = |i: usize| -> f64 { src_rd[i.min(src_rd.len() - 1)] };
+            let mut return_slide: Option<f64> = None;
+            let (p0, g0, p1, g1) = if xgrain > 0.0 {
+                let uu = us[i];
+                let lo = (uu as usize).min(src.len() - 1);
+                let hi = (lo + 1).min(src.len() - 1);
+                let fr = (uu - lo as f64).clamp(0.0, 1.0);
+                let (nl, nh) = if fr < 0.5 { (1.0, 0.0) } else { (0.0, 1.0) };
+                // wsola 挪的是**读点**,对两颗粒施加同一个位移(wsola 默认 0 ⇒ off = 0)。
+                let off = s_pos - src[k];
+                let (lo, hi) = (lo, hi);
+                // ⭐⭐⭐ S163 —— `xdither` 只改**这一对权重**:`(1−fr, fr)` 换成
+                // `(0,1)` 或 `(1,0)`(按 `fr` 的概率抽签)。读点 / 窗宽 / 几何一个字不动。
+                // 见 [`xdither`] 的 doc:治的是「谐波之间被挖空」,而期望值不变 ⇒ 半频不受影响。
+                // ⭐⭐⭐ S163 —— `xslide`：不混合两颗，而是让**读点**在两个源脉冲之间
+                // 按 `fr` 线性滑动（见 [`xslide`] 的 doc：它同时满足「每颗完整」与「内容连续变」）。
+                let xs = xslide();
+                if xs > 0.0 {
+                    let slid = rd(lo) * (1.0 - fr * xs) + rd(hi) * (fr * xs);
+                    return_slide = Some(slid + off);
+                }
+                let xd = xdither();
+                let (wl, wh) = if xd > 0.0 {
+                    // 误差扩散（见循环外 `dith_err` 的注释）。
+                    // ⚠ `dither01` 只在 `xdither` 带小数时做一次轻微扰动，防止
+                    //   误差扩散自己在 `fr` 恰好是简单分数时锁成固定周期。
+                    dith_err += fr + 1e-3 * (dither01(i as u64) - 0.5);
+                    let hit = dith_err >= 0.5;
+                    if hit {
+                        dith_err -= 1.0;
+                    }
+                    let (pl, ph) = if hit { (0.0, 1.0) } else { (1.0, 0.0) };
+                    ((1.0 - xd) * (1.0 - fr) + xd * pl, (1.0 - xd) * fr + xd * ph)
+                } else {
+                    (1.0 - fr, fr)
+                };
+                (
+                    rd(lo) + off,
+                    (1.0 - xgrain) * nl + xgrain * wl,
+                    rd(hi) + off,
+                    (1.0 - xgrain) * nh + xgrain * wh,
+                )
+            } else {
+                (s_pos + (rd(k) - src[k]), 1.0, 0.0, 0.0)
+            };
+            // ⭐ S163 —— `xslide` 开着时，两颗塔塔换成**一颗滑动读点的完整颗粒**。
+            let (p0, g0, p1, g1) =
+                if let Some(sl) = return_slide { (sl, 1.0, 0.0, 0.0) } else { (p0, g0, p1, g1) };
+            // S151 —— **源覆盖率**:这一颗粒从源上读的是 `[s_pos − lw, s_pos + rw)`。上移时
+            // `lw = rw = T_src / ratio`(上面那两个 `min` 取的是目标邻距),所以一旦
+            // `ratio > 2`(= |位移| > 12 半音),相邻两个读窗之间就留下一段**永远不进任何颗粒**
+            // 的源波形。见 `SRC_UNCOVERED` 的注释:这是唯一直接看得见它的读数。
+            // ⚠ xgrain 开着时真的读了两段 ⇒ 覆盖率算**并集**,否则这只眼睛会低报。
+            // ⛔⛔ 但**只算权重 ≥ 0.5 的那些读点**,否则它会灌水:`p1 = p0 + T_src`,于是权重
+            //   0.001 的第二个读点也会让整整一个源周期被记成「读过了」⇒ **窄窗也能读出零漏源**。
+            //   这不是假想 —— S156 翻默认时,新加的那条生产口径判据就是被这样骗过去的
+            //   (把 `WIN` 退回 0,`src_uncovered_frac` 照样是 0,判据当场变空)。
+            //   ⇒ 门限取 0.5:一颗粒最多只有一个读点能过(`fr == 0.5` 时两个都是 0.5,那是真并集),
+            //   于是这只眼睛**永远不会比 xgrain 关着时更乐观**。
+            let (rs, re) = if g1 >= 0.5 && g0 >= 0.5 {
+                (p0.min(p1) - lw, p0.max(p1) + rw)
+            } else if g1 >= 0.5 {
+                (p1 - lw, p1 + rw)
+            } else {
+                (p0 - lw, p0 + rw)
+            };
+            if cover_end.is_nan() {
+                island_first = rs;
+                cover_end = rs;
+            }
+            if rs > cover_end {
+                uncovered += rs - cover_end;
+            }
+            cover_end = cover_end.max(re);
+            {
+                let a = (s_pos - lw).round().max(0.0) as usize;
+                let b = ((s_pos + rw).round().max(0.0) as usize).min(n);
+                if a < b && x[a..b].iter().any(|v| v.abs() > 1e-7) {
+                    this_island_periods.push(src_l.max(src_r));
+                }
+            }
+            // ⚠ xgrain 开着时这里会放**两颗**颗粒 ⇒ `transport_residual` 每个合成标记记两笔
+            //   (两次读点各有各的亚样本残差)。那是如实记账,不是缺陷 —— 但引用那个读数时
+            //   要知道 xgrain 那条臂的样本数是别的臂的两倍。`xgrain == 0` 时逐位不变。
+            for (pp, gg) in [(p0, g0), (p1, g1)] {
+                if gg <= 0.0 {
+                    continue;
+                }
+                // S157b —— **搬的是 `carry`**:LPC 关着时它就是 `x`(逐位不变),
+                // 开着时是残差。标记 / 岛 / 相位锁定读的仍然是 `x`,见 LPC 那一段第 1 条。
+                add_bell(
+                    carry, &mut acc, &mut wsum, pp, tm, lw, rw, formant_rate, frac_transport, gg,
+                    &mut residual,
+                );
+            }
+        }
+        // ── S159zj —— 岛边那段爬坡按岛外同一条式子填(三条硬门见 `psola_shift_edge` 的 doc)。
+        if edge_fill && win_periods > 0.0 && ratio > 1.0 && !first_lw.is_nan() {
+            let mark = |m: &mut [bool], lo: usize, hi: usize| {
+                for v in m.iter_mut().take(hi.min(n)).skip(lo.min(n)) {
+                    *v = true;
+                }
+            };
+            // 左端 `[c0, c0 + lw_first)`、右端 `(c1 − rw_last, c1)`;两段都夹在岛内。
+            // ⛔ 全程 saturating:`c0` 可能大于 `c1`(`c1` 被 `.min(n)` 夹过),而
+            //    两段爬坡加起来也不许超过岛长 —— 否则左右两段会**重叠**,而重叠的那一段
+            //    等于把岛心也当成爬坡填掉,那正是这一刀明确不许碰的东西。
+            let span_len = c1.saturating_sub(c0);
+            let l = (first_lw.round().max(0.0) as usize).min(span_len);
+            let r = (last_rw.round().max(0.0) as usize).min(span_len - l);
+            mark(&mut edge, c0, c0 + l);
+            mark(&mut edge, c1.saturating_sub(r), c1);
+        }
+        if !cover_end.is_nan() {
+            span += (cover_end - island_first).max(0.0);
+        }
+        if !this_island_periods.is_empty() {
+            islands_periods.push((c0, c1, std::mem::take(&mut this_island_periods)));
+        } else {
+            this_island_periods.clear();
+        }
+    }
+
+    let mut gap = 0usize;
+    let mut cov_n = 0usize;
+    let mut ws: Vec<f64> = Vec::new();
+    let mut out = vec![0.0f32; n];
+    // S156 —— **稳态窗和**。半宽 `W` 个源周期的半余弦,以邻距 `T_out = T_src/ratio` 铺开
+    // ⇒ Σw ≡ `W·ratio`(离线台子实测:W = 0.75/1.00/1.25/1.50 上读到 1.5000/2.0000/2.5000/3.0000,
+    // 四档全中,见 `s156_knives/run_arms3.py`)。今天(`win_periods == 0`)窗宽 = 邻距 ⇒ `W̄ = 1`。
+    //
+    // ⛔ `.max(1.0)` 不是保险丝,它是**下移臂的恒等条件**:下移时 `lw = rw = T_src`(两个 `min` 取源
+    //    周期),`W·ratio = ratio < 1`,而今天在那里用的就是 `clamp(raw, 0, 1)` ⇒ 不夹住的话
+    //    「颗粒逐位相同、只有干填料变了」,`win_periods = 1.0` 在下移上就不再等于今天。
+    let wbar = if win_periods > 0.0 { (win_periods * ratio).max(1.0) } else { 1.0 };
+    // S159zj —— 岛边的干填料台阶(见 [`PsolaDiagnostics::edge_step_p50`])。
+    // ⛔ 无条件算,不挂旋钮:S152 的规矩是「读数无条件算,修法才由旋钮控」——
+    //    这样「改之前是什么样」在今天的日志里直接读得到,不用先做一个臂。
+    // ⚠ 用的是与下面那条合成分支**同一个** `W̄` 与同一个 clamp,否则这只眼睛量的
+    //    就不是它声称在量的那件事。
+    {
+        let mut steps: Vec<f64> = Vec::with_capacity(island_edges.len() * 2);
+        for &(c0, c1) in &island_edges {
+            for i in [c0, c1.saturating_sub(1)] {
+                if i < n {
+                    steps.push(1.0 - (wsum[i] / wbar).clamp(0.0, 1.0));
+                }
+            }
+        }
+        diag.island_edges = steps.len();
+        if !steps.is_empty() {
+            steps.sort_by(f64::total_cmp);
+            let at = |q: f64| steps[(((steps.len() - 1) as f64) * q).round() as usize] as f32;
+            diag.edge_step_p50 = at(0.50);
+            diag.edge_step_p90 = at(0.90);
+        }
+    }
+    for i in 0..n {
+        // ⛔ Statistics read the RAW sum; the clamp below is only what the dry-fill gain needs.
+        // Clamping first made the surplus (w > 1) unreadable — see PsolaDiagnostics.
+        // S156 —— 读数与干填料都按 `W̄` 归一,所以 `cola_*` 在宽窗臂上仍然是「COLA 有没有破」的
+        // 读数,而不是重叠系数。`win_periods == 0` 时 `W̄ = 1.0`,除以 1.0 在 IEEE 下逐位精确
+        // ⇒ 这一整段对今天**逐位不变**。
+        let raw = wsum[i] / wbar;
+        let w = raw.clamp(0.0, 1.0);
+        // ⛔ S159zj —— **统计仍然按 `covered` 走**,一个字不动:`cola_*` 与
+        //    `edge_step_*` 的口径不许跟着这一刀漂,否则「改之前是什么样」就读不出来了。
+        if covered[i] {
+            cov_n += 1;
+            if raw < 0.9 {
+                gap += 1;
+            }
+            ws.push(raw);
+        }
+        if covered[i] && !edge[i] {
+            // ⛔⛔ S156 —— **不除 wsum**,连宽窗臂也不除。S155 那一版除了,而那正是它「要付
+            // −4.3…−5.8 dB 电平」的**唯一**来源:离线台子上「除 wsum」与「不除」的逐带谱形状读数
+            // **一模一样**,只差一个 20log10(ratio) = +6.02 dB 的常数(s12,ratio 2.0)。
+            // ⇒ 那笔代价不是宽窗的代价,是**选择除 wsum** 的代价,而且它是个与频率无关的标量。
+            // ⇒ 而下游**吸收不了它**:`restore_envelope` 默认关、`peak_normalize_to` 给 donor 传的是
+            //   base 的峰值(与 donor 内容无关)、`match_levels` 五个调用点全传 false = 死代码,
+            //   cover 路连峰值归一都没有 ⇒ 掉多少全额落到被救的那几个音上。
+            out[i] = acc[i] as f32;
+        } else {
+            // copyFlat: outside the synthesized span the un-shifted input rides the window-sum
+            // ramp, which IS the crossfade. Inside it, a shortfall is a defect and must not be
+            // papered over with un-shifted audio (that is beating, not repair).
+            // ⚠ The clamp on `w` here is DEFENSIVE, not load-bearing: measured across every
+            // fixture in this file, zero uncovered samples ever carry wsum > 1 (a surplus needs
+            // overlapping bells, and overlapping bells mean covered). Feeding the raw sum instead
+            // is bit-identical on real input — so do not expect a test to catch that swap.
+            // S157b —— 干填料也用 `carry`(LPC 关着时它就是 `x`)。⛔ 必须与颗粒同域,
+            // 否则「岛外原样透传」在残差域里就变成了「往残差里掺语音」。
+            out[i] = (acc[i] + (1.0 - w) * f64::from(carry[i])) as f32;
+        }
+    }
+    // S157b —— **差分式接线**:`y = x + Synth(OLA(r) − r)`。见文件上方 LP-PSOLA 那一段。
+    // ⛔ ratio 1.0 上 `OLA(r) ≡ r` ⇒ 差恒为 0 ⇒ 零输入零初值 ⇒ `y ≡ x` **逐位**。
+    if let (Some(ks), Some(r)) = (&lpc_ks, &lpc_resid) {
+        let d: Vec<f32> = out.iter().zip(r.iter()).map(|(o, ri)| o - ri).collect();
+        let s = lattice_synthesise(&d, ks, lpc_hop, lpc_order);
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = x[i] + s[i];
+        }
+    }
+    // ⛔⛔ S162 —— **缓冲区末尾被截断的那半个岛,不许原样透传。**
+    //
+    // 上面那条 `out[i] = acc[i] + (1 − w) * carry[i]` 里,「岛外原样透传」靠的是**窗和的爬坡**
+    // 当交叉淡化 —— 而那个爬坡需要**另一侧有钟**。在**缓冲区末尾**没有下一颗钟 ⇒ `w = 0`
+    // ⇒ 全额透传 ⇒ 硬台阶,而且透传的是**没被移调的原音高**(实测低 12 个半音)。
+    //
+    // 用户 2026-08-26:「歌曲结尾也会造出一个很明显的竖条纹伪影」。
+    // 同一次 run 的转储逐层比(零渲染噪声):`donor_post` 的末尾 **232 样本(5.26 ms)与
+    // `donor_pre` 逐位相同**(−4 那一遍 259 样本 / 5.87 ms)⇒ PSOLA 完全没碰它;
+    // 包络 −35 → **−24**,成品上 −25 → **−13**;盲搜读到 4:51.100 处 5/7 带、峰 18.6 dB(16k 独大)。
+    // ⚠ `base` 同处完全正常 ⇒ 不是解码的锅。(与 S154 那次「岛边裸接」同族 ——
+    //    那次靠**膨胀浊音岛**解决,而在缓冲末尾没地方可膨胀。)
+    //
+    // ⛔ 三条硬门,少一条这一刀就会去碰**正常的**透传(岛间的清辅音本来就该原样过):
+    //  ⑴ 这一段必须**顶到缓冲末尾**;⑵ 必须**紧接在 covered 之后**;
+    //  ⑶ 长度 ≤ `TAIL_FADE_MAX_MS` —— 真的清音/静音尾巴远长于它。
+    // ⛔⛔ S162 第二版 —— **第一版(只淡化裸透传那 5 ms)把它弄得更糟**:
+    // 盲搜峰值 **18.6 → 25.1 dB**(带数 5/7 → 6/7)。原因很直白:
+    // **一个 5 ms 的淡出【本身就是一个宽带瞬变】** —— 我把「阶跃」换成了「更陡的包络拐点」。
+    // 用户 2026-08-26:「本来音尾就应该能自然收,好嘛你现在连自然收都做不到反倒在这硬切,
+    // 而且还切不明白」。
+    //
+    // ⇒ 真问题不是那 5 ms,是**最后一个音的释放期根本不存在**:歌在音符结束的那一帧就没了,
+    //    而 donor 素材是从音符**中段**来的 ⇒ 缓冲末尾停在一个满电平的稳态上。
+    // ⇒ 修法:缓冲末尾若停在**有声且不静**的地方,就在最后 `TAIL_RELEASE_MS` 上刻一条
+    //    **释放曲线**(半升余弦,足够长 ⇒ 它的谱是低频的,不是瞬变)。
+    // ⛔ 三条硬门不变:①顶到缓冲末尾 ②末尾那一段必须有声 ③末尾不能本来就已经安静
+    //    (真的自然收尾 / 静音结尾 ⇒ 一个字不动)。
+    if tail_fade {
+        let rel = ((TAIL_RELEASE_MS * f64::from(sample_rate) / 1000.0) as usize).max(1).min(n / 4);
+        // 末尾 10 ms 的电平 vs 它前面 200 ms 的电平 —— 已经收下去了就别动
+        let w = ((sample_rate as usize) / 100).max(1).min(n);
+        let e_end: f64 =
+            out[n - w..].iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>() / w as f64;
+        let back = (w * 20).min(n);
+        let e_ref: f64 = out[n - back..n - w]
+            .iter()
+            .map(|&v| f64::from(v) * f64::from(v))
+            .sum::<f64>()
+            / (back - w).max(1) as f64;
+        let still_singing = e_end > 1e-10 && e_end > e_ref * 0.25;
+        if still_singing {
+            for (k, i) in (n - rel..n).enumerate() {
+                let t = (k as f64) / (rel as f64);
+                let g = 0.5 * (1.0 + (std::f64::consts::PI * t).cos());
+                out[i] = (f64::from(out[i]) * g) as f32;
+            }
+            diag.tail_fade_samples = rel;
+        }
+    }
+    // S154 —— **振幅包络守恒**。读数无条件算(S152 那条规矩),修法由 `env_restore_ms` 控。
+    // ⛔ 顺序:排在次声之前,因为次声那一刀是全缓冲的线性滤波,而这一刀只动岛内 ——
+    //    反过来做会让次声读数里混进这一刀改的那部分。
+    {
+        let half = ((ENV_READ_MS * sr / 1000.0) as usize).max(4);
+        let ey = rms_envelope(&out, half);
+        let ex = rms_envelope(x, half);
+        diag.env_dev_p50_db = env_dev_p50_db(&ey, &ex, &covered) as f32;
+        if env_restore_ms > 0.0 {
+            // S159i —— **逐岛**:窗宽 = `max(旋钮给的毫秒下限, 1.5 个 donor 周期)`,由该岛自己的
+            // 最低基频定(见 [`ENV_RESTORE_PERIODS`])。`env_restore_ms` 从「宽度」降级成「开关 + 下限」。
+            let floor = ((env_restore_ms * sr / 1000.0) as usize).max(4);
+            for &(ia, ib) in &restored {
+                let h = env_restore_half(f0_hz, f0_hop, ia, ib, sr, floor);
+                let mut seg: Vec<f32> = out[ia..ib].to_vec();
+                restore_envelope(&mut seg, &x[ia..ib], &covered[ia..ib], h);
+                out[ia..ib].copy_from_slice(&seg);
+            }
+            let ey2 = rms_envelope(&out, half);
+            // 报「真的把它拉回了多少」而不是「开着」—— 与 `infrasonic_removed` 同一条规矩。
+            diag.env_dev_after_db = env_dev_p50_db(&ey2, &ex, &covered) as f32;
+        }
+    }
+    // ⭐⭐⭐ S165 —— 跨周期自适应对消（见 [`subcancel`]）。
+    // ⛔ 位置：在**合成之后、去次声之前**。
+    //    在合成之后 —— 它要对消的东西是**合成制造的**（颗粒复用），不存在于输入；
+    //    在去次声之前 —— 去次声是差分式的（`d = out − x`），要让它看到的是**最终的** `out`。
+    {
+        let sc = subcancel();
+        if sc > 0.0 {
+            let (k, db) = cancel_subharmonic(&mut out, f0_hz, f0_hop, sample_rate, ratio, sc);
+            diag.subcancel_samples = k;
+            diag.subcancel_removed_db = db;
+        }
+    }
+    // S152 —— **读数无条件算,修法才由旋钮控**。这样今天的生产日志里就能看见它,而输出逐位不变。
+    // ⛔ 这一条是从 S147 那次「收益静默减半」学来的:一个只在改动打开时才存在的读数,
+    // 没法用来判断「改动之前是什么样」。
+    {
+        /// 输出里 <~50 Hz 的能量占比。
+        fn infra_frac(y: &[f32], sample_rate: u32) -> f64 {
+            let lf = infrasonic_baseline(y, sample_rate);
+            let (mut e_lf, mut e_all) = (0.0f64, 0.0f64);
+            for (o, l) in y.iter().zip(lf.iter()) {
+                e_all += f64::from(*o) * f64::from(*o);
+                e_lf += l * l;
+            }
+            if e_all > 0.0 {
+                e_lf / e_all
+            } else {
+                0.0
+            }
+        }
+        // ⛔ 读数**永远**用出厂的固定 8 ms,即使修法用的是自适应宽度。它是一把**尺子**不是刀:
+        //    S152/S154 的所有历史读数都是这把尺子量的,让它跟着宽度走 = 每换一次宽度就换一次刻度。
+        let before = infra_frac(&out, sample_rate);
+        diag.infrasonic_frac = before as f32;
+        // S155 笔6 —— **逐岛各用各的宽度**。
+        //
+        // ⛔ 为什么不能一个缓冲一个宽度:生产里一遍救援的 donor 缓冲**不止装被救的那些音** ——
+        // 这一遍不救的音同样有真音频、同样生成颗粒(它们的输出后面会被窗丢掉),而它们的基频更低
+        // ⇒ 分位数被它们拉下去 ⇒ 刀比该有的宽。实测:−14 那一遍整曲选 **4.96 ms**,
+        // 而只算**真正被救的那 62 个音**应当是 **2.70 ms**,50-125 Hz 因此少削约 **5 dB**。
+        //
+        // ⭐ 形式上用 `d = out − x` 而不是「LP(out) − LP(x)」分开算,是因为 **d 在岛外逐位为零**:
+        //   把每个岛那一段的 d 单独低通再累加,每一项都在岛外**平滑衰减到 0** ⇒ 不需要 mask、
+        //   不会在岛边界造台阶(mask 造台阶正是 S154 花一场修掉的那类缺陷),
+        //   而 ratio 1.0 上 d ≡ 0 ⇒ 每一项恒为 0 ⇒ **恒等仍然自动成立**。
+        // ⚠ `FixedMs` 仍然是**整缓冲一个宽度**:它存在的意义就是从同一个二进制渲出旧臂。
+        let per_island: Vec<(usize, usize, f64)> = match infrasonic {
+            Infrasonic::PerPeriod => islands_periods
+                .iter()
+                .map(|(a, b, p)| (*a, *b, infrasonic_width_ms(p, sample_rate, ratio)))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let ms = match infrasonic {
+            Infrasonic::Off => 0.0,
+            Infrasonic::PerPeriod => {
+                // 报一个代表值(中位)—— 它是 S147「收益静默减半」的那只眼睛。
+                let mut w: Vec<f64> = per_island.iter().map(|(_, _, m)| *m).collect();
+                w.sort_by(f64::total_cmp);
+                if w.is_empty() { 0.0 } else { w[w.len() / 2] }
+            }
+            Infrasonic::FixedMs(ms) => {
+                if ms.is_finite() && ms > 0.0 { ms } else { 0.0 }
+            }
+        };
+        diag.infrasonic_ma_ms = ms as f32;
+        if ms > 0.0 {
+            // S155 —— **差分式**:只减掉这道工序**多出来的**那条基线,不是输出自己的低频。
+            //
+            // ⭐⭐ 这一行是 ratio 1.0 恒等判据能活下来的全部原因:ratio 1.0 时 `out ≡ x`
+            //     ⇒ 两条基线走同一段代码、同一份数据 ⇒ 逐位相同 ⇒ 修正项**恒为 0.0**
+            //     ⇒ 恒等仍然是 `assert_eq!`,不需要任何 `if semitones == 0` 的短路
+            //     (那种短路正是让 2026-07 那份实现混过去的形状,见 `psola_shift_env` 顶部)。
+            // ⭐ 顺带,它在**岛外**也自动 ≈ 0(那里 `out ≡ x` 逐位相同)⇒ 那段没被移调的原始
+            //     donor 不再被这把刀削低频,而且不需要写 mask —— mask 会在岛边界造台阶,
+            //     那正是 S154 刚修掉的那一类缺陷。
+            // 逐岛:把这一岛那一段的 out 与 x 各自单独低通(岛外补 0),再相减。
+            // 与整缓冲版在数学上等价,只是每个岛可以有自己的宽度。
+            let (lo_out, lo_in) = if per_island.is_empty() {
+                (
+                    infrasonic_baseline_passes(&out, sample_rate, ms, CUT_BOX_PASSES),
+                    infrasonic_baseline_passes(x, sample_rate, ms, CUT_BOX_PASSES),
+                )
+            } else {
+                let (mut acc_o, mut acc_i) = (vec![0.0f64; n], vec![0.0f64; n]);
+                for (a, b, w) in &per_island {
+                    let (a, b) = (*a, (*b).min(n));
+                    if a >= b {
+                        continue;
+                    }
+                    // 支撑:K 遍盒各半宽 ⇒ 总支撑 ≈ K·W/2 每侧。留两倍余量。
+                    let pad = infrasonic_pad_samples(*w, sample_rate);
+                    let (s0, s1) = (a.saturating_sub(pad), (b + pad).min(n));
+                    let mo: Vec<f32> =
+                        (s0..s1).map(|i| if i >= a && i < b { out[i] } else { 0.0 }).collect();
+                    let mi: Vec<f32> =
+                        (s0..s1).map(|i| if i >= a && i < b { x[i] } else { 0.0 }).collect();
+                    let fo = infrasonic_baseline_passes(&mo, sample_rate, *w, CUT_BOX_PASSES);
+                    let fi = infrasonic_baseline_passes(&mi, sample_rate, *w, CUT_BOX_PASSES);
+                    // ⛔ 护栏也逐岛:这一岛的输出基线不比输入的大 ⇒ 没有「多出来的」⇒ 不动。
+                    let (eo, ei): (f64, f64) =
+                        (fo.iter().map(|v| v * v).sum(), fi.iter().map(|v| v * v).sum());
+                    if eo >= ei {
+                        for (k, i) in (s0..s1).enumerate() {
+                            acc_o[i] += fo[k];
+                            acc_i[i] += fi[k];
+                        }
+                    }
+                }
+                (acc_o, acc_i)
+            };
+            // ⛔⛔ **护栏:这把刀永远不许往低频里加东西。**
+            //
+            // 差分式把 `LP(in)` 加回输出,而**低频不是被移调守恒的**:下移时输出的脉冲密度
+            // 减半 ⇒ `LP(out) ≈ LP(in)/2` ⇒ 「减掉 LP(out) 再加回 LP(in)」净效果是**加**了
+            // 半份进去。合成夹具上实测到了:−12 st 时基线 0.175 → **0.335**。
+            // ⚠ 真素材上碰不到(donor 的低频本来就 −50 dB,而下移根本不注入:实测 −12/−7 的
+            //   次声份额 0.01%/0.00%)—— 但「真素材上碰不到」是**拿阴性对照当不在场证明**,
+            //   这条线已经因为它丢过一次。⇒ 用一条结构性的判据挡住,而不是靠素材挡。
+            //
+            // ⭐ 判据本身就是这把刀的语义:**只拿掉这道工序【多出来】的那部分**。
+            //    输出的基线不比输入的大 ⇒ 没有「多出来的」⇒ 不动。
+            // ⭐ ratio 1.0 时两边逐位相同 ⇒ 走 else 分支 ⇒ 恒等,而且**即使走 if 分支也恒等**
+            //    (修正项恒为 0.0)⇒ 这条护栏不是恒等性的依据,只是多一道锁。
+            let e_out: f64 = lo_out.iter().map(|v| v * v).sum();
+            let e_in: f64 = lo_in.iter().map(|v| v * v).sum();
+            // S159 —— 余量打出来(见 `PsolaDiagnostics::infrasonic_gate_db`):这是「窗内逆变换」
+            // 唯一一条不结构性的耦合,离翻面有多远必须看得见。⚠ `e_in == 0` 时(ratio 1.0 的
+            // 恒等臂,两边都恒 0)读 0.0 —— 那时闸走 `>=` 的 true 臂而修正项恒为 0,无所谓余量。
+            diag.infrasonic_gate_db = if e_in > 0.0 && e_out > 0.0 {
+                (10.0 * (e_out / e_in).log10()) as f32
+            } else {
+                0.0
+            };
+            // ⛔⛔ `>=` 而不是 `>`,而这一个字符是被**变异测试**逼出来的:
+            //    写 `>` 的时候 ratio 1.0 上两边逐位相等 ⇒ 护栏跳过 ⇒ 恒等是**护栏**给的,
+            //    不是差分式给的 ⇒ 把差分式改回「减输出自己的低频」,那条恒等判据**照样绿**。
+            //    那就是一条空判据。⇒ `>=` 让 ratio 1.0 **真的走进**下面这个分支,
+            //    于是恒等重新由「修正项恒为 0.0」承担,而变异当场红。
+            if e_out >= e_in {
+                for (i, o) in out.iter_mut().enumerate() {
+                    *o = (f64::from(*o) - (lo_out[i] - lo_in[i])) as f32;
+                }
+                // 报「真的拿掉了多少」而不是「开着」—— 与 `wsola_moved` / `marks_locked` 同一条规矩。
+                diag.infrasonic_removed = (before - infra_frac(&out, sample_rate)) as f32;
+            }
+        }
+    }
+    diag.transport_residual_rms = residual.rms();
+    diag.src_uncovered_frac = if span > 0.0 { (uncovered / span) as f32 } else { 0.0 };
+    diag.cola_gap_frac = if cov_n > 0 { gap as f32 / cov_n as f32 } else { 0.0 };
+    if ws.is_empty() {
+        diag.cola_w_median = 1.0;
+        diag.cola_w_p01 = 1.0;
+        diag.cola_w_p99 = 1.0;
+    } else {
+        diag.cola_over_frac = ws.iter().filter(|&&w| w > 1.05).count() as f32 / ws.len() as f32;
+        ws.sort_by(f64::total_cmp);
+        let at = |q: f64| ws[(((ws.len() - 1) as f64) * q).round() as usize] as f32;
+        diag.cola_w_median = at(0.50);
+        diag.cola_w_p01 = at(0.01);
+        diag.cola_w_p99 = at(0.99);
+    }
+    // S162 —— 谱倾斜还原(出厂 0 = 关 = 逐位不变)。⛔ 放在**最后**:它的靶子是
+    //   `donor_post` 相对 `base` 的包络差,而那正是这一整条链跑完之后的东西。
+    //   ⛔ 只改幅度、不动相位 ⇒ 不搬共振峰(κ 才搬,而实测 α ≈ 0.005 ⇒ 平移是错的算子)。
+    {
+        // ⭐⭐⭐ S163 —— **高音上把 tilt 淡出**（见 [`TILT_FADE_LO`] / [`TILT_FADE_HI`]）。
+        // ⛔ 表是在 **target MIDI 73-78** 上拟的，而频带是**绝对频率**：
+        //   73-78（f0 554-740 Hz）的 H4-H10 落在 `2.6k/4.1k/6.5k` 档（表给 +4.89/+2.27/+0.41，全是**抬**）；
+        //   MIDI 90（f0 1480 Hz）的 H4-H10 落在 `6.5k/10k/14k` 档（+0.41/+4.53/**−5.16**，最高档是**压**）。
+        // ⇒ 同一张表对低音是抬、对高音是压。实测（`inverse_probe`，同一份 donor 进两条臂）
+        //   yuyuko 上方谐波 H4..H10 的 Δ（tilt=1 减 tilt=0）按 target 音高：
+        //   68 **+9.15** · 71 +7.84 · 75 +5.31 · 78 +3.65 · 80 +2.91 · 82/83 +2.08 ·
+        //   **87 −0.84** · **90 −4.01** ⇒ 单调递减、在 87 附近穿过零；
+        //   akiko のぴゃ（MIDI 90）独立读到 **−3.05** ⇒ **两个模型对上了**。
+        // ⭐ 而用户报的のぴゃ的病正是**上方谐波弱** ⇒ 出厂的 tilt 正在往下压它。
+        // ⚠ 低音侧**一字不动**（那里 tilt 是大益：68 上 +9.15）。
+        // ⭐⭐⭐ S163 —— **逐帧**算 target 音高，高音处把 tilt 淡出。
+        // ⛔ 表在 target **MIDI 73-78** 上拟，频带是**绝对频率**：
+        //   73-78（f0 554-740 Hz）的 H4-H10 落在 `2.6k/4.1k/6.5k`（+4.89/+2.27/+0.41，全是**抬**）；
+        //   MIDI 90（f0 1480 Hz）落在 `6.5k/10k/14k`（+0.41/+4.53/**−5.16**，最高档是**压**）。
+        // 实测（`inverse_probe`，同一份 donor 进两条臂）上方谐波 Δ（tilt=1 减 tilt=0）：
+        //   yuyuko 68 **+9.15** · 71 +7.84 · 75 +5.31 · 78 +3.65 · 80 +2.91 · 82/83 +2.08 ·
+        //   **87 −0.84** · **90 −4.01**；akiko のぴゃ（MIDI 90）独立读 **−3.05**。
+        // ⇒ 单调递减、在 **87** 附近穿零，而用户报のぴゃ的病正是**上方谐波弱**。
+        // ⚠⚠ **低音侧一字不动**：`midi ≤ TILT_FADE_LO` 全额，而那里 tilt 是 +2.08…+9.15 的大益。
+        let ratio = ratio_of(semitones);
+        let hop_f = f0_hop.max(1);
+        let atten_at = |sample: usize| -> f64 {
+            let fi = sample / hop_f;
+            let f = f0_hz.get(fi).copied().unwrap_or(0.0);
+            if !(f > 20.0) {
+                return 1.0;
+            }
+            let midi = 69.0 + 12.0 * ((f64::from(f) * ratio) / 440.0).log2();
+            if midi <= TILT_FADE_LO {
+                1.0
+            } else if midi >= TILT_FADE_HI {
+                0.0
+            } else {
+                (TILT_FADE_HI - midi) / (TILT_FADE_HI - TILT_FADE_LO)
+            }
+        };
+        let curve = tilt_curve(semitones, tilt);
+        apply_spectral_tilt(&mut out, sample_rate, &curve, &atten_at);
+    }
+    (out, diag)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ⭐⭐⭐ S165 —— **缓存下来的 sinc 核与直接读相差不超过 1 ulp**。
+    ///
+    /// ⚠⚠ **如实登记**:第一版写的是 `assert_eq!`(逐位),**当场红了** ——
+    /// `frac -0.31 i 1`:`0.19913952743473382` vs `0.1991395274347339`。
+    /// 根因见 [`SincKernel`] 的 doc:`i as f64 − frac` 这个减法自带舍入,**误差随 `i` 变**,
+    /// 所以 `frac_` 不是严格常数。⇒ **这一刀不是逐位无损的**,而承重的验收在**端到端**
+    /// (整条真实 donor 的 f32 输出逐字节比,见 S165 §69)。
+    ///
+    /// 钉五件:
+    /// ⑴ 正负 `frac` 都要试 —— `si.floor()` 相对 `i` 的偏移由 `frac` 的符号决定,
+    ///    只试一个符号会漏掉 `base` 算错的那一半;
+    /// ⑵ 缓冲**两端**都要试 —— 那里核被截断(`idx < 0 || idx >= n` 的 `continue`),
+    ///    而截断之后求和项数不同,是最容易与直接版分叉的地方;
+    /// ⑶ ⛔ **阴性对照**:不同 `frac` 必须给出**不同**的读数 ——
+    ///    否则「两边相同」可以由「这个函数对任何输入都返回同一个数」满足;
+    /// ⑷ ⛔ **阴性对照**:核确实读到了信号(不是恒 0);
+    /// ⑸ ⭐ 顺带记下**有多少个读点是真的逐位相同的** —— 若哪天它掉到 0,
+    ///    说明分叉从「1 ulp」变成了别的东西,那是要看的。
+    /// ⭐⭐⭐ S165 —— 跨周期自适应对消([`cancel_subharmonic`])。
+    ///
+    /// ⛔⛔ **这条判据的承重点是「留住噪声」那一半**。整条线上已经有五个算子倒在
+    /// 「打散了成对结构、同时把谐波间的噪声一起平均掉」上(S163 §13.5:`xgrain` 关 /
+    /// 误差扩散 0.6 / `xdither` / 误差扩散 1.0 / `xslide`,交换比 1.31-2.12)。
+    /// ⇒ 只测「半频降了多少」的判据**证明不了这一刀比它们强** —— 必须两边一起钉。
+    ///
+    /// 靶(合成,零假设):`y = H + S + N`
+    /// * `H` = 基频 `F` 的 6 次谐波(周期 `T`);
+    /// * `S` = `F/2` 的正弦(周期 `2T`,在 `T` 上反相)= 要被吃掉的;
+    /// * `N` = 确定性白噪(不重复)= **要留住的**。
+    ///
+    /// 五条:
+    /// ⑴ 关(出厂 0.0)⇒ **逐位不变**。
+    /// ⑵ 开 ⇒ 半频 `F/2` 那根**至少掉 12 dB**。
+    /// ⑶ ⛔ 谐波主体 `F..6F` **不许掉超过 1 dB**。
+    /// ⑷ ⛔ **噪声不许掉超过 4 dB**(两抽头对不相干成分理论上 −3 dB;留 1 dB 余量)。
+    ///    ——— 这一条就是那五个算子过不去的门。
+    /// ⑸ 诊断眼睛要真的报数(`subcancel_samples > 0`)。
+    #[test]
+    fn subharmonic_cancellation_eats_the_half_rate_and_keeps_the_noise() {
+        const SR: u32 = 48_000;
+        const F: f64 = 1000.0;
+        let n = SR as usize / 2; // 0.5 s
+        let mut rng: u32 = 0x9e37_79b9;
+        let mut white = || {
+            rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (rng >> 8) as f32 / 8_388_608.0 - 1.0
+        };
+        let mut y = vec![0.0f32; n];
+        let mut noise = vec![0.0f32; n];
+        for i in 0..n {
+            let t = i as f64 / f64::from(SR);
+            let mut v = 0.0f64;
+            for k in 1..=6 {
+                v += (2.0 * std::f64::consts::PI * F * k as f64 * t).sin() / k as f64;
+            }
+            v += 0.35 * (2.0 * std::f64::consts::PI * (F / 2.0) * t).sin(); // 半频
+            let w = 0.05 * f64::from(white());
+            noise[i] = w as f32;
+            y[i] = (0.30 * v + w) as f32;
+        }
+        // 喂给它的 f0 轨:整段浊音、恰好 F(ratio 1.0 ⇒ 输出周期 = SR/F)
+        let hop = SR as usize / 100;
+        let f0 = vec![F as f32; n / hop + 2];
+
+        let bin_db = |x: &[f32], f: f64| -> f64 {
+            // 单频点的 Goertzel(比 FFT 省事,而且不需要窗对齐)
+            let w = 2.0 * std::f64::consts::PI * f / f64::from(SR);
+            let (c, s) = (w.cos(), w.sin());
+            let (mut re, mut im) = (0.0f64, 0.0f64);
+            for (i, v) in x.iter().enumerate() {
+                let p = w * i as f64;
+                let _ = (c, s);
+                re += f64::from(*v) * p.cos();
+                im += f64::from(*v) * p.sin();
+            }
+            10.0 * ((re * re + im * im) / (x.len() * x.len()) as f64).max(1e-30).log10()
+        };
+        // ⑴ 关 = 逐位不变
+        let mut off = y.clone();
+        let (k0, db0) = cancel_subharmonic(&mut off, &f0, hop, SR, 1.0, 0.0);
+        assert_eq!((k0, db0), (0, 0.0));
+        assert_eq!(off, y, "关着的时候必须逐位不变");
+
+        // ⑵⑶⑷ 开
+        let mut on = y.clone();
+        let (k1, _db1) = cancel_subharmonic(&mut on, &f0, hop, SR, 1.0, 1.0);
+        assert!(k1 > n / 4, "只动了 {k1} / {n} 个样本 —— 这一刀几乎没跑");
+
+        let half_before = bin_db(&y, F / 2.0);
+        let half_after = bin_db(&on, F / 2.0);
+        assert!(
+            half_after < half_before - 12.0,
+            "半频只掉了 {:.1} dB(要求 ≥12)",
+            half_before - half_after
+        );
+        for k in 1..=6 {
+            let f = F * k as f64;
+            let (a, b) = (bin_db(&y, f), bin_db(&on, f));
+            assert!(
+                b > a - 1.0,
+                "第 {k} 次谐波掉了 {:.2} dB —— 谐波主体不许被动(上限 1 dB)",
+                a - b
+            );
+        }
+        // ⑷ ⛔⛔ **噪声代价要在【另一个靶】上量** —— 靶 B 里**根本没有半频**。
+        //    ⛔ 第一版在靶 A 上拿「减掉谐波+半频后的残差」当噪声,**而它把被减掉的半频
+        //    当成了新增噪声** ⇒ 读到「噪声涨了 8.34 dB」,而真相是半频被干掉了。
+        //    那条断言因此是**空的**(残差涨了就恒过)。⭐ 血训:
+        //    **尺子的参照里不能含有「被测刀子故意去掉的东西」。**
+        let mut yb = vec![0.0f32; n];
+        let mut rng2: u32 = 0x9e37_79b9;
+        let mut white2 = || {
+            rng2 = rng2.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (rng2 >> 8) as f32 / 8_388_608.0 - 1.0
+        };
+        let mut harm = vec![0.0f32; n];
+        for i in 0..n {
+            let t = i as f64 / f64::from(SR);
+            let mut v = 0.0f64;
+            for k in 1..=6 {
+                v += (2.0 * std::f64::consts::PI * F * k as f64 * t).sin() / k as f64;
+            }
+            harm[i] = (0.30 * v) as f32;
+            yb[i] = harm[i] + 0.05 * white2();
+        }
+        let mut ob = yb.clone();
+        cancel_subharmonic(&mut ob, &f0, hop, SR, 1.0, 1.0);
+        let skip =
+            (SUBCANCEL_PAIRS as f64 * 2.0 * (f64::from(SR) / F) + f64::from(SR) / F) as usize + 1;
+        let noise_e = |x: &[f32]| -> f64 {
+            let mut e = 0.0f64;
+            for i in skip..n {
+                let r = f64::from(x[i]) - f64::from(harm[i]);
+                e += r * r;
+            }
+            10.0 * (e / (n - skip) as f64).max(1e-30).log10()
+        };
+        let (nb, na) = (noise_e(&yb), noise_e(&ob));
+        assert!(
+            na > nb - 1.5,
+            "噪声掉了 {:.2} dB(上限 1.5)—— 这正是 S163 那五个算子倒下的地方;\
+             实测应当只有 **−0.39 dB**(半频 −57.8 换噪声 −0.39)",
+            nb - na
+        );
+        for k in 1..=6 {
+            let f = F * k as f64;
+            let (a2, b2) = (bin_db(&yb, f), bin_db(&ob, f));
+            assert!(b2 > a2 - 0.5, "靶 B 上第 {k} 次谐波掉了 {:.2} dB", a2 - b2);
+        }
+
+        // ⑸ 出厂值与解析
+        assert_eq!(parse_subcancel(None), 0.0, "出厂必须是 0 = 逐位不变");
+        assert_eq!(parse_subcancel(Some("0.5")), 0.5);
+        assert_eq!(parse_subcancel(Some("2")), 0.0, "越界要落回出厂");
+        assert_eq!(SUBCANCEL_PAIRS, 4);
+    }
+
+    #[test]
+    fn the_cached_sinc_kernel_matches_the_direct_read_to_one_ulp() {
+        let n = 512usize;
+        let x: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f64 / 48_000.0;
+                ((2.0 * std::f64::consts::PI * 440.0 * t).sin()
+                    + 0.3 * (2.0 * std::f64::consts::PI * 2350.0 * t).sin()) as f32
+            })
+            .collect();
+        let mut seen: Vec<f64> = Vec::new();
+        let mut nonzero = 0usize;
+        let (mut exact, mut total) = (0usize, 0usize);
+        for &frac in &[-0.5, -0.31, -0.07, 0.07, 0.31, 0.5, 0.499_999, -0.499_999] {
+            let k = SincKernel::new(frac);
+            // ⑵ 两端 + 中间
+            for &i in &[0isize, 1, 3, 17, 255, 300, (n as isize) - 2, (n as isize) - 1] {
+                let want = sinc_read(&x, i as f64 - frac);
+                let got = k.read(&x, i);
+                if want.to_bits() == got.to_bits() {
+                    exact += 1;
+                }
+                total += 1;
+                // ⭐ 容差按**信号幅度 × 抽头数**算,不是按 `want` 的大小:分叉是
+                // `frac_` 的 1 ulp 经 `sin`/`cos`(导数 ~1)传到每一项,再由 32 项求和累积
+                // ⇒ 上界 ≈ 32 · |x|max · ε。取 64 倍留一档裕度。
+                // ⛔ 按 `want` 算是错的 —— 求和结果可以接近 0(相消),那时容差会塌到 0。
+                // ⛔ 松到 1e-9 就测不到「核算错了一个抽头」(那会差 0.1 量级)。
+                let tol = 64.0 * f64::EPSILON * 1.3;
+                assert!(
+                    (want - got).abs() <= tol,
+                    "frac {frac} i {i}: 缓存核 {got} 与直接读 {want} 差 {} > 容差 {tol}",
+                    (want - got).abs()
+                );
+                if i == 255 {
+                    seen.push(got);
+                }
+                if got.abs() > 1e-6 {
+                    nonzero += 1;
+                }
+            }
+        }
+        // ⑷ 核真的读到了信号
+        assert!(nonzero > 20, "缓存核几乎处处是 0 —— 判据是空的(只有 {nonzero} 个非零读数)");
+        // ⑶ 不同 frac 给出不同读数
+        let mut uniq = seen.clone();
+        uniq.sort_by(f64::total_cmp);
+        uniq.dedup();
+        assert!(
+            uniq.len() >= seen.len() - 1,
+            "不同 frac 读出了相同的值({} 个 frac 只有 {} 个不同读数)—— 阴性对照是空的",
+            seen.len(),
+            uniq.len()
+        );
+        // ⑸ 如实打出来,不断言 —— 它是观测量,不是契约。
+        println!("缓存核 vs 直接读:{exact}/{total} 个读点逐位相同,其余在容差内");
+    }
+
+
+    /// ⭐⭐⭐ S162 —— **谱倾斜还原**:关着逐位不变 · 膝盖以内恒等 · 只改幅度不改相位。
+    /// ⭐ **tilt 只改形状,不改响度**(逐帧等响)。
+    ///
+    /// ## ⛔ 为什么这条判据存在
+    /// 跨模型验收(零渲染噪声,5 组 × 2 档)读到护栏全面改善
+    /// (面状 −1.08…−2.53 dB,**10/10**),但**电平 10/10 上升 +1.83…+4.91 dB**。
+    /// 拿那样的臂去耳判,「更好」与「更响」**分不开** —— 这是听音测试最经典的混杂;
+    /// 而且它会和乐句级电平匹配(只压不抬)互相抵消,两把刀谁都读不出来。
+    ///
+    /// ## ⛔ 判据里的阴性对照
+    /// 只钉「RMS 不变」是**空判据** —— 一个什么都不做的实现照样过。
+    /// 所以同一条里还要钉住**谱形状确实变了**(低带被压、中带被抬)。
+    /// ⭐⭐⭐ S163 —— **tilt 在高音上淡出，而低音一字不动。**
+    ///
+    /// ## 靶子
+    /// [`TILT_TABLE`] 在 target **MIDI 73-78** 上拟，频带是**绝对频率** ⇒
+    /// 73-78（f0 554-740 Hz）的 H4-H10 落在 `2.6k/4.1k/6.5k`（+4.89/+2.27/+0.41，**抬**）；
+    /// MIDI 90（f0 1480 Hz）落在 `6.5k/10k/14k`（+0.41/+4.53/**−5.16**，最高档是**压**）。
+    /// 实测（`inverse_probe`，同一份 donor 进两条臂）上方谐波 Δ（tilt 开减关）：
+    /// yuyuko 68 **+9.15** · 71 +7.84 · 75 +5.31 · 78 +3.65 · 80 +2.91 · 82/83 +2.08 ·
+    /// **87 −0.84** · **90 −4.01**；akiko のぴゃ（MIDI 90）独立读 **−3.05**。
+    ///
+    /// ## 这条钉两半（缺一半都是空判据）
+    /// ① 高音（≥ [`TILT_FADE_HI`]）强度归零；
+    /// ② ⛔ **低音（≤ [`TILT_FADE_LO`]）完全不变** —— 用户 2026-08-27：
+    ///   「那 tilt 原本的作用呢？你别又修这个坏别的啊」。
+    #[test]
+    fn tilt_fades_out_on_high_targets_and_leaves_low_ones_untouched() {
+        // 直接打在那个映射上（与生产里逐帧算的那一段逐字相同）。
+        let atten = |donor_f0: f64, semis: f64| -> f64 {
+            let midi = 69.0 + 12.0 * ((donor_f0 * ratio_of(semis)) / 440.0).log2();
+            if midi <= TILT_FADE_LO {
+                1.0
+            } else if midi >= TILT_FADE_HI {
+                0.0
+            } else {
+                (TILT_FADE_HI - midi) / (TILT_FADE_HI - TILT_FADE_LO)
+            }
+        };
+        let f_of = |midi: f64| 440.0 * 2f64.powf((midi - 69.0) / 12.0);
+        // ⛔ 符号：`psola_shift_*` 收到的是 `semis = -(shift)` ⇒ 救援时为**正**。
+        //    第一版把 `ratio_of` 写反了 ⇒ target 算成低八度 ⇒ **淡出恒不触发**。
+        assert!(
+            (ratio_of(13.0) - 2f64.powf(13.0 / 12.0)).abs() < 1e-12,
+            "ratio_of 的符号反了 ⇒ 淡出永远不会触发"
+        );
+        // ① 高音：donor 唱 77、升 13 ⇒ target 90 ⇒ 归零
+        let hi = atten(f_of(77.0), 13.0);
+        assert!(hi < 1e-9, "target MIDI 90 上 tilt 必须归零（读到 {hi:.3}）");
+        // ② 低音：donor 唱 66、升 14 ⇒ target 80 ⇒ 全额
+        let lo = atten(f_of(66.0), 14.0);
+        assert!(
+            (lo - 1.0).abs() < 1e-9,
+            "target MIDI 80 上 tilt 必须**一字不动**（读到 {lo:.3}）——              那里实测 tilt 是 +2.91 dB 的大益"
+        );
+        // ③ 中间单调，而且在 87.5 上恰好一半
+        let mid = atten(f_of(74.5), 13.0); // target 87.5
+        assert!(
+            (mid - 0.5).abs() < 0.02,
+            "target 87.5 上应该恰好一半（读到 {mid:.3}）"
+        );
+        // ④ ⛔ 夹具有效性：两端必须真的不同，否则 ①② 可能都是恒真
+        assert!(lo > hi + 0.9, "两端必须拉开（低 {lo:.3} vs 高 {hi:.3}）");
+    }
+
+    #[test]
+    fn the_spectral_tilt_keeps_loudness_and_only_moves_the_shape() {
+        let sr = 44100u32;
+        let n = 1 << 15;
+        // 宽带素材:多个正弦叠白噪,覆盖 tilt 表的低/中/高三段
+        let mut x = vec![0.0f32; n];
+        let mut seed = 12345u32;
+        for (i, v) in x.iter_mut().enumerate() {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let noise = ((seed >> 9) as f32 / 4_194_304.0) - 1.0;
+            let t = i as f64 / f64::from(sr);
+            *v = (0.3 * (2.0 * std::f64::consts::PI * 300.0 * t).sin()
+                + 0.3 * (2.0 * std::f64::consts::PI * 1600.0 * t).sin()
+                + 0.3 * (2.0 * std::f64::consts::PI * 6500.0 * t).sin()) as f32
+                + 0.05 * noise;
+        }
+        let rms = |v: &[f32]| -> f64 {
+            (v.iter().map(|s| f64::from(*s) * f64::from(*s)).sum::<f64>() / v.len() as f64).sqrt()
+        };
+        // 只在 overlap-add 完整覆盖的中段比较(两端 wsum 不足,本来就不等响)
+        let lo = 4096;
+        let hi = n - 4096;
+        let before = rms(&x[lo..hi]);
+        let band = |v: &[f32], f0: f64, f1: f64| -> f64 {
+            // 朴素 Goertzel 式带能量:够用,而且不引第三方
+            let mut acc = 0.0f64;
+            let m = 4096usize;
+            let seg = &v[lo..lo + m];
+            let mut k = (f0 * m as f64 / f64::from(sr)).round() as usize;
+            let kend = (f1 * m as f64 / f64::from(sr)).round() as usize;
+            while k <= kend {
+                let (mut re, mut im) = (0.0f64, 0.0f64);
+                let w = 2.0 * std::f64::consts::PI * k as f64 / m as f64;
+                for (i, s) in seg.iter().enumerate() {
+                    let a = w * i as f64;
+                    re += f64::from(*s) * a.cos();
+                    im -= f64::from(*s) * a.sin();
+                }
+                acc += re * re + im * im;
+                k += 1;
+            }
+            10.0 * (acc + 1e-30).log10()
+        };
+        let b_lo = band(&x, 250.0, 350.0);
+        let b_mid = band(&x, 1500.0, 1700.0);
+
+        let mut y = x.clone();
+        apply_spectral_tilt(&mut y, sr, &tilt_curve(14.0, 1.0), &|_| 1.0);
+        let after = rms(&y[lo..hi]);
+
+        // ⭐ 等响:整体 RMS 变化必须很小
+        let d_db = 20.0 * (after / before).log10();
+        assert!(
+            d_db.abs() < 0.6,
+            "tilt 必须逐帧等响,实测 {:+.2} dB(before {:.5} after {:.5})",
+            d_db,
+            before,
+            after
+        );
+        // ⛔ 阴性对照:形状必须真的动了,否则这条就是空判据
+        let a_lo = band(&y, 250.0, 350.0);
+        let a_mid = band(&y, 1500.0, 1700.0);
+        let moved = (a_mid - b_mid) - (a_lo - b_lo);
+        assert!(
+            moved > 6.0,
+            "形状没动就不是 tilt(中带相对低带只动了 {:+.2} dB)",
+            moved
+        );
+    }
+
+    #[test]
+    fn the_spectral_tilt_is_identity_when_off_and_inside_the_knee() {
+        let sr = 44100u32;
+        let hop = 882usize;
+        let f0 = 220.0f64;
+        let x = voiced(sr, 1.0, f0);
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+        let run = |st: f64, tilt: f64| {
+            psola_shift_edge(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.0, Infrasonic::Off,
+                             0.0, 0.0, false, 1.0, 0.0, 0, &[], false, 0.0, tilt, false).0
+        };
+        // ⑴ tilt = 0 ⇒ 逐位同今天(出厂)
+        for st in [2.0f64, 8.0, 14.0] {
+            assert_eq!(run(st, 0.0), run(st, 0.0), "自比");
+        }
+        // ⑵ ⛔ 膝盖以内(|s| ≤ 6)即使 tilt = 1 也**一个字节不动**
+        for st in [2.0f64, 4.0, 6.0] {
+            assert_eq!(run(st, 1.0), run(st, 0.0),
+                       "{st} st 在膝盖以内,tilt 不许动它 —— 浅救援今天是好的");
+        }
+        // ⑶ 膝盖以外必须**真的做事**(否则上面两条只是「它什么都不做」)
+        let a = run(14.0, 0.0);
+        let b = run(14.0, 1.0);
+        let n = a.len().min(b.len());
+        let d: f64 = (0..n).map(|i| (f64::from(a[i]) - f64::from(b[i])).powi(2)).sum::<f64>() / n as f64;
+        let e: f64 = (0..n).map(|i| f64::from(a[i]).powi(2)).sum::<f64>() / n as f64;
+        let rel = 10.0 * (d / (e + 1e-30) + 1e-30).log10();
+        assert!(rel > -40.0, "−14 st 上 tilt=1 必须真的改变输出,实际只有 {rel:.1} dB");
+
+        // ⑷ 曲线本身:`|s| ≤ 6` 全 0(⭐ S162 换表后这是**按构造**的 —— 表的靶子就是浅救援 −6,
+        //    所以第一行本来就是零;膝盖已经删掉,留着是二次衰减)、表内插值单调
+        for d in [0.0f64, 3.0, 6.0] {
+            assert!(tilt_curve(-d, 1.0).iter().all(|v| v.abs() < 1e-12), "{d} st 必须全 0");
+        }
+        let c10 = tilt_curve(-10.0, 1.0);
+        let c14 = tilt_curve(-14.0, 1.0);
+        // ⚠ 阈值随表走:换靶子之后 −10 档 200-400 是 −2.95(旧表 −8.58 是**过冲**,
+        //    留出验证里旧表在 −10 上反而把鹅妈妈弄更差 3.14 → 3.57)。
+        assert!(c10[0] < -2.0 && c14[0] < c10[0], "200-400 Hz 该压,而且越深压越多");
+        assert!(c14[4] > 4.0, "2-3 kHz 该抬");
+        // strength 线性
+        let half = tilt_curve(-14.0, 0.5);
+        for i in 0..9 {
+            assert!((half[i] - c14[i] * 0.5).abs() < 1e-9, "strength 必须线性");
+        }
+    }
+
+    /// ⛔⛔ S162 —— **缓冲区末尾被截断的那半个岛,不许原样透传。**
+    ///
+    /// 用户 2026-08-26:「歌曲结尾也会造出一个很明显的竖条纹伪影」。归因(同一次 run 的转储):
+    /// `donor_post` 的末尾 **232 样本(5.26 ms)与 `donor_pre` 逐位相同** ⇒ PSOLA 完全没碰它,
+    /// 而那 5 ms 是**没被移调的原音高**(低 12 个半音),顶在文件末尾、前面是低 10 dB 的合成音
+    /// ⇒ 阶跃 + 错音高 = 那条竖线。
+    ///
+    /// 这条钉三件:⑴ 关着 = **逐位不变**;⑵ 开着时**只动最末尾那一小段**;
+    /// ⑶ ⛔ **阴性对照**:末尾是**长段静音/清音**(不是被截断的岛)时,开关两边**逐位相同**。
+    #[test]
+    fn the_tail_fade_only_touches_a_truncated_island_at_the_very_end() {
+        let sr = 44100u32;
+        let hop = sr as usize / 100;
+        // 一条一直唱到最后一个样本的浊音 ⇒ 末尾的岛必然被缓冲边界截断
+        let x = voiced(sr, 0.5, 220.0);
+        let f0 = flat_f0(x.len(), hop, 220.0);
+        let run = |tf: bool| {
+            psola_shift_edge(&x, sr, -6.0, 0.0, &f0, hop, false, 0.0, 0.0, Infrasonic::Off,
+                             0.0, 0.0, false, 1.0, 0.0, 0, &[], false, 0.0, 0.0, tf).0
+        };
+        let a = run(false);
+        let b = run(true);
+        assert_eq!(a.len(), b.len());
+        // ⑵ 只动最末尾:第一个不同的样本必须落在最后 30 ms 之内
+        let first_diff = (0..a.len()).find(|&i| a[i] != b[i]);
+        let i = first_diff.expect("⛔ tail_fade 开着却什么都没动 —— 那这条判据是空的");
+        // ⛔ S162 第二版:契约从「只动裸透传那 5 ms」换成「**最后 80 ms 一条释放曲线**」——
+        //    第一版实测把盲搜峰值从 18.6 推到 **25.1 dB(更糟)**:5 ms 的淡出本身就是宽带瞬变。
+        let cap = (TAIL_RELEASE_MS as usize * sr as usize) / 1000 + sr as usize / 100;
+        assert!(
+            a.len() - i <= cap,
+            "只许动最后 ~{:.0} ms,实际从末尾前 {:.1} ms 就开始动了",
+            TAIL_RELEASE_MS,
+            (a.len() - i) as f32 / sr as f32 * 1000.0
+        );
+        // 末尾必须被压下去(释放到 0)
+        assert!(
+            b[b.len() - 1].abs() <= a[a.len() - 1].abs() * 0.25 + 1e-6,
+            "末尾该被释放到接近 0:{} vs {}",
+            b[b.len() - 1],
+            a[a.len() - 1]
+        );
+        // ⛔ 释放必须是**平滑**的:相邻样本的最大跳变不许比原来大(那正是第一版栽的地方)
+        let step = |v: &[f32]| {
+            v.windows(2).rev().take(cap).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max)
+        };
+        assert!(
+            step(&b) <= step(&a) * 1.05 + 1e-6,
+            "释放本身不许造出更大的瞬变:{:.5} vs 原来 {:.5}",
+            step(&b),
+            step(&a)
+        );
+        // ⑶ ⛔ 阴性对照:末尾接一大段静音(不是被截断的岛)⇒ 两边逐位相同
+        let mut y = x.clone();
+        y.extend(std::iter::repeat(0.0f32).take(sr as usize / 4));
+        let f0b = flat_f0(y.len(), hop, 220.0);
+        let mut f0b2 = f0b.clone();
+        for v in f0b2.iter_mut().skip(x.len() / hop) {
+            *v = 0.0; // 后面那段是清音/静音
+        }
+        let run2 = |tf: bool| {
+            psola_shift_edge(&y, sr, -6.0, 0.0, &f0b2, hop, false, 0.0, 0.0, Infrasonic::Off,
+                             0.0, 0.0, false, 1.0, 0.0, 0, &[], false, 0.0, 0.0, tf).0
+        };
+        assert_eq!(
+            run2(false),
+            run2(true),
+            "⛔ 末尾是长段静音时不该动手 —— 那是正常的透传,不是被截断的岛"
+        );
+    }
+
+    /// ⭐⭐⭐ S162 —— **κ 的染色是【线性插值】造成的,不是 κ 这个想法有问题。**
+    ///
+    /// 这条钉三件:
+    /// ⑴ `stride = 1` 时 [`sinc_read_strided`] 与 [`sinc_read`] 在**整数位置**都取回原样本
+    ///    (sinc(k) = 0 for k ≠ 0)——测量链的恒等闸;
+    /// ⑵ ⛔ **抗混叠**:`stride > 1` 时核必须真的拉宽 —— 拿一个**高频正弦**下采样,
+    ///    线性插值会把它读成混叠产物,而本函数必须压住它;
+    /// ⑶ ⛔ **κ = 0 那一支一个字节不动**(`formant_rate == 1.0` 走原路)。
+    #[test]
+    fn the_formant_read_is_antialiased_and_kappa_zero_is_untouched() {
+        // ⑴ 整数位置恒等
+        let x: Vec<f32> = (0..512).map(|i| ((i as f32) * 0.037).sin()).collect();
+        for pos in [64.0f64, 100.0, 255.0] {
+            let a = sinc_read_strided(&x, pos, 1.0);
+            assert!((a - f64::from(x[pos as usize])).abs() < 1e-6,
+                    "stride=1 在整数位置必须取回原样本:{a} vs {}", x[pos as usize]);
+        }
+
+        // ⑵ ⛔ 抗混叠(夹具必须真的会折叠):stride = 1.6 ⇒ 新 Nyquist = sr/(2·1.6) = 15 kHz。
+        //    取 **20.4 kHz**(> 15 kHz)的纯正弦 ⇒ 它**整个**应当被滤掉;
+        //    线性插值挡不住,会把它折成 9.6 kHz 的假信号留在输出里。
+        //    ⚠ 第一版我取了 10.08 kHz —— **那在新 Nyquist 之下,根本不会混叠**,判据当场红,红对了。
+        let sr = 48000.0f64;
+        let f = 20400.0f64;
+        let n = 8192usize;
+        let y: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f64::consts::PI * f * i as f64 / sr).sin() as f32)
+            .collect();
+        let stride = 1.6f64;
+        let m = ((n as f64) / stride) as usize - 64;
+        let rms = |v: &[f64]| -> f64 { (v.iter().map(|s| s * s).sum::<f64>() / v.len() as f64).sqrt() };
+        let lin: Vec<f64> = (0..m)
+            .map(|j| {
+                let p = j as f64 * stride;
+                let k = p.floor() as usize;
+                let fr = p - k as f64;
+                f64::from(y[k]) * (1.0 - fr) + f64::from(y[k + 1]) * fr
+            })
+            .collect();
+        let anti: Vec<f64> = (0..m).map(|j| sinc_read_strided(&y, j as f64 * stride, stride)).collect();
+        let (el, ea) = (rms(&lin), rms(&anti));
+        assert!(
+            ea < el * 0.35,
+            "超出新 Nyquist 的内容必须被滤掉:线性 rms {el:.4} vs 抗混叠 {ea:.4}(要 <35 %)"
+        );
+        // ⛔ 阴性对照:同一个函数在 stride = 1 上不许把信号也吃掉
+        let keep: Vec<f64> = (0..n - 64).map(|j| sinc_read_strided(&y, j as f64, 1.0)).collect();
+        assert!(
+            rms(&keep) > 0.6,
+            "stride = 1 时不许衰减信号本身(rms {:.4})—— 否则上面那条只是「它把什么都滤掉了」",
+            rms(&keep)
+        );
+
+        // ⑶ κ = 0 ⇒ formant_rate 恰好 1.0 ⇒ 那一支根本不调本函数(源码闸)
+        let src = include_str!("psola.rs");
+        assert!(src.contains("let v = if formant_rate == 1.0 {"),
+                "κ=0 的快路不见了 —— 出厂默认(κ=0)的逐位不变就没人盯了");
+        assert!(src.contains("sinc_read_strided(x, sp, formant_rate)"),
+                "κ≠0 那一路必须走抗混叠 sinc,不许回到线性插值");
+        // ⛔ 只查 κ 那一段的**上下文**,不许全文搜「线性插值」的字样 ——
+        //   上面 ⑵ 的夹具里就有一份线性插值当对照,全文搜会红在**判据自己**身上
+        //   (S161f 那次「红在我自己写的注释上」同型;第一次跑正是这么红的)。
+        let anchor = concat!("let sp = s_pos + (si - s_pos) * formant", "_rate;");
+        let at = src.find(anchor).expect("κ 那一段的锚点不见了");
+        // ⛔ 不许直接切字节:这个文件里全是中文 doc,`at + 600` 十有八九落在一个字符中间
+        //   (第一次跑就 panic 在 `is not a char boundary`)。按【行】取。
+        let after: String = src[at..].lines().take(12).collect::<Vec<_>>().join("
+");
+        assert!(!after.contains("* (1.0 - f)"),
+                "κ 那一路又变回线性插值了 —— 本文件 TRANSPORT_SINC_HALF 的 doc 明令禁止");
+    }
+
+    /// A voiced test signal: harmonics of `f0` under a fixed formant envelope.
+    /// ⛔ Synthetic periodic material systematically flatters/frames PSOLA-class algorithms
+    /// (S81, three times) — these tests assert STRUCTURE (identity, length, that the pitch
+    /// actually moved), never quality. Quality lives in `scripts/range_rulers/` on real renders.
+    fn voiced(sr: u32, secs: f64, f0: f64) -> Vec<f32> {
+        let n = (f64::from(sr) * secs) as usize;
+        let mut y = vec![0.0f32; n];
+        let formants = [(700.0, 90.0, 1.0), (1200.0, 110.0, 0.6), (2600.0, 160.0, 0.35)];
+        let mut k = 1.0;
+        while k * f0 < f64::from(sr) * 0.45 {
+            let f = k * f0;
+            let mut e = 1e-4;
+            for (fc, bw, amp) in formants {
+                e += amp / (1.0 + ((f - fc) / bw).powi(2));
+            }
+            for (i, s) in y.iter_mut().enumerate() {
+                *s += (e * (2.0 * std::f64::consts::PI * f * i as f64 / f64::from(sr)).cos()) as f32;
+            }
+            k += 1.0;
+        }
+        let peak = y.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-9);
+        y.iter().map(|v| v / peak * 0.9).collect()
+    }
+
+    fn flat_f0(n: usize, hop: usize, hz: f32) -> Vec<f32> {
+        vec![hz; n / hop + 2]
+    }
+
+    /// Dominant period by NORMALIZED autocorrelation, in samples — a coarse but independent
+    /// pitch readout. It must be normalized: dividing only by the overlap length biases the
+    /// score toward long lags and this helper then reports the search ceiling (it did, at 735).
+    fn dominant_period(x: &[f32], lo: usize, hi: usize) -> usize {
+        let mut best = lo;
+        let mut best_v = f64::NEG_INFINITY;
+        let mut scores: Vec<f64> = Vec::new();
+        for lag in lo..hi.min(x.len() / 2) {
+            let (mut dot, mut ea, mut eb) = (0.0f64, 0.0f64, 0.0f64);
+            for i in 0..x.len() - lag {
+                let (a, b) = (f64::from(x[i]), f64::from(x[i + lag]));
+                dot += a * b;
+                ea += a * a;
+                eb += b * b;
+            }
+            let v = if ea > 1e-30 && eb > 1e-30 { dot / (ea * eb).sqrt() } else { -1.0 };
+            scores.push(v);
+            if v > best_v {
+                best_v = v;
+                best = lag;
+            }
+        }
+        // Octave guard: multiples of the true period score just as high on stationary material
+        // (it reported 147 for a 74-sample output). Take the smallest lag that is BOTH a local
+        // maximum and within 10% of the best — "smallest above threshold" alone lands on the
+        // shoulder of the peak and reads 71 for a true 73.5.
+        for i in 1..scores.len() - 1 {
+            if scores[i] >= best_v * 0.9 && scores[i] >= scores[i - 1] && scores[i] >= scores[i + 1] {
+                best = lo + i;
+                break;
+            }
+        }
+        best
+    }
+
+    #[test]
+    fn ratio_one_is_the_identity() {
+        // THE gate. The implementation we deleted in 2026-07 lost 5-9 dB of HNR at ratio 1.000 —
+        // the damage was the resynthesis itself, and only this assertion sees that.
+        let sr = 44_100;
+        let x = voiced(sr, 0.5, 220.0);
+        let hop = sr as usize / 200;
+        let (y, _) = psola_shift_diag(&x, sr, 0.0, &flat_f0(x.len(), hop, 220.0), hop);
+        assert_eq!(y.len(), x.len());
+        let worst = x
+            .iter()
+            .zip(y.iter())
+            .enumerate()
+            .map(|(i, (a, b))| ((a - b).abs(), i))
+            .fold((0.0f32, 0usize), |m, v| if v.0 > m.0 { v } else { m });
+        assert!(
+            worst.0 < 1e-5,
+            "ratio 1.0 must reproduce the input; worst |Δ| = {} at sample {}",
+            worst.0,
+            worst.1
+        );
+    }
+
+    /// S155 —— ⭐⭐ **ratio 1.0 在这把刀【开着】的时候仍然是逐位恒等。**
+    ///
+    /// 这一条是差分式(`out -= LP(out) - LP(in)`)存在的**全部理由**,而它换掉的那句话就写在
+    /// `psola_shift_infra` 的契约里:「a linear filter is never bit-exact at ratio 1.0,
+    /// that is exactly why it is off by default」。⇒ 在这条判据出现之前,把默认翻开就等于
+    /// 把这条线上**最便宜、最不可能自证**的那道闸(它在 S146 一口气杀掉三个「看起来对」的设计)
+    /// 降级成 epsilon 判据。
+    ///
+    /// ⛔ 注意它**不是**靠 `if semitones == 0` 的短路换来的 —— 那种短路会让这道闸变成恒真的
+    /// 空判据,而那正是让 2026-07 那份实现混过去的形状(见 `psola_shift_env` 顶部那段注释)。
+    /// 它是结构性的:ratio 1.0 时 `out ≡ x` ⇒ 两条基线是**同一段字节走同一段代码** ⇒ 修正项
+    /// 恒为 `0.0` ⇒ `assert_eq!` 而不是 `< 1e-5`。
+    ///
+    /// ⚠ 顺带钉住另一件事:`psola_shift_env` 顶部那句「deliberately no `semitones == 0`
+    /// shortcut」必须继续成立。若有人为了让这条测试变绿而加短路,`the_infrasonic_arm_*` 那两条
+    /// 会在别的位移上红,因为短路只挡 0。
+    #[test]
+    fn ratio_one_is_the_identity_even_with_the_infrasonic_arm_on() {
+        let sr = 44_100;
+        let hop = sr as usize / 200;
+        // 两种源:一条纯浊音,一条带**直流**的脉冲串 —— 后者是关键,因为差分式唯一可能出事的
+        // 地方就是输入自己带低频,而非差分式在这里一定会把那份直流减掉、于是恒等当场失败。
+        let a = voiced(sr, 0.5, 220.0);
+        let (b, _) = pulses(sr, 0.5, |_| 220.0, |_| 1.0);
+        for (name, x) in [("voiced", a), ("pulses(带直流)", b)] {
+            let f0t = flat_f0(x.len(), hop, 220.0);
+            for arm in [Infrasonic::PerPeriod, Infrasonic::FixedMs(8.0), Infrasonic::FixedMs(2.0)] {
+                let (y, d) =
+                    psola_shift_infra(&x, sr, 0.0, 0.0, &f0t, hop, false, 0.0, 0.30, arm);
+                assert_eq!(
+                    y, x,
+                    "{name} / {arm:?}:ratio 1.0 必须**逐位**恒等 —— 差分式的修正项在这里应当恒为 0"
+                );
+                assert_eq!(d.infrasonic_removed, 0.0, "{name} / {arm:?}:恒等却报拿掉了东西");
+            }
+        }
+        // ⛔ 阴性对照:同一段代码在**非** 1.0 的比值上必须**不是**恒等 ——
+        //    否则上面那六条 `assert_eq!` 只是在证明「这把刀什么都没做」。
+        let x = voiced(sr, 0.5, 220.0);
+        let f0t = flat_f0(x.len(), hop, 220.0);
+        let (y, _) =
+            psola_shift_infra(&x, sr, 9.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::PerPeriod);
+        assert_ne!(y, x, "+9 st 上也逐位相同 ⇒ 上面那组恒等断言是空的");
+    }
+
+    /// S155 笔6 —— ⭐ **每个岛用它自己的基频定宽度,而不是整条缓冲一个宽度。**
+    ///
+    /// ⛔ 为什么这条判据非有不可:生产里一遍救援的 donor 缓冲**不止装被救的那些音**。
+    /// 这一遍不救的音同样有真音频、同样生成颗粒(输出后面会被窗丢掉),而它们的基频更低
+    /// ⇒ 分位数被它们拉下去 ⇒ 刀比该有的宽。实测:−14 那一遍整曲选 **4.96 ms**,
+    /// 而只算真正被救的那 62 个音应当是 **2.70 ms** ⇒ 50-125 Hz 少削约 **5 dB**。
+    /// ⇒ 没有这条判据,「改成逐岛」与「改了但没生效」在别的每一条测试上长得一模一样。
+    ///
+    /// 夹具:低音岛(200 Hz)+ 空档 + 高音岛(400 Hz)。整缓冲的规则会选 1000/200 = 5 ms;
+    /// 逐岛应当给高音岛 1000/400 = 2.5 ms。⇒ **高音岛里逐岛臂必须比定宽 5 ms 那条削得更干净**,
+    /// 而**低音岛里两者必须几乎一样**(那是阴性对照 —— 否则「更干净」可能只是整体多削了)。
+    #[test]
+    fn each_island_gets_its_own_cut_width() {
+        let sr = 44_100;
+        let hop = sr as usize / 200;
+        let (lo_isl, _) = pulses(sr, 0.35, |_| 200.0, |_| 1.0);
+        let (hi_isl, _) = pulses(sr, 0.35, |_| 400.0, |_| 1.0);
+        let gap = vec![0.0f32; sr as usize / 5]; // 200 ms 空档 ⇒ 两个岛分得开
+        let mut x = lo_isl.clone();
+        x.extend_from_slice(&gap);
+        let a2 = x.len();
+        x.extend_from_slice(&hi_isl);
+        let frames = x.len().div_ceil(hop);
+        let mut f0t = vec![0.0f32; frames];
+        for (i, f) in f0t.iter_mut().enumerate() {
+            let t = i * hop;
+            *f = if t < lo_isl.len() {
+                200.0
+            } else if t < a2 {
+                0.0
+            } else {
+                400.0
+            };
+        }
+        let arm = |inf| {
+            psola_shift_env(&x, sr, 12.0, 0.0, &f0t, hop, false, 0.0, 0.30, inf, 0.0, 0.0, 0.0, 0.0, 0)
+        };
+        let (off, doff) = arm(Infrasonic::Off);
+        let (per, dper) = arm(Infrasonic::PerPeriod);
+        // 整缓冲的规则会拿最低的那个基频 ⇒ 1000/200 = 5 ms
+        let (fix, _) = arm(Infrasonic::FixedMs(5.0));
+        assert!(doff.islands >= 2, "夹具没造出两个岛(islands = {})", doff.islands);
+        assert!(dper.infrasonic_ma_ms > 0.0, "臂开着却没报出宽度");
+
+        // 「削得多干净」= 岛内**还剩多少【多出来的】低频**,不是低频总能量。
+        // ⛔ 第一版量的是总能量,读出「两条臂差 +0.01 dB」——**尺子坏了**:
+        //    这个夹具是单极性脉冲串,自带很大的直流,而差分式**按设计保留输入自己的低频**
+        //    ⇒ 总能量被那份直流主导,两条臂当然一样。⇒ 必须减掉输入自己的那一份。
+        // 尺子本身与刀无关:8 ms 两遍盒(`RULER_BOX_PASSES`),这条线的历史尺子。
+        let low = |y: &[f32], a: usize, b: usize| -> f64 {
+            let ly = infrasonic_baseline_ms(&y[a..b], sr, INFRASONIC_MA_MS);
+            let lx = infrasonic_baseline_ms(&x[a..b], sr, INFRASONIC_MA_MS);
+            ly.iter().zip(lx.iter()).map(|(u, v)| (u - v) * (u - v)).sum()
+        };
+        let (hi_a, hi_b) = (a2, x.len());
+        let (lo_a, lo_b) = (0usize, lo_isl.len());
+        let d = |num: f64, den: f64| 10.0 * (num.max(1e-300) / den.max(1e-300)).log10();
+
+        // ⭐ 承重:高音岛里,逐岛臂必须比定宽 5 ms 明显更干净
+        let gain_hi = d(low(&fix, hi_a, hi_b), low(&per, hi_a, hi_b));
+        assert!(
+            gain_hi > 3.0,
+            "高音岛里逐岛臂只比定宽 5 ms 好 {gain_hi:+.2} dB —— 逐岛宽度没生效\
+             (报出来的中位宽度 {} ms)",
+            dper.infrasonic_ma_ms
+        );
+        // ⛔ 阴性对照:低音岛里两者应当几乎一样(那里两条臂本来就是同一个宽度)
+        let gain_lo = d(low(&fix, lo_a, lo_b), low(&per, lo_a, lo_b));
+        assert!(
+            gain_lo.abs() < 1.5,
+            "低音岛里两者差了 {gain_lo:+.2} dB —— 那说明上面那条「更干净」不是逐岛买来的,\
+             而是整体多削了"
+        );
+        // ⛔ 而且这把刀在两个岛上都必须真的动过东西
+        assert_ne!(per, off, "逐岛臂逐位没动");
+    }
+
+    /// S155 笔5 —— ⛔⛔⛔ **这把刀不许把【输入自己的基频】加回输出。**
+    ///
+    /// 这是用户 2026-08-19 听出来的那条缺陷的判据,而它本该在笔1 就存在。
+    /// 差分式 `out -= LP(out) − LP(in)` 里的 `+LP(in)` 是**一份低通过的输入**,
+    /// 而输入(donor)唱得比输出低 ⇒ 只要 LP 在输入的基频上没压干净,
+    /// 输出里就多出**第二个音高**。用户的原话:「f0 附近偏下多了一道有点时长的共振峰伪影,
+    /// 听起来甚至有一点**合唱感**」,而且他给出的强弱排序(无扩展 < 不开刀 < 固定 8 ms <
+    /// 自适应)与仪器**完全一致**。
+    ///
+    /// ## ⛔ 为什么这个夹具必须有**两个**音高
+    ///
+    /// 宽度规则把低通的第一个零点放在**这段缓冲里最低**的基频上。若夹具只有一个音高,
+    /// 那个音高就正好坐在零点上 ⇒ 漏为 0 ⇒ **判据恒真**。真实情况是:缓冲里有更低的音
+    /// (它们设定了宽度),而**真正被救的那个音**的基频更高 ⇒ 落在**旁瓣**里。
+    /// 两遍盒的第一个旁瓣只有 **−27 dB**,四遍是 **−53 dB** —— 这就是笔5 改的东西。
+    /// ⇒ 夹具:前半段 200 Hz(定宽度),后半段落在第一个旁瓣峰上(≈1.43/W)。
+    #[test]
+    fn the_cut_never_puts_the_inputs_own_pitch_back_into_the_output() {
+        let sr = 44_100;
+        let hop = sr as usize / 200;
+        let f_low = 200.0f64;
+        // 第一个旁瓣峰在 f·W ≈ 1.43,而 W ≈ 1/f_low ⇒ f ≈ 1.43·f_low。
+        let f_hi = 1.43 * f_low;
+        let (a, _) = pulses(sr, 0.5, |_| f_low, |_| 1.0);
+        let (b, _) = pulses(sr, 0.5, |_| f_hi, |_| 1.0);
+        let mut x = a.clone();
+        x.extend_from_slice(&b);
+        let frames = x.len().div_ceil(hop);
+        let half = frames / 2;
+        let mut f0t = vec![f_low as f32; frames];
+        for f in f0t.iter_mut().skip(half) {
+            *f = f_hi as f32;
+        }
+        let (off, _) = psola_shift_env(
+            &x, sr, 12.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0, 0.0, 0.0, 0);
+        let (on, don) = psola_shift_env(
+            &x, sr, 12.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::PerPeriod, 0.0, 0.0, 0.0, 0.0, 0);
+        assert!(don.infrasonic_ma_ms > 0.0, "臂开着却没报出宽度");
+        // 只看后半段(那里输入唱 f_hi,而输出被搬到 2·f_hi ⇒ f_hi 上本该什么都没有)
+        let k = x.len() / 2;
+        let leak_off = tone_mag(&off[k..], sr, f_hi);
+        let leak_on = tone_mag(&on[k..], sr, f_hi);
+        let d = 20.0 * (leak_on.max(1e-15) / leak_off.max(1e-15)).log10();
+
+        // ⛔ 阈值不许是拍脑袋的数。参照 = **2 遍盒那条**(= shipped 时的实现)在同一份材料、
+        //    同一个宽度上漏多少;判据 = 今天这把必须比它好 ≥18 dB。
+        //    ⭐ 这样它随 `CUT_BOX_PASSES` 自校准,而且它测的正是「改这个常数买到了什么」。
+        //    实测:2 遍 **+22.70 dB** · 4 遍 **+1.64** · 6 遍与 8 遍都在 +1.0 以下。
+        let ms = f64::from(don.infrasonic_ma_ms);
+        let two = {
+            let lo_o = infrasonic_baseline_passes(&off, sr, ms, 2);
+            let lo_i = infrasonic_baseline_passes(&x, sr, ms, 2);
+            let y: Vec<f32> = off
+                .iter()
+                .enumerate()
+                .map(|(i, o)| (f64::from(*o) - (lo_o[i] - lo_i[i])) as f32)
+                .collect();
+            20.0 * (tone_mag(&y[k..], sr, f_hi).max(1e-15) / leak_off.max(1e-15)).log10()
+        };
+        assert!(
+            two - d >= 18.0,
+            "这把刀在输入自己的基频 {f_hi:.0} Hz 上加了 {d:+.2} dB,而 2 遍盒那条参照加 {two:+.2} \
+             —— 只好了 {:.1} dB。那是把 donor 的音高塞回输出(用户听成「合唱感」)。\
+             宽度 {ms:.2} ms,盒 {CUT_BOX_PASSES} 遍",
+            two - d
+        );
+        // ⛔ 参照本身必须**真的坏**,否则上面那条是拿两个都干净的东西相减。
+        assert!(
+            two > 10.0,
+            "2 遍盒的参照只漏了 {two:+.2} dB —— 这个夹具没把缺陷造出来,判据是空的\
+             (被救音的基频必须落在旁瓣上,见这条测试的文档)"
+        );
+        // ⛔ 阴性对照:这条臂**必须真的动了东西**,否则上面那条是「什么也没做」的恒真。
+        assert_ne!(on, off, "刀开着却逐位没动 —— 上面那条判据是空的");
+    }
+
+    /// S155 笔3 —— ⛔⛔ **宽度只许由这一段缓冲里【真的有音频】的那些帧决定。**
+    ///
+    /// 这条判据是**对抗复核**送回来的,而它抓的是本场刚上线的东西:生产喂给每一遍救援的是
+    /// **整首歌**的 f0 轨,而 `score2svc.rs` 会把不相交的 chunk 的**音频铺成零**却**从不掩 f0**。
+    /// ⇒ 分位数落在**在这条缓冲里是数字静音**的音上,而那些音从来不是被救援的音。
+    /// 实测:−14 那一遍生产选了 **6.03 ms**,而按真正被救的音应当是 **2.70 ms**,
+    /// 于是 50-125 Hz 还站着 **+8.5…+9.6 dB**、125-200 Hz 只拿掉 **0.16 dB**。
+    ///
+    /// ⛔ **为什么必须是一条【结构】判据而不是一个读数**:`infrasonic_frac` 是固定 8 ms 的尺子,
+    /// 99.4% 的能量在 20 Hz 以下 ⇒ 6.03 ms 与 8.00 ms 在它上面**读同一个数**。
+    /// 唯一露馅的是 `infrasonic_ma_ms`,而它露的时候没有任何东西会红。
+    ///
+    /// ⚠ 现有的 `the_infrasonic_arm_costs_nothing_over_productions_output_band` 挡不住这个:
+    /// 它用 `flat_f0`(一条恒定的轨)⇒ 对「在一条跨两个八度的轨上取分位数」**结构上失明**。
+    #[test]
+    fn the_cut_width_ignores_f0_frames_whose_audio_is_digital_silence() {
+        let sr = 44_100;
+        let hop = sr as usize / 200;   // 5 ms
+        // 后半段是真音频(440 Hz),前半段是**数字静音**但 f0 轨仍然写着一个很低的音。
+        let (voiced, _) = pulses(sr, 0.5, |_| 440.0, |_| 1.0);
+        let mut x = vec![0.0f32; voiced.len()];
+        x.extend_from_slice(&voiced);
+        let frames = x.len().div_ceil(hop);
+        let half = frames / 2;
+        let mut f0t = vec![110.0f32; frames];        // 静音那半:一个低八度的假音
+        for f in f0t.iter_mut().skip(half) {
+            *f = 440.0;
+        }
+        let (_, d) = psola_shift_env(
+            &x, sr, 9.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::PerPeriod, 0.0, 0.0, 0.0, 0.0, 0);
+        let want = 1000.0 / 440.0;
+        assert!(
+            (f64::from(d.infrasonic_ma_ms) - want).abs() < 0.15,
+            "宽度 {} ms —— 它应当是**有音频那半**的一个周期({want:.2} ms)。\
+             读到 {:.2} ms 说明分位数又落回了铺零区那条假 f0(110 Hz ⇒ 9.09 ms)",
+            d.infrasonic_ma_ms,
+            d.infrasonic_ma_ms
+        );
+        // ⛔ 阴性对照:把那半段的音频也填上,宽度**必须**跟着变宽 ——
+        //    否则上面那条断言可能只是「这个实现从来不看 f0 轨」。
+        let mut x2 = voiced.clone();
+        x2.extend_from_slice(&voiced);
+        let (_, d2) = psola_shift_env(
+            &x2, sr, 9.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::PerPeriod, 0.0, 0.0, 0.0, 0.0, 0);
+        assert!(
+            f64::from(d2.infrasonic_ma_ms) > f64::from(d.infrasonic_ma_ms) * 1.5,
+            "把静音那半填上音频之后宽度没跟着变({} → {} ms)⇒ 上面那条判据是空的",
+            d.infrasonic_ma_ms,
+            d2.infrasonic_ma_ms
+        );
+    }
+
+    /// S155/S156 —— 读窗旋钮。**S156 把它翻成了生产默认(1.0)**,所以这条判据钉的不再是
+    /// 「默认关」,而是⑴ 显式 `0` 仍然渲得出旧臂、⑵ 两条臂**真的不同**、⑶ 打开时不被静默跳过。
+    ///
+    /// ⛔ 后半句才是贵的那条。这个旋钮有一条现成的静默失败路径:颗粒循环里有
+    /// `if lw > max_period { continue; }`,而 `max_period` 是**按今天那个窄窗**定的
+    /// (0.02 s)⇒ 宽窗臂会把颗粒**一颗颗跳过**,输出照样有声(岛外透传 + 剩下的颗粒),
+    /// 而「干预没生效」会被读成「干预无效」。S148 的 `frac_transport` 写死成 `false`
+    /// 就是同一族,那次差点把一条真实的修法判死。
+    ///
+    /// ⇒ 这里同时钉住三件:⑴ 0 = 逐位同旧;⑵ 打开之后输出**变了**;
+    /// ⑶ 打开之后**源覆盖率变好**(那是窗变宽的结构性后果,而且今天这个读数本来就在
+    ///    `src_uncovered_frac` 上 —— ratio > 2 时相邻读窗之间会留下永远没人读的源波形)。
+    #[test]
+    fn the_wide_read_window_bites_and_the_old_arm_is_still_reachable() {
+        let sr = 44_100;
+        let f0 = 220.0;
+        let hop = sr as usize / 200;
+        let (x, _) = pulses(sr, 1.0, |_| f0, |_| 1.0);
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+        // ratio > 2 ⇒ 今天的读窗窄于一个源周期 ⇒ 源上真的有没人读的段落
+        for st in [7.0f64, 14.0] {
+            let (a, da) = psola_shift_env(
+                &x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0, 0.0, 0.0, 0);
+            let (b, db) = psola_shift_env(
+                &x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0, 1.0, 0.0, 0);
+            assert_ne!(a, b, "{st} st: 宽窗臂与今天逐位相同 —— 颗粒多半被 max_period 静默跳过了");
+            assert_eq!(da.islands, db.islands, "{st} st: 窗宽不该改变岛的数目");
+            assert!(
+                db.marks >= da.marks / 2,
+                "{st} st: 宽窗臂的标记数塌了({} → {})—— 那是被跳过,不是被加宽",
+                da.marks,
+                db.marks
+            );
+            assert!(
+                db.src_uncovered_frac <= da.src_uncovered_frac + 1e-6,
+                "{st} st: 窗加宽了源覆盖率反而变差({:.4} → {:.4})",
+                da.src_uncovered_frac,
+                db.src_uncovered_frac
+            );
+            // ⛔⛔ ⑷ **电平**。S155 在这里钉的是 `(-9.0..=1.0)`,而 S156 发现那个区间宽到
+            //   **分不出「除 wsum」与「不除」** —— 把实现从「除」改成「不除」(那是一次真实的
+            //   语义改动,电平差 20log10(ratio) ≈ 6 dB),这条断言**照样绿**。⇒ 它对自己声称
+            //   钉住的那件事接近一条空判据。S156 把它收紧到能分开为止。
+            //
+            //   今天的实现**不除 wsum**(见输出合成那一段的说明):离线台子上「除」与「不除」的
+            //   逐带谱形状读数**一模一样**,只差一个 20log10(ratio) 的常数 ⇒ 那 −4.3…−5.8 dB 不是
+            //   宽窗的代价,是**除 wsum** 的代价;而下游没有任何东西吸收得了它
+            //   (`restore_envelope` 默认关 · `peak_normalize_to` 给 donor 传 base 的峰值 ·
+            //    `match_levels` 五个调用点全 false)⇒ 那 5 dB 会全额落到被救的那几个音上。
+            //   实测:这个合成夹具 **+0.220 / +0.266 dB**;真素材(s12,+12)**+0.49 dB**。
+            //   ⛔ 变异验过(2026-08-20 真跑,不是估的):把 `out[i] = acc[i]` 改回
+            //      `acc[i] / wsum[i]` ⇒ +7 st 读 **−3.28 dB** ⇒ 这条断言当场红。
+            let (ra, rb) = (rms(&a), rms(&b));
+            let drop = 20.0 * (rb / ra).log10();
+            assert!(
+                (-1.5..=1.5).contains(&drop),
+                "{st} st: 宽窗臂的电平变了 {drop:+.2} dB —— 不除 wsum 时实测只有 +0.2…+0.5 dB。\
+                 跑出这个区间说明 wsum 又被除了、或者颗粒被静默跳过了"
+            );
+            // ⭐ ⑸ **`cola_w_median` 在宽窗臂上必须仍然是「COLA 有没有破」的读数**。
+            //   窗一放宽,原始重叠系数就变成 ≈ `win·ratio`(实测 1.5/2.0/2.5/3.0 四档全中),
+            //   而 S156 让读数与干填料都按稳态窗和 `W̄` 归一 ⇒ 它回到 1。
+            //   ⛔ 没有这条,`cola_w_median` / `cola_gap_frac` 在这条臂上会静默地读别的东西
+            //   (S155 的注释当时就是这样写的:「别把它读成红」= 把一只眼睛关掉)。
+            //   ⛔ 变异验过(2026-08-20 真跑):去掉 `wbar` 那个除法 ⇒ +7 st 读 **1.4982**,
+            //      而 `win·ratio = 1.0 × 1.4983` ⇒ 解析式与实测对到 1e-4,判据当场红。
+            assert!(
+                (db.cola_w_median - 1.0).abs() < 0.02,
+                "{st} st: 宽窗臂的 cola_w_median = {:.4} —— 它应当按 W̄ 归一后回到 1,\
+                 读到 ≈win·ratio 说明归一没做",
+                db.cola_w_median
+            );
+        }
+        // ⭐ 阴性对照:ratio > 2 时今天的读窗**必然**漏掉源(见 `src_uncovered_frac`),
+        //    所以上面那条覆盖率断言不是恒真的。
+        let (_, d14) = psola_shift_env(
+            &x, sr, 14.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0, 0.0, 0.0, 0);
+        assert!(
+            d14.src_uncovered_frac > 0.01,
+            "+14 st 上今天就没漏源({:.4})⇒ 上面那条覆盖率判据是空的",
+            d14.src_uncovered_frac
+        );
+    }
+
+    /// S156 —— ⛔⛔ **宽窗臂的 ratio-1.0 恒等**。这条判据在 S155 是**不存在**的,而它的缺席
+    /// 不是疏忽,是结构性的:这条线上所有恒等闸都经由 `psola_shift_diag` / `_locked` / `_infra`
+    /// 进来,而那三个包装器把最后三个参数**写死成 `0.0`** ⇒ `win_periods` 恒为 0
+    /// ⇒ 宽窗臂在这条线上**最便宜、最不可能自证**的那道闸底下,一寸覆盖都没有。
+    /// ⇒ 「把 `UTAI_PSOLA_WIN` 的默认翻开」这个改动,本来可以在 `psola.rs` 一条测试都不红的
+    ///    情况下把恒等悄悄弄坏(S155 那一版会:它在 `win_periods > 0` 时无条件 `acc / raw`,
+    ///    而 `raw` 只是**近似** 1.0 —— 取整余量会直接进输出)。
+    ///
+    /// 为什么 `win_periods = 1.0` 上它**结构上**成立:ratio 1.0 时 `u = j` 是整数
+    /// ⇒ `tgt[j] ≡ src[j]` ⇒ 目标邻距 ≡ 源周期 ⇒ `1.0 * src_l` 与今天那两个 `min` 给出的
+    /// **是同一个数**;而 `W̄ = (1.0 × 1.0).max(1.0) = 1.0`,除以 1.0 在 IEEE 下逐位精确
+    /// ⇒ 干填料那条也一字不差。⇒ 这里用 `assert_eq!` 而不是 epsilon。
+    ///
+    /// ⛔ **双向**:下移臂上两个 `min` 取的是**源周期**,`win = 1.0` 给的是同一个数,
+    ///    但 `win·ratio < 1` —— `W̄` 那个 `.max(1.0)` 就是为这一侧写的。
+    ///    ⛔ 变异验过:把 `.max(1.0)` 去掉 ⇒ 下移那两档当场红(干填料被除小 ⇒ 岛外的透传被削)。
+    ///
+    /// ⛔ 阴性对照:`win = 0.5` 与 `win = 1.5` 在 ratio 1.0 上**必须不恒等**(前者窗比邻距窄 ⇒ 留缝,
+    ///    后者宽 ⇒ 重叠)。没有它,上面那条可能只是「这个实现根本不看 `win_periods`」。
+    #[test]
+    fn the_wide_read_window_is_still_the_identity_at_ratio_one() {
+        let sr = 44_100;
+        let f0 = 220.0;
+        let hop = sr as usize / 200;
+        let (x, _) = pulses(sr, 1.0, |_| f0, |_| 1.0);
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+        let run = |st: f64, win: f64| {
+            psola_shift_env(
+                &x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0, win, 0.0, 0)
+            .0
+        };
+        assert_eq!(run(0.0, 1.0), x, "ratio 1.0 上 win=1.0 的宽窗臂不是恒等变换");
+        // 下移侧:两个 `min` 取的是源周期,win=1.0 给的是同一个窗 ⇒ 必须与今天**逐位**相同。
+        for st in [-5.0f64, -12.0] {
+            assert_eq!(run(st, 1.0), run(st, 0.0), "{st} st: 下移时 win=1.0 应当与今天逐位相同");
+        }
+        // 阴性对照:这两档在 ratio 1.0 上**必须**破恒等,否则上面那条是空的。
+        for win in [0.5f64, 1.5] {
+            assert_ne!(run(0.0, win), x, "ratio 1.0 上 win={win} 竟然也恒等 ⇒ 上面那条判据是空的");
+        }
+    }
+
+
+    /// ⭐⭐⭐ S159zj —— **岛边的干填料台阶**这只眼睛,先在一条可解析的对照上自证阳性。
+    ///
+    /// 被盯的缺陷:`covered` 的边界钉在第一颗/最后一颗**合成标记**上,而窗和要再爬
+    /// 约 `win_periods × T_src` 才满。合成分支在 `i = c0` 上**突然把 `(1−w)·carry` 整项
+    /// 丢掉** ⇒ 每条岛边一个单样本宽带阶跃,幅度 = [`PsolaDiagnostics::edge_step_p50`]。
+    ///
+    /// ⛔ 这条判据**不问好不好听**,它问的是「输出连不连续」—— 可判定,所以不吃
+    /// `range_rulers/README.md` 第 8 条那句「新尺子先在用户点名的坐标上验阳性」。
+    ///
+    /// 三条腿:
+    /// ⑴ **`win_periods == 0`(S156 之前那条臂)必须读 0.000** —— `W̄ = 1` 且岛边第一颗
+    ///    钟形窗自己就到 1 ⇒ 解析上恒为 0。这是**阴性对照**:眼睛不许无中生有。
+    /// ⑵ **`win_periods == 1.0`(今天出厂)上移时必须读得出来** —— 否则它是空判据。
+    /// ⑶ **越往上移越大** —— `W̄ = ratio` 随位移单调增,而窗和在 `c0` 上不跟着长。
+    ///
+    /// ⛔ 变异(写这条判据时逐个真跑过,读数记在各行后面)。
+    #[test]
+    #[allow(non_snake_case)]
+    fn the_island_edge_step_eye_reads_zero_before_S156_and_grows_with_the_shift() {
+        let sr = 44_100u32;
+        let f0 = 250.0;
+        let hop = sr as usize / 200;
+        let (x, _) = pulses(sr, 0.6, |_| f0, |_| 1.0);
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+        let run = |st: f64, win: f64| {
+            psola_shift_win(
+                &x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.0, Infrasonic::Off, 0.0, 0.0, win, 0.0, 0,
+                &[],
+            )
+            .1
+        };
+
+        // ⑴ 阴性对照 —— S156 之前那条臂,解析上恒为 0。
+        for st in [2.0f64, 7.0, 12.0] {
+            let d = run(st, 0.0);
+            assert!(d.island_edges >= 2, "{st} st: 夹具必须至少有一个岛(读到 {} 条边)", d.island_edges);
+            assert_eq!(
+                d.edge_step_p50, 0.0,
+                "win_periods = 0 上岛边台阶必须**解析地**为 0,读到 {}",
+                d.edge_step_p50
+            );
+            assert_eq!(d.edge_step_p90, 0.0, "p90 同上,读到 {}", d.edge_step_p90);
+        }
+
+        // ⑵ 今天出厂那条臂上,它必须真的读得出来。
+        let d7 = run(7.0, 1.0);
+        assert!(
+            d7.edge_step_p50 > 0.05,
+            "win_periods = 1.0 / +7 st 上岛边台阶必须读得出来,读到 {}",
+            d7.edge_step_p50
+        );
+
+        // ⑶ 单调:`W̄ = ratio` 随位移增,而 `c0` 上的窗和不跟着长。
+        let (d2, d12) = (run(2.0, 1.0), run(12.0, 1.0));
+        assert!(
+            d2.edge_step_p50 < d7.edge_step_p50 && d7.edge_step_p50 < d12.edge_step_p50,
+            "台阶必须随位移单调增,读到 +2 {} / +7 {} / +12 {}",
+            d2.edge_step_p50,
+            d7.edge_step_p50,
+            d12.edge_step_p50
+        );
+
+        // ⑷ ⛔ 条数守恒:每个**被保留的**岛正好两条边。
+        assert_eq!(
+            d7.island_edges,
+            2 * d7.islands,
+            "岛边条数必须 = 2 × 岛数(读到 {} vs {})",
+            d7.island_edges,
+            d7.islands
+        );
+    }
+
+
+    /// ⭐⭐⭐ S159zj —— **`edge_fill` 把岛边那段交叉淡化补完**。
+    ///
+    /// 被修的缺陷与三条硬门写在 [`psola_shift_edge`] 的 doc 里。这条判据钉四件:
+    /// ⑴ **关着时逐位不变**(默认路径 `psola_shift_win` 一个样本都不许动);
+    /// ⑵ **`win_periods == 0` 上开与关逐位相同** —— 那条臂的爬坡宽度是 0,没有可补的;
+    /// ⑶ **下移(`ratio < 1`)上开与关逐位相同** —— cover 车道不许被这一刀碰
+    ///    (S159k-o 已收线);
+    /// ⑷ ⭐ **上移时岛边的输出不连续必须真的变小** —— 否则这一刀只是「动了但没修」。
+    ///    量法:`|out[c0] − out[c0−1]|`,对全体岛边取中位,开 vs 关。
+    ///
+    /// ⛔ ⑷ 里那个 `c0` 不是猜的:它就是 [`PsolaDiagnostics::island_edges`] 数的那批边,
+    /// 而这里用**同一个** `f0`/岛结构把它算出来(夹具只有一个岛 ⇒ `c0` = 第一颗合成标记)。
+    ///
+    /// ⛔ 变异(写这条判据时逐个真跑过,读数记在各行后面)。
+    #[test]
+    fn edge_fill_completes_the_crossfade_at_island_edges_and_touches_nothing_else() {
+        let sr = 44_100u32;
+        let f0 = 250.0;
+        let hop = sr as usize / 200;
+        // ⛔⛔ **平滑的浊音夹具,不是脉冲串。**写这条判据时我先用了 `pulses`,⑷ 当场读到
+        //    「开着反而更大」(0.107 vs 0.094)—— 因为脉冲串的 `carry` 自己就有巨大的样本间
+        //    跳变,往里加一部分当然让局部一阶差变大。**公式连续 ≠ 信号连续**,而这一刀修的是
+        //    前者。⇒ 夹具必须是「相邻样本本来就接近」的材料,否则 ⑷ 量的不是它声称在量的东西。
+        let x = voiced(sr, 0.6, f0);
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+        let run = |st: f64, win: f64, fill: bool| {
+            psola_shift_edge(
+                &x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.0, Infrasonic::Off, 0.0, 0.0, false,
+                win, 0.0, 0,
+                // ⛔ 最后一个 `false` = `tail_fade`:这两条判据钉的是别的东西,
+                //    让新刀不许改变它们的读数(它自己有专门的判据)。
+                &[], fill, 0.0, 0.0, false,
+            )
+        };
+
+        // ⑴ 默认入口(`psola_shift_win`)必须就是「关」那一档,逐位。
+        for st in [2.0f64, 7.0, 12.0] {
+            let a = psola_shift_win(
+                &x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.0, Infrasonic::Off, 0.0, 0.0, 1.0, 0.0, 0,
+                &[],
+            )
+            .0;
+            assert_eq!(a, run(st, 1.0, false).0, "{st} st: 默认入口不是 edge_fill = false");
+        }
+
+        // ⑵ `win_periods == 0`:开与关逐位相同(爬坡宽度 0)。
+        for st in [2.0f64, 7.0, 12.0] {
+            assert_eq!(
+                run(st, 0.0, true).0,
+                run(st, 0.0, false).0,
+                "{st} st: win=0 上 edge_fill 竟然改了输出 —— 那条臂没有爬坡可补"
+            );
+        }
+
+        // ⑶ 下移:开与关逐位相同(cover 车道不许被碰)。
+        for st in [-5.0f64, -12.0] {
+            assert_eq!(
+                run(st, 1.0, true).0,
+                run(st, 1.0, false).0,
+                "{st} st: 下移臂被 edge_fill 碰了 —— `ratio > 1` 那道门漏了"
+            );
+        }
+
+        // ⑷ ⭐ 上移时岛边的输出不连续必须变小,而且**必须真的动过**。
+        for st in [7.0f64, 12.0] {
+            let (yon, don) = run(st, 1.0, true);
+            let (yoff, _) = run(st, 1.0, false);
+            assert_ne!(yon, yoff, "{st} st: edge_fill 开着却逐位相同 ⇒ 它没生效");
+            assert!(don.island_edges >= 2, "{st} st: 夹具必须有岛边");
+            // 岛边位置 = 第一颗合成标记。夹具只有一个岛 ⇒ 用输出上「第一个非零样本之后」的
+            // 那个跳变点找不到它;改用诊断报的台阶必须 > 0 来确认爬坡确实存在。
+            assert!(
+                don.edge_step_p50 > 0.05,
+                "{st} st: 这个夹具上本来就没有台阶,⑷ 无从谈起(读到 {})",
+                don.edge_step_p50
+            );
+            // ⛔⛔ 量**岛边那一个样本**,不是全曲最大一阶差 —— 写这条判据时我先写的是后者,
+            //    真跑读到 0.1208 vs 0.1193(**开着反而更大**),因为这个夹具是脉冲串,
+            //    全局最大一阶差由脉冲本身主导,跟岛边一点关系都没有。
+            //    ⇒ 那是「尺子够不着症状轴」的又一个实例(整个 `range_rulers/` 目录就是为它建的)。
+            // ⭐ 岛边的位置不用猜:**开与关第一个不同的样本**由构造就是 `c0`
+            //    (两条臂只在 `edge` 掩码上分流)。
+            let i0 = yon
+                .iter()
+                .zip(&yoff)
+                .position(|(a, b)| a != b)
+                .expect("edge_fill 开着必须至少改一个样本");
+            assert!(i0 > 0, "第一个不同的样本落在 0 上 ⇒ 找不到它左边那个样本");
+            let step = |y: &[f32]| (f64::from(y[i0]) - f64::from(y[i0 - 1])).abs();
+            assert!(
+                step(&yon) < step(&yoff),
+                "{st} st: 岛边(样本 {i0})的一阶差没变小 —— 开 {} vs 关 {}",
+                step(&yon),
+                step(&yoff)
+            );
+            // ⑸ ⛔ 改动必须**只落在两端的爬坡上**,不许漏进岛心。
+            let touched = yon.iter().zip(&yoff).filter(|(a, b)| a != b).count();
+            assert!(
+                touched * 20 < yon.len(),
+                "{st} st: 改到了 {touched}/{} 个样本 —— 那不再是「两端的爬坡」",
+                yon.len()
+            );
+        }
+    }
+
+    /// S156 —— **xgrain**:颗粒内容在相邻两个源脉冲之间插值,把宽窗引来的
+    /// **「donor 自己的音高」**(`0.5·f_out`)拿掉。
+    ///
+    /// ⛔ 这条判据的**夹具必须逐周期有变化**。用严格周期的脉冲串会让它**恒真而且恒绿**:
+    /// 相邻两个源脉冲逐位相同 ⇒ 在它们之间插值与取其中任何一个**是同一件事**
+    /// ⇒ xgrain 在那种夹具上是精确的空操作,而判据会读出「开与关一样干净」⇒ 全绿、零信息。
+    /// ⇒ 这里给脉冲串加一条**逐脉冲的幅度起伏**(≈17.5 Hz 的 shimmer,边带落在 220±17 Hz,
+    ///    离 `0.5·f_out = 220` 的判读点足够远,不会自己制造被测的那个东西)。
+    ///
+    /// 钉四件:⑴ `0.0` 逐位同旧;⑵ ratio 1.0 上**任何深度**都恒等(`fr ≡ 0` ⇒ 最近邻权重与
+    /// 线性权重是同一个向量 `(1,0)`);⑶ 打开之后输出真的变了;
+    /// ⑷ ⭐ **承重那条**:宽窗臂上 `0.5·f_out` 的泄漏必须被压下去,
+    ///    **而且要断言参照本身真的漏**(否则是拿两个都干净的东西相减 —— S155 笔5 那条判据的形状)。
+    #[test]
+    fn the_grain_interpolation_bites_and_zero_is_still_the_nearest_pulse_arm() {
+        let sr = 44_100;
+        let f0 = 220.0;
+        let hop = sr as usize / 200;
+        // ⚠ 逐脉冲起伏是这条判据成立的前提,见 doc。
+        let (x, _) = pulses(sr, 1.0, |_| f0, |k| 1.0 + 0.5 * ((k as f64) * 0.5).sin());
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+        let run = |st: f64, win: f64, xg: f64| {
+            psola_shift_env(
+                &x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0, win, xg,
+                0)
+            .0
+        };
+        // ⑵ ratio 1.0:任何深度都必须是**逐位**恒等。
+        for xg in [0.3f64, 1.0] {
+            assert_eq!(run(0.0, 0.0, xg), x, "ratio 1.0 上 xgrain={xg} 不恒等");
+            assert_eq!(run(0.0, 1.0, xg), x, "ratio 1.0 上 win=1.0 + xgrain={xg} 不恒等");
+        }
+        // ⑴/⑶
+        let base = run(12.0, 1.0, 0.0);
+        let xg = run(12.0, 1.0, 1.0);
+        assert_eq!(run(12.0, 1.0, 0.0), base, "同参数两跑不一致");
+        assert_ne!(base, xg, "+12 st: xgrain 打开之后输出逐位相同 ⇒ 它没生效");
+        // ⛔⛔ **承重那条判据不在这里,而且这不是疏忽** —— 见下面 `..._is_exactly_a_no_op_...`。
+        //
+        // 我先写的是「宽窗臂上 `0.5·f_out` 的泄漏必须被压下去」,而**阴性对照当场判死了它**:
+        // 拿一条**恒定增益、严格周期**的脉冲串(此时相邻源脉冲按构造无差别 ⇒ xgrain 必须是
+        // 精确空操作、读数必须一模一样),它读出的却是与其他所有夹具**一样的 3.2 dB「改善」**。
+        // ⇒ 那个 3.2 dB 量的不是 xgrain 的机理,是 `pulses` 把脉冲放在**不同亚样本相位**上
+        //   ⇒ 混合相邻两颗 = 一次低通。⇒ 那条判据会把「低通」读成「拿掉了 donor 的音高」。
+        // ⭐ 这就是 §7-1「合成周期信号系统性冤枉 PSOLA 类算法」的一个新变种:
+        //   这次它不是冤枉,是**送了一份来路不明的好成绩**。
+        //
+        // ⇒ 收益那一面只有**真素材**读得出来,它记在这里、由探针复现(`s156_knives/subh156.py`,
+        //   s12 = 位移 +12,`0.5·f_out` 带能量相对各自 400-4000 Hz):
+        //     donor 输入自己(结构地板) −45.5 | 今天 −37.9 | 宽窗 xgrain 关 **−33.6** |
+        //     宽窗 xgrain 开 **−38.7** | 今天 + xgrain 开 −42.6
+        //   ⇒ 宽窗自己带来 **+4.3 dB**,xgrain 拿掉 **5.1 dB**。
+        //   ⚠ 代价也一起记:xgrain 让 8-12k 相对 300-1k 的倾斜从 −1.07 变成 −1.44(≈0.4 dB 的高频损失),
+        //     方向与「混合相邻脉冲 = 一次低通」一致。
+        //   ⛔ 这两条都**没有**判据盯着(仓里没有真素材)⇒ 这就是这个旋钮**默认关**、
+        //     并且它的取舍要交给耳朵的原因(S146 协议)。
+    }
+
+    /// S156 —— xgrain 的**结构判据**:相邻两个源脉冲**逐位相同**时,在它们之间插值必须是
+    /// **精确的空操作**。
+    ///
+    /// ⭐ 它把这个旋钮的语义钉死到不留余地:xgrain 只许**混合相邻两颗源脉冲的内容**,
+    /// 不许顺带挪读点、不许改窗、不许做任何别的平滑。任何「顺手多做一点」的实现都会在这里逐位露馅。
+    /// ⛔ 这条判据是被上面那条**失败的**泄漏判据逼出来的:那条量到的 3.2 dB 其实来自
+    /// `pulses` 把脉冲放在不同亚样本相位上(混合两颗 = 一次低通),而不是 xgrain 的机理。
+    ///
+    /// 夹具:`f0 = 44100/200 = 220.5 Hz` ⇒ 周期**恰好 200 个整样本** ⇒ `pulses` 的落点全是整数
+    /// ⇒ 每个脉冲的采样波形逐位相同。⛔ 阳性对照用 220.0 Hz(周期 200.4545 样本,落点带小数)
+    /// —— 那时 xgrain **必须**改变输出,否则这条判据只是「这个实现根本不看 xgrain」。
+    #[test]
+    fn the_grain_interpolation_is_exactly_a_no_op_when_the_neighbouring_pulses_are_identical() {
+        let sr = 44_100;
+        let hop = sr as usize / 200;
+        let go = |f0: f64, st: f64, xg: f64| {
+            let (x, _) = pulses(sr, 1.0, |_| f0, |_| 1.0);
+            let f0t = flat_f0(x.len(), hop, f0 as f32);
+            psola_shift_env(
+                &x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0, 1.0, xg,
+                0)
+            .0
+        };
+        // 周期 = 200 个整样本 ⇒ 相邻源脉冲逐位相同 ⇒ 混合它们必须逐位空操作。
+        let exact = f64::from(sr) / 200.0;
+        // 逐段的相对残差(dB)。⛔ 必须**分段**:信号两端那里,`src[lo]` 与 `src[hi]` 的读窗
+        // 一个被信号边界截断、一个没有 ⇒ 两次读到的内容**本来就不同**,那不是 xgrain 多做了事。
+        // 实测全段 −28…−29 dB 全部来自这两头(头 −21…−23 / 尾 −23…−25),而中段是数值零。
+        let seg = |a: &[f32], b: &[f32], lo: usize, hi: usize| {
+            let d: f64 = (lo..hi).map(|i| (f64::from(a[i]) - f64::from(b[i])).powi(2)).sum();
+            let e: f64 = (lo..hi).map(|i| f64::from(a[i]).powi(2)).sum();
+            10.0 * (d.max(1e-300) / e.max(1e-300)).log10()
+        };
+        for st in [7.0f64, 12.0, 14.0] {
+            let (a0, a1) = (go(exact, st, 0.0), go(exact, st, 1.0));
+            let (b0, b1) = (go(220.0, st, 0.0), go(220.0, st, 1.0));
+            let n = a0.len();
+            let (m0, m1) = (n / 4, 3 * n / 4);
+            let same = seg(&a1, &a0, m0, m1);
+            let diff = seg(&b1, &b0, m0, m1);
+            // 相邻源脉冲逐位相同 ⇒ 混合它们必须是**数值零**(实测 −178.7 / −3029 / −3031 dB)。
+            assert!(
+                same < -100.0,
+                "{st} st: 相邻源脉冲逐位相同,xgrain 却改了中段 {same:.1} dB                  ⇒ 它做了「混合相邻两颗」之外的事"
+            );
+            // 阳性对照:落点带小数 ⇒ 相邻脉冲的采样波形不同 ⇒ xgrain 必须真的动手(实测 −34…−35 dB)。
+            assert!(
+                diff > -60.0,
+                "{st} st: 源脉冲落点带小数,xgrain 在中段却只改了 {diff:.1} dB                  ⇒ 上面那条判据是空的"
+            );
+            // ⭐ 两者必须差出量级来,否则「空操作」与「生效」是同一个读数(实测差 144 dB)。
+            assert!(diff - same > 60.0, "{st} st: 空操作档与生效档分不开({same:.1} vs {diff:.1})");
+        }
+    }
+
+    /// S156 —— ⛔⛔ **这条线上第一条跑【生产口径】的判据。**
+    ///
+    /// 缺口是结构性的,而且它当场自证过:把 `WIN_PERIODS_DEFAULT` / `XGRAIN_DEFAULT` 从 0 翻成 1
+    /// (= 换掉每一个被救音的音频),`psola.rs` 里 **68 条测试一条都没红** —— 因为它们**全部**
+    /// 显式传旋钮,没有一条读生产默认。⇒ 「改了默认」与「改了行为」在这份文件里是分开的两件事,
+    /// 而那正是 S155 笔0 在探针上修掉的同一族缺陷(探针对旋钮硬编码回落值,照旧脚本跑出来的
+    /// 「今天」其实是改动之前的臂)。
+    ///
+    /// ⇒ 这里从 [`PROBE_ARM_DEFAULTS`](= 生产默认,由 `vocal_range` 的
+    /// `the_probe_defaults_are_the_production_defaults` 绑住)把参数读出来跑,钉三件:
+    /// ⑴ ratio 1.0 在**全套生产默认**下仍然 `assert_eq!` 恒等;
+    /// ⑵ +14 上**源覆盖率必须是 0**(教科书宽度把 `ratio > 2` 那段没人读的源补上了)——
+    ///    ⛔ 这一条就是「默认真的翻了」的指纹:退回 `WIN = 0` 它当场读 ≈0.108;
+    /// ⑶ 生产臂与旧臂**逐位不同**(否则默认没生效)。
+    #[test]
+    fn the_production_default_arm_is_actually_what_runs() {
+        let g = |k: &str| {
+            PROBE_ARM_DEFAULTS.iter().find(|(n, _)| *n == k).unwrap_or_else(|| panic!("{k}")).1
+        };
+        let hp = if g("UTAI_PSOLA_HP") != 0.0 {
+            if g("UTAI_PSOLA_HP_MS") > 0.0 {
+                Infrasonic::FixedMs(g("UTAI_PSOLA_HP_MS"))
+            } else {
+                Infrasonic::PerPeriod
+            }
+        } else {
+            Infrasonic::Off
+        };
+        let sr = 44_100;
+        let f0 = 220.0;
+        let hop = sr as usize / 200;
+        let (x, _) = pulses(sr, 1.0, |_| f0, |_| 1.0);
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+        let prod = |st: f64| {
+            psola_shift_env(
+                &x,
+                sr,
+                st,
+                0.0,
+                &f0t,
+                hop,
+                g("UTAI_PSOLA_FRAC") != 0.0,
+                g("UTAI_PSOLA_WSOLA"),
+                g("UTAI_PSOLA_LOCK"),
+                hp,
+                g("UTAI_PSOLA_ENVFIX"),
+                g("UTAI_PSOLA_BRIDGE"),
+                g("UTAI_PSOLA_WIN"),
+                g("UTAI_PSOLA_XGRAIN"),
+                0)
+        };
+        // ⑴ 全套生产默认下的恒等 —— 这条线上最便宜、最不可能自证的那道闸。
+        assert_eq!(prod(0.0).0, x, "ratio 1.0 在生产默认下不是恒等变换");
+        // ⑵ 教科书宽度把 ratio > 2 时那段「永远没人读的源」补上了。
+        let (y14, d14) = prod(14.0);
+        assert!(
+            d14.src_uncovered_frac < 1e-9,
+            "+14 st 生产臂仍然漏源 {:.4} —— 宽读窗没生效(退回 WIN=0 这里读 ≈0.108)",
+            d14.src_uncovered_frac
+        );
+        // ⑶ ⭐⭐ **每一个被翻成默认的旋钮,单独退回 0 都必须改变输出。**
+        //   ⛔ 这一条是被变异测试逼出来的:第一版只有 ⑴⑵,而把 `PROBE_ARM_DEFAULTS` 里的
+        //   `WIN` 退回 0 之后它**照样绿** —— 因为 xgrain 的第二个读点把源覆盖率灌满了
+        //   (见颗粒循环里那段门限的说明)。⇒ 「默认翻了」必须逐个旋钮证,不能靠一条综合读数。
+        // S157c —— `FRAC` 也翻成默认了 ⇒ 它必须进这张「逐个旋钮单独退回」的名单,
+        //   否则「改了默认」与「改了行为」又变成两件事(S156 那条形状)。
+        let no_frac = psola_shift_env(
+            &x, sr, 14.0, 0.0, &f0t, hop, false, g("UTAI_PSOLA_WSOLA"), g("UTAI_PSOLA_LOCK"), hp,
+            g("UTAI_PSOLA_ENVFIX"), g("UTAI_PSOLA_BRIDGE"), g("UTAI_PSOLA_WIN"),
+            g("UTAI_PSOLA_XGRAIN"), g("UTAI_PSOLA_LPC") as usize,
+        )
+        .0;
+        assert_ne!(y14, no_frac, "把 FRAC 单独退回 0,输出没变");
+        let one_off = |win: f64, xg: f64| {
+            psola_shift_env(
+                &x,
+                sr,
+                14.0,
+                0.0,
+                &f0t,
+                hop,
+                g("UTAI_PSOLA_FRAC") != 0.0,
+                g("UTAI_PSOLA_WSOLA"),
+                g("UTAI_PSOLA_LOCK"),
+                hp,
+                g("UTAI_PSOLA_ENVFIX"),
+                g("UTAI_PSOLA_BRIDGE"),
+                win,
+                xg,
+                0)
+            .0
+        };
+        assert_ne!(y14, one_off(0.0, g("UTAI_PSOLA_XGRAIN")), "把 WIN 单独退回 0,输出没变");
+        assert_ne!(y14, one_off(g("UTAI_PSOLA_WIN"), 0.0), "把 XGRAIN 单独退回 0,输出没变");
+        // 旧臂(两个都退回 0)在 +14 上**必须**漏源,否则 ⑵ 是空的。
+        let (_, dold) = psola_shift_env(
+            &x, sr, 14.0, 0.0, &f0t, hop, false, 0.0, 0.30, hp, 0.0, 30.0, 0.0, 0.0,
+            0);
+        assert!(
+            dold.src_uncovered_frac > 0.01,
+            "旧臂在 +14 上竟然不漏源({:.4})⇒ ⑵ 那条判据是空的",
+            dold.src_uncovered_frac
+        );
+    }
+
+    // ── S159 窗内逆变换 ────────────────────────────────────────────────────────────
+
+    /// S159 —— 窗内逆变换的夹具:一串**互相分开的**浊音岛,岛之间是真休止(f0 = 0)。
+    ///
+    /// ⛔ 岛间距必须**大于**桥接上限(`BRIDGE` 生产默认 30 ms),否则 `bridge_unvoiced` 会把
+    /// 相邻两岛合并成一个,于是「跳掉一个岛」这件事在夹具上**结构上不可能发生** —— 判据全绿
+    /// 而什么都没测。返回 `(x, f0 轨, hop, 每个岛的 (起, 止) 样本)`。
+    fn island_train(sr: u32, isl_ms: f64, gap_ms: f64, f0: f64, count: usize) -> (Vec<f32>, Vec<f32>, usize, Vec<(usize, usize)>) {
+        let hop = sr as usize / 200; // 5 ms —— 与生产喂进来的 f0 网格同量级
+        let isl = (f64::from(sr) * isl_ms / 1000.0) as usize;
+        let gap = (f64::from(sr) * gap_ms / 1000.0) as usize;
+        let n = gap + count * (isl + gap);
+        let mut x = vec![0.0f32; n];
+        let mut f0t = vec![0.0f32; n / hop + 2];
+        let mut spans = Vec::new();
+        for k in 0..count {
+            let a = gap + k * (isl + gap);
+            let b = (a + isl).min(n);
+            for (i, v) in voiced(sr, isl_ms / 1000.0, f0).iter().enumerate() {
+                if a + i < b {
+                    x[a + i] = *v;
+                }
+            }
+            // f0 只在岛**内部**写(留一帧余量),这样探到的岛边不会跑到 [a, b] 外面去。
+            for fi in (a / hop + 1)..(b / hop) {
+                if fi < f0t.len() {
+                    f0t[fi] = f0 as f32;
+                }
+            }
+            spans.push((a, b));
+        }
+        (x, f0t, hop, spans)
+    }
+
+    /// S159 —— 生产默认的那一套旋钮,从 [`PROBE_ARM_DEFAULTS`] 读(S156 立的规矩:
+    /// 判据不许把默认写成字面量,否则钉的是机理不是默认)。
+    fn prod_knobs() -> (bool, f64, f64, Infrasonic, f64, f64, f64, f64, usize) {
+        let g = |k: &str| {
+            PROBE_ARM_DEFAULTS.iter().find(|(n, _)| *n == k).unwrap_or_else(|| panic!("{k}")).1
+        };
+        let hp = if g("UTAI_PSOLA_HP") != 0.0 {
+            if g("UTAI_PSOLA_HP_MS") > 0.0 {
+                Infrasonic::FixedMs(g("UTAI_PSOLA_HP_MS"))
+            } else {
+                Infrasonic::PerPeriod
+            }
+        } else {
+            Infrasonic::Off
+        };
+        (
+            g("UTAI_PSOLA_FRAC") != 0.0,
+            g("UTAI_PSOLA_WSOLA"),
+            g("UTAI_PSOLA_LOCK"),
+            hp,
+            g("UTAI_PSOLA_ENVFIX"),
+            g("UTAI_PSOLA_BRIDGE"),
+            g("UTAI_PSOLA_WIN"),
+            g("UTAI_PSOLA_XGRAIN"),
+            g("UTAI_PSOLA_LPC") as usize,
+        )
+    }
+
+    /// S159 —— ⭐⭐⭐ **这一刀的承重判据:`keep` 里的每一个样本必须与整条臂【逐位】相同。**
+    ///
+    /// 生产里这条性质就是全部的验收:donor 遍只有 `keep` 那几段会被拼回歌里
+    /// (`vocal_range::apply_dead_only_windows` 只切走「窗 ± 余量」),窗外渲的是什么无关紧要。
+    ///
+    /// ## ⛔ 夹具是**设计过的**,不是随手造的
+    /// 五个岛、岛长 300 ms、岛间 60 ms 休止(> 桥接上限 30 ms ⇒ 不会被合并),窗盖住中间那个岛,
+    /// 而且窗的**左边缘故意伸进休止里**,离前一个岛的岛尾只有 6 ms。
+    /// ⇒ 前一个岛按构造**能写进窗里**(标记外走一个周期 9.1 ms · 颗粒半宽 4.5 ms ·
+    /// 去次声逐岛滤波的支撑 18 ms),所以「护栏够不够宽」这件事在这个夹具上**测得到**。
+    /// ⛔ 若把窗放在岛正中央、离邻岛半秒远,这条判据会照绿,而护栏写成 0 也照绿 = 空判据。
+    ///
+    /// ## 变异(逐条实跑过)
+    /// * 把 `reach` 里的三项去掉任一项(退成「岛与窗相交」)⇒ 前一个岛被跳掉 ⇒ 窗头几毫秒变 ⇒ **红**;
+    /// * 把 keep 谓词写成恒 `true`(永不跳岛)⇒ 逐位判据照绿,而**阴性对照** `islands_skipped` ⇒ **红**;
+    /// * 把 `continue` 挪到 `diag.islands += 1` 之后 ⇒ 输出对、收益对,而计数器读 0 ⇒ **红**。
+    #[test]
+    fn the_window_keeps_every_sample_inside_it_bit_identical() {
+        let sr = 44_100u32;
+        let (frac, wsola, lock, hp, envfix, bridge, win, xg, lpc) = prod_knobs();
+        // 110 Hz:周期 9.1 ms ⇒ 岛外溢的三项都是毫秒量级、都跨得过下面那 6 ms 的窗边余量。
+        let (x, f0t, hop, spans) = island_train(sr, 300.0, 60.0, 110.0, 5);
+        let arm = |keep: &[(usize, usize)]| {
+            psola_shift_win(
+                &x, sr, 12.0, 0.0, &f0t, hop, frac, wsola, lock, hp, envfix, bridge, win, xg, lpc,
+                keep,
+            )
+        };
+        let (full, dfull) = arm(&[]);
+        assert_eq!(dfull.islands_seen, 5, "夹具没造出 5 个岛 —— 下面每一条断言都失去意义");
+        assert_eq!(dfull.islands_skipped, 0, "空 keep 必须一个岛都不跳");
+        assert_eq!(dfull.keep_frac, 1.0, "空 keep 的覆盖率必须报 1.0");
+
+        // 窗:中间那个岛,左边缘伸进休止、离前一个岛的岛尾只有 6 ms(见上面 doc)。
+        let ms = |v: f64| (f64::from(sr) * v / 1000.0) as usize;
+        let (m0, m1) = spans[2];
+        let keep = [(spans[1].1 + ms(6.0), m1 + ms(6.0))];
+        assert!(keep[0].0 < m0, "窗的左边缘必须落在休止里,否则护栏那一项测不到");
+        let (winy, dwin) = arm(&keep);
+
+        // ⭐ 承重:窗内逐位相同。
+        assert_eq!(
+            &winy[keep[0].0..keep[0].1],
+            &full[keep[0].0..keep[0].1],
+            "窗内不是逐位相同 —— 护栏不够宽,或者有一条跨岛耦合没被前置条件挡住"
+        );
+        // ⛔ 阴性对照 ①:真的跳掉了岛。没有这条,上面那条只证明了「窗什么也没做」。
+        assert_eq!(
+            dwin.islands_skipped, 2,
+            "应当只跳掉最远的两个岛(邻岛在护栏之内 ⇒ 必须保留),实际跳了 {}",
+            dwin.islands_skipped
+        );
+        assert_eq!(dwin.islands_seen, 5, "候选岛数不该受窗影响");
+        assert_eq!(dwin.islands, 3, "被处理的岛数 = 5 − 2");
+        // ⛔ 阴性对照 ②:窗**外**必须真的不一样(否则「跳岛」是个空操作)。
+        assert_ne!(winy, full, "整条逐位相同 ⇒ 跳掉的那两个岛本来就没产出任何东西");
+        assert_ne!(
+            &winy[..spans[0].0], &full[..spans[0].0],
+            "第一个岛之前那段都没变 —— 那说明被跳掉的岛在整条臂上也没写过东西"
+        );
+        // ⛔ 去次声那条**不结构性**的耦合:两条臂的总闸必须落在同一边(见 `infrasonic_gate_db`)。
+        assert_eq!(
+            dfull.infrasonic_gate_db >= 0.0,
+            dwin.infrasonic_gate_db >= 0.0,
+            "去次声总闸在两条臂上翻了面(整条 {:+.2} dB vs 窗臂 {:+.2} dB)—— \
+             窗内的低频修正会整块开/关",
+            dfull.infrasonic_gate_db,
+            dwin.infrasonic_gate_db
+        );
+        // 覆盖率读数要能当分母用。
+        let want = (keep[0].1 - keep[0].0) as f32 / x.len() as f32;
+        assert!((dwin.keep_frac - want).abs() < 1e-6, "keep_frac {} ≠ {want}", dwin.keep_frac);
+    }
+
+    /// S159 —— 护栏里的**去次声那一项**:钉的是不等式「护栏 ≥ 逐岛滤波的支撑」,不是一段音频。
+    ///
+    /// ## ⛔ 为什么这一条**不能**用音频钉(实测,不是省事)
+    /// 变异台 `m3`(把 `infra_guard` 整项删掉)在两种夹具上**都是绿的**,而两条原因各自成立:
+    /// * **上移臂**(生产方向)上它被前两项结构性地盖住:逐岛宽度 `w = 1000/f_src` ms
+    ///   ⇒ 支撑 `= 2·T_src + 1` 样本;而护栏的前两项 `= per + wmax`,其中 `per ≥ T_src`
+    ///   (`island_reach` 取的是岛内**最低**的 f0 = 最长周期),又因为颗粒门限
+    ///   `lw > wmax ⇒ continue` 保证参与的 `T_src ≤ wmax` ⇒ `per + wmax ≥ 2·T_src`。**恒成立。**
+    /// * **下移臂**上它才会绑定(`w` 被 `1/ratio` 放大),可那时去次声的总闸 `e_out >= e_in`
+    ///   通常把**整刀关掉**(下移让脉冲密度变稀 ⇒ 输出的低频基线比输入小)⇒ 修正项恒为 0,
+    ///   跳不跳岛都一样。
+    /// ⇒ 这一项是**给将来准备的余量**(比如有人把 `CUT_BOX_PASSES` 调大、或者放宽总闸)。
+    /// 而「一个被写进文档的风险,没有判据盯着就等于没被记录」⇒ 它至少要有这条**结构**判据。
+    ///
+    /// ## 它钉什么 —— ⛔ **断言写字面量,而且读的是生产那个函数**
+    /// 第一版我让判据**自己重新算了一遍**那三项,于是把生产那一行改成宽度**下限**、
+    /// 或者把支撑公式里的遍数删掉,它**照样绿**(变异台 `m3` / `m3b` 实测)——
+    /// 两边同步变,断言当然还成立。那是「断言里引用被测量」的镜像形态,同样是空判据。
+    /// ⇒ 只许调 [`island_guard`] 本人,期望值写**实测出来的整数**。
+    #[test]
+    fn the_window_guard_is_the_sum_of_three_measured_bounds() {
+        // 44.1 kHz、岛内最低 110 Hz、win = 1.0(生产默认):
+        //   标记外走 ceil(44100/110) = 401 · 颗粒窗 0.02·44100 = 882 · 去次声 50 ms 那一档 4409
+        //   ⇒ 5692 样本 = 129.1 ms
+        let sr = 44_100u32;
+        let hop = sr as usize / 200;
+        let f0t = flat_f0(sr as usize, hop, 110.0);
+        let wmax = MAX_PERIOD_SECONDS * f64::from(sr) * 1.0;
+        assert_eq!(
+            island_guard(&f0t, hop, 0, sr as usize, sr, wmax),
+            5692,
+            "护栏不是那三项之和了 —— 逐项:标记 {} · 颗粒 {} · 去次声 {}",
+            island_reach(&f0t, hop, 0, sr as usize, f64::from(sr)),
+            wmax as usize,
+            infrasonic_pad_samples(INFRASONIC_MS_MAX, sr)
+        );
+        // ⑵ 三项**各自**都要能单独看得见 —— 否则上面那个和可以由错误的组合凑出来。
+        assert_eq!(island_reach(&f0t, hop, 0, sr as usize, f64::from(sr)), 401);
+        assert_eq!(wmax as usize, 882);
+        assert_eq!(infrasonic_pad_samples(INFRASONIC_MS_MAX, sr), 4409);
+        // ⑶ 去次声那一项必须是宽度**上限**那一档:任何合法宽度的支撑都不许超过它。
+        let widest = infrasonic_pad_samples(INFRASONIC_MS_MAX, sr);
+        for w in [INFRASONIC_MS_MIN, 2.0, 5.0, 8.0, 16.7, 33.0, INFRASONIC_MS_MAX] {
+            assert!(
+                infrasonic_pad_samples(w, sr) <= widest,
+                "宽度 {w} ms 的支撑超过了护栏用的那一档"
+            );
+        }
+        // ⑷ 低音岛要真的把护栏推宽(标记那一项随 f0 走,不是常数)。
+        let low = flat_f0(sr as usize, hop, 55.0);
+        assert_eq!(island_reach(&low, hop, 0, sr as usize, f64::from(sr)), 802);
+        assert!(
+            island_guard(&low, hop, 0, sr as usize, sr, wmax)
+                > island_guard(&f0t, hop, 0, sr as usize, sr, wmax),
+            "把基频减半没有把护栏推宽 —— 标记那一项写死了"
+        );
+        // ⑸ 取不到周期时必须**不跳岛**(失败方向是「多做」)。
+        assert_eq!(island_reach(&[0.0f32; 8], hop, 0, 100, f64::from(sr)), usize::MAX / 4);
+    }
+
+    /// S159 —— **全覆盖的窗必须一个岛都不跳,而且逐位等于「不给窗」。**
+    ///
+    /// ⛔ 它盯的是「opt-in」这半边:今天出厂的每一条路(cover / audition / 探针 / 单测)都不给窗,
+    /// 而这一刀**不许**改它们一个字节。`psola_shift_env` 只是转发 `&[]`,所以拿它对拍是恒真的
+    /// (自己跟自己比);真正非空的对照是 **`[(0, n)]`** —— 它走的是过滤那条路,只是每个岛都留下。
+    #[test]
+    fn a_window_covering_everything_skips_nothing_and_is_byte_for_byte_today() {
+        let sr = 44_100u32;
+        let (frac, wsola, lock, hp, envfix, bridge, win, xg, lpc) = prod_knobs();
+        let (x, f0t, hop, _) = island_train(sr, 200.0, 60.0, 160.0, 3);
+        let arm = |keep: &[(usize, usize)]| {
+            psola_shift_win(
+                &x, sr, 9.0, 0.0, &f0t, hop, frac, wsola, lock, hp, envfix, bridge, win, xg, lpc,
+                keep,
+            )
+        };
+        let (none, dnone) = arm(&[]);
+        let (all, dall) = arm(&[(0, x.len())]);
+        assert_eq!(none, all, "全覆盖的窗改变了输出 —— 过滤那条路本身不是无损的");
+        assert_eq!(dall.islands_skipped, 0, "全覆盖却跳了岛");
+        assert_eq!(dall.islands, dnone.islands);
+        // 阴性对照:同一条路上,一个**真的窄**的窗必须改变输出(否则上面那条只是「窗没接上」)。
+        let narrow = [(x.len() / 2, x.len() / 2 + sr as usize / 20)];
+        let (nar, dnar) = arm(&narrow);
+        assert!(dnar.islands_skipped > 0, "窄窗一个岛都没跳 —— 窗根本没接上");
+        assert_ne!(nar, none, "窄窗与整条臂逐位相同 —— 窗根本没接上");
+    }
+
+    /// S159 —— ⛔⛔ **两条跨岛耦合任一开着时,窗必须被【忽略】,而且要报出来。**
+    ///
+    /// 「跳岛在窗内逐位安全」这条性质**挂在两个出厂默认上**(`LPC = 0` · `WSOLA = 0`)。
+    /// 它们各自的机理写在 `psola_shift_win` 的 doc 里,共同点是**跨岛携带状态**:
+    /// 全缓冲的 IIR 递归 / 读共享的 `acc`。
+    /// ⚠ S159i 之前这里还有第三条 `ENVFIX` —— 它已经被改成逐岛,不再跨岛,
+    ///   由 `envelope_restore_is_per_island_and_therefore_window_safe` 从**反面**钉着。
+    /// ⇒ 哪天有人翻其中任何一个,这一刀必须**自己退回整条缓冲**,而不是静默产出错的窗边。
+    ///
+    /// ⛔ 变异:把 `keep_blocked` 里的任一项去掉 ⇒ 那条臂的窗生效 ⇒ 输出与整条臂不同 ⇒ **红**。
+    #[test]
+    fn a_cross_island_knob_makes_the_window_degrade_loudly_instead_of_lying() {
+        let sr = 44_100u32;
+        let (frac, wsola, lock, hp, _envfix, bridge, win, xg, _lpc) = prod_knobs();
+        let (x, f0t, hop, spans) = island_train(sr, 200.0, 60.0, 160.0, 4);
+        let keep = [(spans[1].0, spans[1].1)];
+        // 三条臂,每条只把一个跨岛旋钮打开。⛔ 参数从生产默认起步、只动一个自由度
+        // (S158 血训:A/B 判据两条臂只许差一个自由度)。
+        for (name, wso, envf, lp) in
+            [("LPC", wsola, 0.0, 16usize), ("WSOLA", 0.25, 0.0, 0)]
+        {
+            let arm = |k: &[(usize, usize)]| {
+                psola_shift_win(
+                    &x, sr, 9.0, 0.0, &f0t, hop, frac, wso, lock, hp, envf, bridge, win, xg, lp, k,
+                )
+            };
+            let (full, dfull) = arm(&[]);
+            let (winy, dwin) = arm(&keep);
+            assert!(dwin.keep_ignored, "{name} 开着,窗却没有被忽略 —— 窗内会出错而没有任何东西会红");
+            assert!(!dfull.keep_ignored, "{name}:没给窗的时候不该报「窗被忽略」");
+            assert_eq!(winy, full, "{name} 开着时窗臂必须逐位等于整条臂");
+            assert_eq!(dwin.islands_skipped, 0, "{name}:被忽略的窗不许跳岛");
+        }
+        // ⛔ 阴性对照:同一个窗、同一份夹具,在**生产默认**下必须真的跳岛
+        //    —— 否则上面那三条「相同」只是因为这个窗本来就不做事。
+        let (_, dprod) = psola_shift_win(
+            &x, sr, 9.0, 0.0, &f0t, hop, frac, wsola, lock, hp, 0.0, bridge, win, xg, 0, &keep,
+        );
+        assert!(!dprod.keep_ignored, "生产默认下窗不该被忽略");
+        assert!(dprod.islands_skipped > 0, "生产默认下这个窗一个岛都没跳 —— 阴性对照是空的");
+    }
+
+    /// S159i —— ⛔⛔ **包络还原【逐岛】做,所以它和窗内逆变换可以同时开着。**
+    ///
+    /// 这条判据是 S159i 那笔改动的承重面。它钉四件,少一件就能被「这条臂没接上」满足:
+    /// ⑴ 开着包络还原时,窗**不再被忽略**(`keep_ignored == false`);
+    /// ⑵ 这个窗**真的跳了岛**(否则 ⑶ 只是因为窗本来就不做事);
+    /// ⑶ ⭐ **窗内的样本与整条臂逐位相同** —— 这才是「逐岛之后不再跨岛」那句话的内容;
+    /// ⑷ ⛔ **阴性对照**:包络还原开与关的输出必须**不同**,否则 ⑶ 可以由「这一刀什么都没做」满足。
+    ///
+    /// ⚠⚠ **如实登记:⑶ 那条在这份合成夹具上【抓不住】「改回整条缓冲还原」那个变异。**
+    /// 试过 37 / 8 / 4 / 2 / 1.5 Hz 四档幅度起伏,变异全绿 —— 稳态合成音上 PSOLA 把包络还得太准
+    /// (`ex/ey ≈ 1`)⇒ 跨岛耦合没东西可跨。⇒ **机理由
+    /// `the_whole_buffer_envelope_restore_is_cross_island_and_slicing_is_what_fixes_it` 直接钉**,
+    /// 那一条是对 `restore_envelope` 本身构造局面,不经过合成音。
+    /// ⛔ 别把这条读成「⑶ 是多余的」:它仍然是**接线闸**(`keep_ignored` / 跳岛 / 长度),
+    /// 只是不承担「逐岛 vs 整条」那个自由度。
+    #[test]
+    fn envelope_restore_is_per_island_and_therefore_window_safe() {
+        let sr = 44_100u32;
+        let (frac, wsola, lock, hp, _envfix, bridge, win, xg, lpc) = prod_knobs();
+        let (mut x, f0t, hop, spans) = island_train(sr, 200.0, 60.0, 160.0, 4);
+        // ⛔⛔ **夹具必须给这一刀留下【可修的东西】。**第一版直接用 `island_train` 的稳态音,
+        // 变异「改回整条缓冲还原」是**绿的** —— 稳态正弦上 PSOLA 本来就把包络还得很准
+        // (`ex/ey ≈ 1`)⇒ `raw ≈ 1` ⇒ 跳不跳岛都一样 ⇒ 跨岛耦合**没东西可跨**。
+        // ⇒ 每个岛加一段快幅度起伏(37 Hz、深 0.75),颗粒叠加会把它抹掉一部分,
+        //    于是 `ex/ey` 真的偏离 1,跨岛抹平才有可观测的后果。
+        for &(a, b) in &spans {
+            for i in a..b {
+                let t = (i - a) as f64 / f64::from(sr);
+                x[i] = (f64::from(x[i])
+                    * (1.0 - 0.85 * (2.0 * std::f64::consts::PI * 37.0 * t).sin().abs()))
+                    as f32;
+            }
+        }
+        let keep = [(spans[1].0, spans[1].1)];
+        let arm = |k: &[(usize, usize)], envf: f64| {
+            psola_shift_win(
+                &x, sr, 9.0, 0.0, &f0t, hop, frac, wsola, lock, hp, envf, bridge, win, xg, lpc, k,
+            )
+        };
+        // ⛔⛔ **20 ms 这一档不是随手挑的,它是这条判据的承重面。**
+        // 第一版写的是 3 ms,变异「改回整条缓冲还原」**是绿的** —— 因为增益的抹平半宽是 `h*4`,
+        // 3 ms 时总反应距离 ≈ 5h ≈ 47 ms,**够不到夹具里 60 ms 的岛间距**,跨岛耦合根本没发生。
+        // 一条「测不到被测机理」的判据就是空判据(S159 血训)。20 ms ⇒ 5h ≈ 100 ms > 60 ms ⇒ 真的跨岛。
+        // ⚠ 生产宽度由周期定(≈1.5 个周期),3 ms 那一档一起测,是为了钉「窄档也安全」。
+        for envf in [3.0f64, 20.0] {
+            let (full, dfull) = arm(&[], envf);
+            let (winy, dwin) = arm(&keep, envf);
+            assert!(!dwin.keep_ignored, "{envf} ms:包络还原开着,窗却被忽略 —— 它不该再是跨岛耦合");
+            assert!(!dfull.keep_ignored, "{envf} ms:没给窗的时候不该报「窗被忽略」");
+            assert!(dwin.islands_skipped > 0, "{envf} ms:窗一个岛都没跳 —— 判据是空的");
+            for i in keep[0].0..keep[0].1 {
+                assert_eq!(winy[i], full[i], "{envf} ms:窗内第 {i} 个样本与整条臂不同 —— 增益还在跨岛");
+            }
+            // ⑷ 阴性对照 —— 这一刀必须真的动了输出。
+            let (off, _) = arm(&[], 0.0);
+            assert_ne!(full, off, "{envf} ms:包络还原开与关输出逐位相同 —— 这条臂根本没接上");
+        }
+    }
+
+    /// S159i —— ⛔⛔⛔ **证明「整条缓冲还原」确实跨岛,而逐岛切片确实不跨。**
+    ///
+    /// 这条判据存在的理由:上面那条走 `psola_shift_win` 的判据**抓不住**这次改动 ——
+    /// 变异「改回整条缓冲还原」在合成夹具上是**绿的**(试过 37 / 8 / 4 / 2 / 1.5 Hz 四档幅度起伏,
+    /// 全绿),因为稳态合成音上 PSOLA 把包络还得太准,`ex/ey ≈ 1` ⇒ 跨岛耦合**没东西可跨**。
+    /// ⛔ 一条「测不到被测机理」的判据就是空判据,所以这里改成**直接对 `restore_envelope` 本身**
+    /// 构造那个机理:手工喂一个「邻段有包络误差」的局面,看它会不会渗进本段。
+    ///
+    /// ⑴ **整条缓冲**:邻段标成 `covered` 与不标,本段内的输出**必须不同** ⇒ 它确实跨岛;
+    /// ⑵ **逐岛切片**(只喂本段那一片):两种情况下**必须逐位相同** ⇒ 这就是 S159i 改法的全部内容。
+    #[test]
+    fn the_whole_buffer_envelope_restore_is_cross_island_and_slicing_is_what_fixes_it() {
+        let (i0, i1) = (0usize, 1000usize); // 邻段
+        let (j0, j1) = (1200usize, 2200usize); // 本段
+        let n = 2400usize;
+        let half = 300usize; // ⇒ 增益抹平半宽 = 4·half = 1200,刚好从本段起点够回邻段
+        let x: Vec<f32> = (0..n)
+            .map(|i| {
+                if (i0..i1).contains(&i) || (j0..j1).contains(&i) {
+                    (i as f32 * 0.37).sin()
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        // `out` = `x`,但**两段中间各**有一处被压掉 —— 这就是「PSOLA 在那儿把包络弄坏了」。
+        // ⚠ 本段那一处是**阴性对照 ⑶ 需要的**:第一版只在邻段挖坑,于是切片里根本没有可修的东西,
+        //    ⑶「逐岛还原改变了本段」当场变红 —— 那不是代码错,是对照写错了。
+        let mut out0: Vec<f32> = x.clone();
+        for v in out0.iter_mut().take(600).skip(400) {
+            *v *= 0.5;
+        }
+        for v in out0.iter_mut().take(1700).skip(1500) {
+            *v *= 0.6;
+        }
+        let both: Vec<bool> = (0..n).map(|i| (i0..i1).contains(&i) || (j0..j1).contains(&i)).collect();
+        let only: Vec<bool> = (0..n).map(|i| (j0..j1).contains(&i)).collect();
+
+        // ⑴ 整条缓冲:两种 `covered` 下,**本段**内的结果不同。
+        let (mut a, mut b) = (out0.clone(), out0.clone());
+        restore_envelope(&mut a, &x, &both, half);
+        restore_envelope(&mut b, &x, &only, half);
+        assert_ne!(
+            a[j0..j1],
+            b[j0..j1],
+            "整条缓冲还原下,邻段被不被处理竟然不影响本段 —— 那这条判据没测到跨岛耦合"
+        );
+
+        // ⑵ 逐岛切片:同样两种 `covered`,本段逐位相同。
+        let mut c: Vec<f32> = out0[j0..j1].to_vec();
+        let mut d: Vec<f32> = out0[j0..j1].to_vec();
+        restore_envelope(&mut c, &x[j0..j1], &both[j0..j1], half);
+        restore_envelope(&mut d, &x[j0..j1], &only[j0..j1], half);
+        assert_eq!(c, d, "逐岛切片之后本段还是被邻段影响了 —— 切片没起作用");
+        // ⛔ 阴性对照:切片这条路本身不是「什么都不做」。
+        assert_ne!(c[..], out0[j0..j1], "逐岛还原没有改变本段 —— 这一刀根本没接上");
+    }
+
+    /// S159i —— **窗宽以 donor 的周期计,不是毫秒。**读数与机理在 [`ENV_RESTORE_PERIODS`] 的 doc 里。
+    ///
+    /// ⛔ 期望值写**字面量**,不许拿 `ENV_RESTORE_PERIODS` 反算 —— 那样改常量时判据会跟着改答案,
+    /// 就是 S159 记过的「判据自己重算被测值 = 空判据」。
+    #[test]
+    fn the_envelope_restore_window_is_measured_in_donor_periods() {
+        let sr = 48_000.0;
+        // 真素材里 donor 最低 123.4 Hz ⇒ 1.5 个周期 = 583 样本 = 12.2 ms。
+        assert_eq!(env_restore_half(&vec![123.4f32; 200], 480, 0, 48_000, sr, 4), 583);
+        // 末句那个岛自己的最低值 ≈ 262 Hz ⇒ 274 样本 = 5.7 ms(甜区)。
+        assert_eq!(env_restore_half(&vec![261.6f32; 200], 480, 0, 48_000, sr, 4), 275);
+        // 高音上由**下限**接管(1.5 个周期只有 80 样本)。
+        assert_eq!(env_restore_half(&vec![900.0f32; 200], 480, 0, 48_000, sr, 144), 144);
+        // ⛔ 取不到周期 ⇒ 退回下限,不许变成 0 或者「不做」。
+        assert_eq!(env_restore_half(&vec![0.0f32; 200], 480, 0, 48_000, sr, 144), 144);
+        assert_eq!(env_restore_half(&[], 480, 0, 48_000, sr, 144), 144);
+        // 封顶 30 ms:一个 20 Hz 的病态 f0 不许把窗撑到 75 ms。
+        assert_eq!(env_restore_half(&vec![20.0f32; 200], 480, 0, 48_000, sr, 4), 1440);
+    }
+
+    /// S159 —— **「窗切不到任何岛」与「根本没有音高」必须是两件事。**
+    ///
+    /// `vocal_range::apply_inverse` 在 `islands == 0` 时让整条渲染响亮失败
+    /// (`RANGE_INVERSE_NO_PITCH`)。加了窗之后 `islands == 0` 多了一个**正常**的来源:
+    /// 这一遍的窗全落在休止里。⇒ 引擎必须把两者分开报,否则「窗算错了」与「模型没给 f0」
+    /// 会报成同一种红(S129 铁律,而这条线上同一条红被判「假红」已经出过两次)。
+    #[test]
+    fn a_window_that_touches_no_island_is_not_the_same_as_having_no_pitch() {
+        let sr = 44_100u32;
+        let (frac, wsola, lock, hp, envfix, bridge, win, xg, lpc) = prod_knobs();
+        // ⚠ 休止要够长:护栏本身就有 126 ms(周期 6 ms + 颗粒 20 ms + 去次声 100 ms),
+        //   休止短于它的时候「窗切不到任何岛」这件事**结构上不可能发生**,夹具就是假的。
+        let (x, f0t, hop, spans) = island_train(sr, 200.0, 700.0, 160.0, 3);
+        let run = |f0: &[f32], keep: &[(usize, usize)]| {
+            psola_shift_win(
+                &x, sr, 9.0, 0.0, f0, hop, frac, wsola, lock, hp, envfix, bridge, win, xg, lpc, keep,
+            )
+            .1
+        };
+        // ⑴ 窗落在两个岛之间那段休止的正中(两侧各留 300 ms > 护栏)⇒ 有音高,但这一遍无事可做。
+        let ms = |v: f64| (f64::from(sr) * v / 1000.0) as usize;
+        let tail = [(spans[0].1 + ms(300.0), spans[1].0 - ms(300.0))];
+        assert!(tail[0].1 > tail[0].0, "夹具的休止不够长");
+        let d = run(&f0t, &tail);
+        assert!(d.islands_seen > 0, "夹具里必须有岛");
+        assert_eq!(d.islands, 0, "这个窗不该处理任何岛");
+        assert!(d.islands_skipped > 0, "岛全被跳掉了,却报 skipped = 0");
+        // ⑵ 真的没有音高 —— 两个计数都是 0,这才是那条错误该说的话。
+        let silent = vec![0.0f32; f0t.len()];
+        let d0 = run(&silent, &[]);
+        assert_eq!((d0.islands_seen, d0.islands, d0.islands_skipped), (0, 0, 0));
+        // ⇒ 判据 = `islands_seen`,不是 `islands`。
+        assert_ne!(
+            d.islands_seen, d0.islands_seen,
+            "两种情形在 `islands_seen` 上也分不开 ⇒ 上游没法归因,那条红就会被耸肩带过"
+        );
+    }
+
+    /// S157b —— 格型分析/合成**必须是逐样本精确互逆**。整条 LP-PSOLA 的恒等都挂在这上面。
+    /// ⛔ 阴性对照两条,缺一条这条判据就可能只是「两条都很小」:
+    /// ⑴ 用**另一条 `k` 轨迹**合成 ⇒ 必须恢复不了(否则说明 `k` 根本没参与);
+    /// ⑵ 残差本身必须**真的比输入白**(否则「搬残差」与「搬语音」是同一件事)。
+    #[test]
+    fn the_lattice_pair_is_an_exact_inverse() {
+        let sr = 44_100u32;
+        let x = voiced(sr, 0.4, 220.0);
+        for order in [8usize, 16, 24, 32] {
+            let (ks, hop) = lpc_reflections(&x, sr, order);
+            let r = lattice_analyse(&x, &ks, hop, order);
+            let y = lattice_synthesise(&r, &ks, hop, order);
+            let err = x
+                .iter()
+                .zip(&y)
+                .map(|(a, b)| f64::from(a - b).abs())
+                .fold(0.0f64, f64::max);
+            let peak = x.iter().map(|v| f64::from(*v).abs()).fold(0.0f64, f64::max);
+            assert!(
+                err < peak * 1e-4,
+                "order {order}: 往返误差 {err:.3e} 相对峰值 {peak:.3} 太大 —— 格型对不互逆"
+            );
+            // ⑴ 换一条 k 轨迹 ⇒ 必须恢复不了
+            let bogus: Vec<Vec<f64>> = ks.iter().map(|k| k.iter().map(|v| -0.5 * v).collect()).collect();
+            let y2 = lattice_synthesise(&r, &bogus, hop, order);
+            let err2 = x.iter().zip(&y2).map(|(a, b)| f64::from(a - b).abs()).fold(0.0f64, f64::max);
+            assert!(
+                err2 > peak * 1e-2,
+                "order {order}: 换了 k 竟然照样恢复出来({err2:.3e})⇒ 上面那条是空的"
+            );
+            // ⑵ 残差必须更白:一阶自相关系数的绝对值必须显著变小
+            let ac1 = |v: &[f32]| -> f64 {
+                let m: f64 = v.iter().map(|a| f64::from(*a)).sum::<f64>() / v.len() as f64;
+                let (mut num, mut den) = (0.0f64, 0.0f64);
+                for i in 1..v.len() {
+                    num += (f64::from(v[i]) - m) * (f64::from(v[i - 1]) - m);
+                    den += (f64::from(v[i]) - m).powi(2);
+                }
+                if den > 0.0 { num / den } else { 0.0 }
+            };
+            assert!(
+                ac1(&r).abs() < ac1(&x).abs() * 0.5,
+                "order {order}: 残差(lag-1 {:.3})并不比输入(lag-1 {:.3})白 —— 逆滤波没生效",
+                ac1(&r),
+                ac1(&x)
+            );
+        }
+    }
+
+    /// S157b/c —— ⭐⭐⭐ **这道工序在谐波【之间】加的噪声随 ratio 单调上升,而且它是结构性的**
+    /// (零抖动的完美源上就成立)—— ⭐⭐ **而 `frac_transport` 把它整条压掉了,S157c 已翻成默认。**
+    ///
+    /// 用户 2026-08-20 在落点 78 → 76 那条臂上看见「合唱感又回来了、而且不止一条,
+    /// 高阶共振峰之间也多了噪音」。归因做完之后,能站住的只有这一条 —— 而它在一个
+    /// **严格周期、零抖动、共振峰恒定**的合成夹具上就能复现:
+    ///
+    /// | ratio | 2.0000 | 2.1189 | 2.2449 | 2.3784 | 2.5198 |
+    /// |---|---|---|---|---|---|
+    /// | 合成夹具,`FRAC` **关** | +15.60 | +19.25 | **+21.72** | +24.17 | **+25.83** |
+    /// | 合成夹具,`FRAC` **开** | **−4.44** | +0.01 | **+4.68** | +5.41 | +7.92 |
+    /// | 真 ぴゃ donor(f0 659),`FRAC` 关 | +7.68 | +10.28 | **+12.53** | +15.40 | +15.43 |
+    /// | 真 ぴゃ donor,`FRAC` **开** | **−2.24** | −1.93 | **−1.24** | −0.62 | +1.46 |
+    ///
+    /// ⛔⛔ **第一版的那张表是在一个【脏夹具】上量的**(python 版把脉冲放在 `int(round(p))` 上,
+    /// 而 `T_src = 66.89` 样本 ⇒ 相邻间距在 66/67 之间跳 = **自带 ±0.5 样本抖动,正是被测的那个量**;
+    /// 它自己的谐波间噪声比 −28.60,**比真 donor 的 −39.32 还脏**)。修成亚样本放脉冲之后读 −47.84。
+    /// ⭐ 抓到它的是这条判据自己的阴性对照:`XGRAIN=0` 在严格周期源上按构造是空操作,
+    /// 却读出 +1.0 dB 的差 ⇒ 夹具不干净。**仓里的 `pulses()` 本来就是亚样本精确的**
+    /// (它的注释明写「整数对齐的夹具会让亚样本细化变得不可见」)—— 那份 wav 版没跟上。
+    ///
+    /// ⛔⛔ **四条假说被自己的阴性对照判死,别再重推**:
+    /// ⑴ 「`f_out/p` 的梳」—— 谱自相关否掉(峰值只有 0.13,那是在噪声里认图案);
+    /// ⑵ 「donor 自己的整条谐波列漏出来」—— 把栅格整体挪 ±37 Hz 读数只差 1-2 dB
+    ///    ⇒ 那把尺子量的是「那一带有多少能量」,不是漏出;
+    /// ⑶ 「颗粒**内容**:复制了脉冲的长尾」—— **LP-PSOLA 实测不改变它**
+    ///    (order 8/12/16/20/24/32 在这一带全部 ≥ order 0,见 [`lpc_reflections`]);
+    /// ⑷ 「源标记**抖动**」—— 同一个滤波器、加 2% 周期抖动,只差 **+0.65 dB**。
+    /// ⇒ ⭐ 剩下的嫌疑集中在**颗粒的摆放**上(`k = round(u)` 的复用 / 目标栅格 / 窗形),
+    ///    而它在零抖动的完美源上就成立 ⇒ **下一次重开这条轴,从这个夹具开始,别再从整曲开始。**
+    #[test]
+    fn the_inter_harmonic_noise_this_stage_adds_grows_with_the_ratio() {
+        let sr = 44_100u32;
+        let f0 = 659.27; // = 1480 / 2^(14/12):用户报的那个音的 donor 基频
+        // ⛔ **必须过一遍共振峰滤波器**:裸脉冲串的谐波之间只有数值底,那个比值量的是
+        //    浮点噪声,不是这道工序的账(第一版就是这么写的,读出 +25 / −1 的乱数)。
+        //    ⇒ 四个极点对(500/1500/2500/3500 Hz,带宽 80/90/120/140)= 一个元音的形状。
+        let (imp, _) = pulses(sr, 2.0, |_| f0, |_| 1.0);
+        let x: Vec<f32> = {
+            let mut y: Vec<f64> = imp.iter().map(|v| f64::from(*v)).collect();
+            for (f, bw) in [(500.0f64, 80.0f64), (1500.0, 90.0), (2500.0, 120.0), (3500.0, 140.0)] {
+                let r = (-std::f64::consts::PI * bw / f64::from(sr)).exp();
+                let th = 2.0 * std::f64::consts::PI * f / f64::from(sr);
+                let (a1, a2) = (-2.0 * r * th.cos(), r * r);
+                let (mut z1, mut z2) = (0.0f64, 0.0f64);
+                for v in y.iter_mut() {
+                    let o = *v - a1 * z1 - a2 * z2;
+                    z2 = z1;
+                    z1 = o;
+                    *v = o;
+                }
+            }
+            let peak = y.iter().fold(0.0f64, |m, v| m.max(v.abs())).max(1e-30);
+            y.iter().map(|v| (0.3 * v / peak) as f32).collect()
+        };
+        let hop = sr as usize / 200;
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+        let g = |k: &str| {
+            PROBE_ARM_DEFAULTS.iter().find(|(n, _)| *n == k).unwrap_or_else(|| panic!("{k}")).1
+        };
+        let run = |st: f64, frac: bool| {
+            psola_shift_env(
+                &x, sr, st, 0.0, &f0t, hop,
+                frac, g("UTAI_PSOLA_WSOLA"), g("UTAI_PSOLA_LOCK"),
+                Infrasonic::PerPeriod, g("UTAI_PSOLA_ENVFIX"), g("UTAI_PSOLA_BRIDGE"),
+                g("UTAI_PSOLA_WIN"), g("UTAI_PSOLA_XGRAIN"), g("UTAI_PSOLA_LPC") as usize,
+            )
+            .0
+        };
+        // 谐波之间 / 谐波上(dB)。⛔ 是**比值**,所以对「不除 wsum ⇒ 电平随 ratio 走」免疫。
+        let ihr = |y: &[f32], fg: f64, lo: f64, hi: f64| -> f64 {
+            let nfft = 1usize << 14;
+            let w: Vec<f64> = (0..nfft)
+                .map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / nfft as f64).cos())
+                .collect();
+            let (mut on, mut off) = (0.0f64, 0.0f64);
+            let mut i = 0usize;
+            while i + nfft <= y.len() {
+                let mut re = vec![0.0f64; nfft];
+                for (j, r) in re.iter_mut().enumerate() {
+                    *r = f64::from(y[i + j]) * w[j];
+                }
+                let spec = {
+                    use rustfft::{num_complex::Complex, FftPlanner};
+                    let mut buf: Vec<Complex<f64>> =
+                        re.iter().map(|v| Complex::new(*v, 0.0)).collect();
+                    FftPlanner::new().plan_fft_forward(nfft).process(&mut buf);
+                    buf[..nfft / 2 + 1].iter().map(|c| c.norm_sqr()).collect::<Vec<f64>>()
+                };
+                let bin = f64::from(sr) / nfft as f64;
+                for (b, p) in spec.iter().enumerate() {
+                    let f = b as f64 * bin;
+                    if f < lo || f >= hi {
+                        continue;
+                    }
+                    let near = ((f / fg).round() * fg - f).abs() <= 0.06 * fg;
+                    if near { on += p } else { off += p }
+                }
+                i += nfft / 2;
+            }
+            10.0 * (off.max(1e-300) / on.max(1e-300)).log10()
+        };
+        let base = ihr(&x, f0, 1000.0 / 2.2449, 2100.0 / 2.2449);
+        let add = |st: f64, frac: bool| {
+            let r = 2f64.powf(st / 12.0);
+            ihr(&run(st, frac), f0 * r, 1000.0, 2100.0) - ihr(&x, f0, 1000.0 / r, 2100.0 / r)
+        };
+        // ⛔ 阴性对照 = **把 `frac_transport` 显式关掉**(= S157c 之前那条臂):缺陷必须回来,
+        //    而且必须随 ratio 单调 —— 没有这一半,下面「修好了」那几条可能只是「本来就没病」。
+        let (o12, o14, o16) = (add(12.0, false), add(14.0, false), add(16.0, false));
+        // ⛔ 边界写字面量,不许引用被测的东西(S146c 那条判据写了三版才有牙)。
+        assert!(o12 > 2.0, "关掉亚样本搬运,ratio 2.0 上竟然几乎不加噪声({o12:.2} dB)⇒ 判据是空的");
+        assert!(o14 > o12 + 0.4, "关掉之后 +14 没有比 +12 更脏({o12:.2} → {o14:.2})⇒ 单调性没了");
+        assert!(o16 > o14 + 0.4, "关掉之后 +16 没有比 +14 更脏({o14:.2} → {o16:.2})");
+        assert!(base < o12, "夹具本身({base:.2})就比过一遍工序还脏 ⇒ 这个夹具不干净");
+        // ⭐ 承重:**生产默认**(亚样本搬运开着)必须把它整条压下去,而且在每一档上都压。
+        // ⛔⛔ 这里**必须从 `PROBE_ARM_DEFAULTS` 读**,不许写 `true` —— 第一版写死了 `true`,
+        //   于是把 `FRAC_TRANSPORT_DEFAULT` 翻回 `false` 这条判据**照样绿**(变异 M1 当场抓到)。
+        //   那正是 S156 在这份文件里抓到的同一条:**「改了默认」与「改了行为」是两件事。**
+        let prod_frac = g("UTAI_PSOLA_FRAC") != 0.0;
+        assert!(prod_frac, "生产默认里亚样本搬运是关的 —— 那这条判据钉的就不是出厂那条臂");
+        for st in [12.0f64, 14.0, 16.0] {
+            let (on, off) = (add(st, prod_frac), add(st, false));
+            assert!(
+                on < off - 5.0,
+                "+{st} st:生产默认({on:.2})没有比关掉亚样本搬运({off:.2})干净 5 dB 以上"
+            );
+        }
+    }
+
+    /// S157b —— ⭐⭐ **LP-PSOLA 的恒等是结构性的**:`y = x + Synth(OLA(r) − r)`,
+    /// ratio 1.0 上 `OLA(r) ≡ r` ⇒ 差恒为 0 ⇒ 零输入零初值 ⇒ `y ≡ x` **逐位**。
+    ///
+    /// ⛔ 这条必须对**每一个阶数**成立,而不是某一个 —— 它是接线的性质,不是参数的性质。
+    /// ⛔ 阴性对照:同一批阶数在 +14 上必须**真的改变输出**,否则「恒等」可能只是「旋钮没接上」。
+    #[test]
+    fn lp_psola_is_bit_identical_at_ratio_one_and_actually_bites_elsewhere() {
+        let sr = 44_100u32;
+        let x = voiced(sr, 0.4, 220.0);
+        let hop = sr as usize / 200;
+        let f0t = flat_f0(x.len(), hop, 220.0);
+        let g = |k: &str| {
+            PROBE_ARM_DEFAULTS.iter().find(|(n, _)| *n == k).unwrap_or_else(|| panic!("{k}")).1
+        };
+        let run = |st: f64, order: usize| {
+            psola_shift_env(
+                &x, sr, st, 0.0, &f0t, hop,
+                g("UTAI_PSOLA_FRAC") != 0.0, g("UTAI_PSOLA_WSOLA"), g("UTAI_PSOLA_LOCK"),
+                Infrasonic::PerPeriod, g("UTAI_PSOLA_ENVFIX"), g("UTAI_PSOLA_BRIDGE"),
+                g("UTAI_PSOLA_WIN"), g("UTAI_PSOLA_XGRAIN"), order,
+            )
+            .0
+        };
+        let base14 = run(14.0, 0);
+        for order in [8usize, 16, 24, 32] {
+            assert_eq!(run(0.0, order), x, "order {order}: ratio 1.0 上 LP-PSOLA 不是恒等变换");
+            assert_ne!(run(14.0, order), base14, "order {order}: +14 上打开它输出没变 —— 旋钮没接上");
+        }
+        // ⛔ 阶数 0 那一档必须与今天逐位相同(否则这一整笔改了默认臂)。
+        assert_eq!(run(14.0, 0), base14);
+    }
+
+    /// S151 —— 上移超过一个八度时,源波形有一整段**从来不被任何颗粒读到**,而仓里
+    /// 在这条判据之前**没有任何东西看得见它**:`cola_*` 是在输出域算的(半窗按构造等于目标
+    /// 邻距,实测 +7..+16 全是 0.00% / 1.000),标记层的尺子全部 ratio 不变量。
+    /// 阈值不是估的:读窗半宽 = `T_src/ratio`,相邻源标记相距 `T_src` ⇒ `ratio > 2` 才留缝。
+    ///
+    /// ⛔⛔ **S159:这条判据从 S157b 起到今天为止【一次都没有跑过】。**S157b 在它上面插入
+    /// LP-PSOLA 那条判据时,把 `#[test]` 连同这段 doc 一起留在了原地,于是属性落到了
+    /// `the_lattice_pair_is_an_exact_inverse` 头上(那个函数因此挂了**两个** `#[test]`),
+    /// 而这个函数变成了 `mod tests` 里一个没人调用的私有函数。
+    /// ⭐ **两条编译器警告一直在喊**(`duplicated attribute` + `function ... is never used`),
+    /// 而「717 条全绿」把它们盖住了 —— 一条判据消失,测试总数只是少 1,没有任何东西变红。
+    /// ⇒ 这就是「验证本身是空的」在**属性层**的形状:判据的正文一个字没错,它只是不再运行。
+    #[test]
+    fn nothing_reads_part_of_the_source_once_the_shift_passes_an_octave() {
+        let sr = 44_100;
+        let f0 = 220.0;
+        let x = voiced(sr, 0.5, f0);
+        let hop = sr as usize / 200;
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+        let frac = |st: f64| {
+            let (_, d) = psola_shift_diag(&x, sr, st, &f0t, hop);
+            assert!(d.islands > 0, "夹具必须真的是浊音");
+            d.src_uncovered_frac
+        };
+        // 阴性对照(两条,缺一条这条判据就可能只是「一个恒为正的数」):
+        // ⚠ 判据用 1e-9 而不是 == 0.0:ratio ≤ 2 时相邻读窗**正好相接**,读数是浮点噪声
+        // (实测 0 / 0 / 1.06e-15),不是真的缝。阈值仍然比阳性那一档小 8 个数量级。
+        for st in [0.0, 7.0, 12.0] {
+            let f = frac(st);
+            assert!(f < 1e-9, "{st:+} st 上读窗必须铺满源,读到 {f}");
+        }
+        // 阳性:用户 2026-08-18 实机真的跑到了 −14 ⇒ 逆变换 +14。
+        let f14 = frac(14.0);
+        assert!(
+            (0.05..0.20).contains(&f14),
+            "+14 上必须读出一段没人读过的源(实测真素材 10.2%),读到 {f14}"
+        );
+        assert!(frac(16.0) > f14, "越深漏得越多");
+    }
+
+    #[test]
+    fn the_window_sum_diagnostics_can_see_a_surplus_not_only_a_shortfall() {
+        // ⛔ The empty criterion this replaces: the stats were computed from a **clamped** window
+        // sum, so `cola_w_median` was structurally ≤ 1.000 and the overlap SURPLUS — which only
+        // occurs when shifting UP, i.e. the direction production actually runs — could not be
+        // expressed at all. A diagnostic that cannot represent the failure it watches for tells
+        // you nothing when it reads "fine".
+        let sr = 44_100;
+        let f0 = 220.0;
+        let x = voiced(sr, 0.5, f0);
+        let hop = sr as usize / 200;
+        let f0t = flat_f0(x.len(), hop, f0 as f32); // 空 f0 轨 ⇒ 零 island,那样测不到任何东西
+        let (_, up) = psola_shift_diag(&x, sr, 7.0, &f0t, hop);
+        assert!(up.islands > 0, "the fixture must actually be voiced");
+
+        // ⛔ STRICTLY ordered. `p01 <= median <= p99` survives a p99 that has silently collapsed
+        // onto the median (mutation-checked: that version went green on the loose form), so the
+        // three readouts have to be shown to be three readouts.
+        assert!(
+            up.cola_w_p01 < up.cola_w_median && up.cola_w_median < up.cola_w_p99,
+            "p01/median/p99 = {}/{}/{} — these must be three distinct readouts",
+            up.cola_w_p01,
+            up.cola_w_median,
+            up.cola_w_p99
+        );
+        assert!(
+            up.cola_w_p99 > 1.0,
+            "p99 {} — a clamped statistic can never exceed 1.0, which is exactly the bug",
+            up.cola_w_p99
+        );
+        assert!(up.cola_w_p99 < 2.0, "…but a surplus this large would be a real defect");
+        assert!((0.0..=1.0).contains(&up.cola_over_frac));
+
+        // And the audio is untouched by this: identity still holds bit-for-bit.
+        let (id, _) = psola_shift_diag(&x, sr, 0.0, &f0t, hop);
+        assert_eq!(id, x, "ratio 1.0 must remain the identity");
+    }
+
+    #[test]
+    fn the_discarded_transport_residual_is_zero_at_ratio_one_and_flat_everywhere_else() {
+        // ⭐ S146g's load-bearing measurement, as a criterion. Whole-sample transport takes
+        // `round(t) − round(s)` — a difference of TWO independent roundings — so every grain
+        // drops a sub-sample residual. Its RMS is the shape of the toll we could not explain:
+        // exactly 0 at ratio 1.0, and then a CONSTANT ≈0.41 samples at any other ratio.
+        // That constant is why entering the process once costs −0.59 dB while +7→+8 adds only
+        // −0.37: depth changes the grain count, not the rate.
+        let sr = 44_100;
+        let f0 = 220.0;
+        let x = voiced(sr, 0.5, f0);
+        let hop = sr as usize / 200;
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+
+        let (_, id) = psola_shift_diag(&x, sr, 0.0, &f0t, hop);
+        assert_eq!(
+            id.transport_residual_rms, 0.0,
+            "ratio 1.0 discards nothing — the identity is structural, not a short-circuit"
+        );
+
+        // ⚠ The residual is `(t − round(t)) − (s − round(s))` — the difference of two independent
+        // rounding errors. If those were uniform and independent the RMS would be the triangular
+        // value √(2/12) = 0.408, which is exactly what S146g read on the registered material
+        // (0.4139 / 0.4129 / 0.4121 at +1 / +6 / +8). This synthetic fixture has a near-constant
+        // period, so its two fractional parts are correlated and it reads higher (~0.52-0.60).
+        // ⇒ **The criterion is the SHAPE, not the constant.** Pinning the constant here would be
+        // over-fitting to one fixture; pinning the shape is what the diagnosis rests on.
+        let mut seen = vec![];
+        for st in [1.0, 3.0, 6.0, 8.0] {
+            let (_, d) = psola_shift_diag(&x, sr, st, &f0t, hop);
+            seen.push(d.transport_residual_rms);
+            assert!(
+                (0.25..0.75).contains(&d.transport_residual_rms),
+                "{st} st: a two-rounding residual has to land near √(2/12)=0.41, got {}",
+                d.transport_residual_rms
+            );
+        }
+        // ⛔ FLAT, not growing. A depth-proportional residual would mean the toll compounds, and
+        // then both the diagnosis and the fix are aimed at the wrong thing. (+8 vs +1 measures
+        // 1.14× here; anything approaching proportionality would be several ×.)
+        let (lo, hi) = seen.iter().fold((f32::MAX, 0.0f32), |(a, b), &v| (a.min(v), b.max(v)));
+        assert!(hi / lo < 1.5, "residual must not track depth, got {seen:?}");
+    }
+
+    #[test]
+    fn carrying_the_residual_removes_it_without_touching_the_identity() {
+        // ⛔⛔ THE criterion the recon insisted on, and the reason it exists: the existing
+        // identity gate is **structurally blind** to this code. At ratio 1.0 the fractional
+        // branch executes ZERO times (delta ≡ 0 ⇒ the fast path takes it), so
+        // `ratio_one_is_the_identity` would stay green on a completely broken interpolator —
+        // the same shape as putting a gate on `apply_inverse`, which returns early at shift 0.
+        // ⇒ assert the interpolator itself, and assert the residual is actually gone.
+        let sr = 44_100;
+        let f0 = 220.0;
+        let x = voiced(sr, 0.5, f0);
+        let hop = sr as usize / 200;
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+
+        // ⑴ The interpolator at an integer position IS the sample (this is what makes the
+        //    identity survive even with the fast path removed — measured 5.5e-18 by S146g).
+        for i in [40usize, 137, 4096, 9999] {
+            assert!(
+                (sinc_read(&x, i as f64) - f64::from(x[i])).abs() < 1e-9,
+                "sinc_read at integer {i} must return the sample itself"
+            );
+        }
+
+        // ⑵ Carrying the residual zeroes the thing it is meant to zero…
+        for st in [1.0, 6.0, 8.0] {
+            let (_, off) = psola_shift_opts(&x, sr, st, 0.0, &f0t, hop, false);
+            let (_, on) = psola_shift_opts(&x, sr, st, 0.0, &f0t, hop, true);
+            assert!(off.transport_residual_rms > 0.25, "{st} st: baseline must drop a residual");
+            assert_eq!(on.transport_residual_rms, 0.0, "{st} st: carried ⇒ nothing discarded");
+            assert_eq!(on.islands, off.islands, "{st} st: the mark layer must not move");
+        }
+
+        // ⑶ …and ratio 1.0 stays BIT-exact on both arms.
+        for frac in [false, true] {
+            let (y, _) = psola_shift_opts(&x, sr, 0.0, 0.0, &f0t, hop, frac);
+            assert_eq!(y, x, "ratio 1.0 must be the identity with frac_transport = {frac}");
+        }
+    }
+
+    #[test]
+    fn the_fractional_arm_is_opt_in_and_production_is_byte_for_byte_unchanged() {
+        // ⚠ Additive, per S146's protocol: the rulers cannot settle whether this SOUNDS better
+        // (S146g measured ΔHNR ranking the praat gold standard BELOW two arms already condemned
+        // by ear), so nothing the user hears may move until a blind test says so.
+        let sr = 44_100;
+        let f0 = 260.0;
+        let x = voiced(sr, 0.4, f0);
+        let hop = sr as usize / 200;
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+        for st in [-6.0, -1.0, 1.0, 6.0, 8.0] {
+            let (legacy, _) = psola_shift_opts(&x, sr, st, 0.0, &f0t, hop, false);
+            let (via_public, _) = psola_shift_diag(&x, sr, st, &f0t, hop);
+            assert_eq!(legacy, via_public, "{st} st: the default entry must be the legacy arm");
+            let (frac, _) = psola_shift_opts(&x, sr, st, 0.0, &f0t, hop, true);
+            assert_ne!(frac, legacy, "{st} st: …and the opt-in arm must actually differ");
+        }
+    }
+
+
+    /// |mean| / RMS — an **independent** proxy for the manufactured baseline.
+    /// ⛔ Deliberately not `infrasonic_baseline`: measuring a filter with itself is the shape of a
+    /// criterion that cannot fail. On a stationary fixture the injection is essentially pure DC,
+    /// so the plain mean reads it exactly and owes nothing to the implementation.
+    /// ⚠ An earlier version of this helper used the RMS of 20 ms block means and had a **24 %
+    /// floor** on a 220 Hz fixture (a block holds a non-integer number of periods), i.e. it could
+    /// not have failed for the right reason. Kept as a note because that floor looked like a
+    /// finding for about a minute.
+    fn baseline_rms(x: &[f32], _sr: u32) -> f64 {
+        (x.iter().map(|v| f64::from(*v)).sum::<f64>() / x.len().max(1) as f64).abs()
+    }
+
+    /// A glottal-pulse-like **asymmetric** source whose every period integrates to exactly zero:
+    /// an instantaneous jump followed by an exponential decay, minus that period's own mean.
+    /// ⇒ any baseline in the OUTPUT was manufactured by the process, not carried in.
+    fn asym_pulses(sr: u32, secs: f64, period: usize) -> Vec<f32> {
+        let p = period.max(8);
+        // ⛔ Whole periods only. 44100 samples of a 200-sample period is 220.5 of them, and that
+        // half period puts a mean of 0.0014 into the FIXTURE — which is exactly the quantity the
+        // test is about, so it has to be zero by construction, not by luck.
+        let n = ((f64::from(sr) * secs) as usize / p) * p;
+        let mut cycle: Vec<f64> =
+            (0..p).map(|i| (-(i as f64) / (p as f64 * 0.15)).exp()).collect();
+        let m = cycle.iter().sum::<f64>() / p as f64;
+        for v in cycle.iter_mut() {
+            *v -= m;
+        }
+        (0..n).map(|i| cycle[i % p] as f32).collect()
+    }
+
+    fn rms(x: &[f32]) -> f64 {
+        (x.iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>() / x.len().max(1) as f64).sqrt()
+    }
+
+    /// Magnitude of a single frequency (a Goertzel-style projection), normalised by length.
+    fn tone_mag(x: &[f32], sr: u32, f: f64) -> f64 {
+        let w = 2.0 * std::f64::consts::PI * f / f64::from(sr);
+        let (mut re, mut im) = (0.0f64, 0.0f64);
+        for (i, v) in x.iter().enumerate() {
+            let p = w * i as f64;
+            re += f64::from(*v) * p.cos();
+            im += f64::from(*v) * p.sin();
+        }
+        (re * re + im * im).sqrt() / x.len() as f64
+    }
+
+    /// A pure sine — the SYMMETRIC control. Every period integrates to zero and so does every
+    /// window centred anywhere in it, so this source must NOT produce the baseline.
+    fn sine(sr: u32, secs: f64, f0: f64) -> Vec<f32> {
+        let n = (f64::from(sr) * secs) as usize;
+        (0..n)
+            .map(|i| {
+                (2.0 * std::f64::consts::PI * f0 * i as f64 / f64::from(sr)).sin() as f32
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_infrasonic_arm_is_opt_in_and_the_default_arm_is_byte_for_byte_unchanged() {
+        // S146 protocol, same as `frac_transport` / `wsola` / `phase_lock` before it: nothing the
+        // user hears moves until a blind test says so. ⚠ Both directions — a criterion that only
+        // covers the up-shift is how a −12 st arm once returned its input bit-for-bit while four
+        // rulers read "perfect" (S146).
+        let sr = 44_100;
+        let f0 = 220.0;
+        let (x, _) = pulses(sr, 1.0, |_| f0, |_| 1.0);
+        let hop = sr as usize / 200;
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+        let (mut n_inject, mut n_quiet) = (0usize, 0usize);
+        for st in [-12.0, -7.0, -1.0, 1.0, 7.0, 12.0, 14.0] {
+            let (legacy, dl) = psola_shift_locked(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30);
+            let (via_deep, dd) =
+                psola_shift_infra(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off);
+            assert_eq!(legacy, via_deep, "{st} st: the 9-arg entry must stay the legacy arm");
+            assert_eq!(dl, dd, "{st} st: …diagnostics included");
+            // ⛔ And the readout must EXIST on the arm that is off — otherwise "what does it look
+            // like today" is unanswerable without shipping the change (S147's silent-halving).
+            assert!(
+                dl.infrasonic_frac.is_finite(),
+                "{st} st: the readout must be computed unconditionally"
+            );
+            assert_eq!(dl.infrasonic_removed, 0.0, "{st} st: nothing removed while off");
+
+            let (on, don) = psola_shift_infra(
+                &x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::PerPeriod,
+            );
+            // S155 —— 「臂开着就一定做了事」**不能无条件断言**,而这不是把判据放软:
+            //   下移**根本不注入**。真素材实测(探针,同一条 donor,同一段音频):
+            //   +9 / +14 的次声份额 7.12% / 17.27%,而 −7 / −12 是 **0.00% / 0.01%**。
+            //   ⇒ 在下移上要求「必须拿掉东西」= 要求这把刀去动一个不存在的缺陷。
+            // ⇒ 判据改成与机理同形,而且**两侧都有牙**:
+            //     注入了 ⇒ 必须拿掉;没注入 ⇒ 必须是**逐位空操作**。
+            //   后半句才是贵的那条:差分式会把输入自己的低频加回输出,而低频**不被移调守恒**
+            //   (下移时输出脉冲密度减半 ⇒ 加回来的比拿掉的多)。合成夹具上实测到过
+            //   基线 0.175 → **0.335**,这条断言就是把那个失败模式钉死成红。
+            // ⛔ 判据必须用**和护栏同一个**谓词,否则中间地带必然打架(第一版在这里写了
+            //    一个 0.01 的魔法阈值,+1 st 的注入是 0.0076 ⇒ 护栏动了而判据说不该动)。
+            //    护栏是:输出那条基线的**能量**大于输入那条 ⇒ 才出手。
+            let ms = f64::from(don.infrasonic_ma_ms);
+            let e = |y: &[f32]| -> f64 {
+                infrasonic_baseline_ms(y, sr, ms).iter().map(|v| v * v).sum()
+            };
+            let (e_off, e_in) = (e(&legacy), e(&x));
+            let inj = baseline_rms(&legacy, sr) / rms(&legacy) - baseline_rms(&x, sr) / rms(&x);
+            if e_off >= e_in {
+                n_inject += 1;
+                assert_ne!(on, legacy, "{st} st: 注入了 {inj:.4} 却一个样本都没动");
+                assert!(
+                    don.infrasonic_removed > 0.0,
+                    "{st} st: the arm reports it removed nothing — 'on' and 'did something' are \
+                     different facts (removed {})",
+                    don.infrasonic_removed
+                );
+            } else {
+                n_quiet += 1;
+                assert_eq!(
+                    on, legacy,
+                    "{st} st: 没有注入(基线差 {inj:+.4})⇒ 这把刀必须**逐位**空操作"
+                );
+                assert_eq!(don.infrasonic_removed, 0.0, "{st} st: 空操作却报拿掉了东西");
+            }
+            // ⛔ 无论走哪个分支,**永不变差**:这把刀不许让基线比不开它的时候更大。
+            //    这一条覆盖上面那个二分的**中间地带**(注入很小的位移),
+            //    也是差分式在下移上唯一可能出事的方向。
+            let b_off = baseline_rms(&legacy, sr) / rms(&legacy);
+            let b_on = baseline_rms(&on, sr) / rms(&on);
+            assert!(
+                b_on <= b_off + 1e-6,
+                "{st} st: 开了这把刀之后基线**变大**了({b_off:.5} → {b_on:.5})"
+            );
+        }
+        // 一条从没被执行过的分支就是一条空判据 —— 两侧都必须真的走到过。
+        assert!(n_inject >= 2, "没有一个位移触发注入分支 ⇒ 上面那半条判据是空的");
+        assert!(n_quiet >= 2, "没有一个位移触发空操作分支 ⇒ 护栏那半条判据是空的");
+    }
+
+    /// S154 — the envelope-restoration arm: opt-in, readout unconditional, and it must do something.
+    ///
+    /// ⚠ The material matters here. A constant-amplitude pulse train has no envelope to violate,
+    /// so it would let a no-op arm pass; this fixture **ramps the amplitude** the way an attack
+    /// does, which is where the violation actually lives.
+    #[test]
+    fn the_envelope_arm_is_opt_in_and_the_readout_exists_while_it_is_off() {
+        let sr = 44_100;
+        let f0 = 220.0;
+        // A 40 ms attack ramp into a steady body — the shape the defect lives on.
+        // `gain` is indexed by PULSE, not by time: at 220 Hz the first 9 pulses are ~40 ms.
+        let (x, _) = pulses(sr, 1.0, |_| f0, |k| {
+            if k < 9 {
+                0.25 + 0.75 * (k as f64) / 9.0
+            } else {
+                1.0
+            }
+        });
+        let hop = sr as usize / 200;
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+        for st in [-12.0, -7.0, 1.0, 7.0, 14.0] {
+            let (off, doff) =
+                psola_shift_infra(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off);
+            let (via, dvia) =
+                psola_shift_env(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0, 0.0, 0.0, 0);
+            assert_eq!(off, via, "{st} st: env_restore_ms = 0 must be the legacy arm");
+            assert_eq!(doff, dvia, "{st} st: …diagnostics included");
+            // ⛔ The readout has to exist while the arm is OFF, or "what does it look like today"
+            // cannot be answered without shipping the change (S147's silent halving).
+            assert!(
+                doff.env_dev_p50_db.is_finite(),
+                "{st} st: the readout must be computed unconditionally"
+            );
+            assert_eq!(doff.env_dev_after_db, 0.0, "{st} st: nothing restored while off");
+
+            let (on, don) =
+                psola_shift_env(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 5.0, 0.0, 0.0, 0.0, 0);
+            assert_ne!(on, off, "{st} st: the opt-in arm must actually change the audio");
+            // ⛔ What this arm promises is **the slow part**: the step at an island start. It does
+            // not promise to shrink a 5 ms median that is already down in the period-scale noise,
+            // and it must not be allowed to pretend otherwise — so the contract is split in two:
+            //   · where there is a real violation to fix (≥ 1 dB), it has to fall;
+            //   · everywhere else it may not make things meaningfully worse.
+            // ⚠ The second half is the one that caught a real defect: the first implementation
+            // (raw per-sample gain, one pass) turned 0.37 dB into 1.05 dB at +1 st.
+            if don.env_dev_p50_db >= 1.0 {
+                assert!(
+                    don.env_dev_after_db < don.env_dev_p50_db,
+                    "{st} st: the arm did not reduce a real violation ({} -> {})",
+                    don.env_dev_p50_db,
+                    don.env_dev_after_db
+                );
+            }
+            assert!(
+                don.env_dev_after_db <= don.env_dev_p50_db + 0.05,
+                "{st} st: the arm made the deviation WORSE ({} -> {})",
+                don.env_dev_p50_db,
+                don.env_dev_after_db
+            );
+            eprintln!(
+                "  [envfix] {st:+5} st: env dev {:.3} -> {:.3} dB",
+                don.env_dev_p50_db, don.env_dev_after_db
+            );
+        }
+    }
+
+    /// S154 — the unvoiced-bridge arm: opt-in, and when on it must actually shrink the un-shifted
+    /// leak at the island edges (which is the whole point of it).
+    ///
+    /// ⚠ The fixture has to have an **unvoiced gap inside a note**, because that gap is the defect.
+    /// A fully-voiced fixture would let a no-op pass.
+    #[test]
+    fn the_unvoiced_bridge_is_opt_in_and_closes_the_gap_it_exists_for() {
+        let sr = 44_100;
+        let hop = sr as usize / 200;
+        let f0 = 220.0;
+        let (x, _) = pulses(sr, 1.0, |_| f0, |_| 1.0);
+        // Voiced, then a 40 ms unvoiced gap in the middle, then voiced again — one note with a
+        // consonant in it, which is exactly the shape the fed f0 has on a rescued 「と」.
+        let mut f0t = flat_f0(x.len(), hop, f0 as f32);
+        let g0 = f0t.len() * 4 / 10;
+        let g1 = (g0 + ((0.040 * f64::from(sr)) as usize / hop).max(1)).min(f0t.len());
+        for v in f0t.iter_mut().take(g1).skip(g0) {
+            *v = 0.0;
+        }
+        let islands_of = |t: &[f32]| {
+            voiced_islands(t, hop, x.len(), (MIN_ISLAND_SECONDS * f64::from(sr)) as usize).len()
+        };
+        assert_eq!(islands_of(&f0t), 2, "fixture must actually have two islands");
+
+        let (off, _) = psola_shift_infra(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off);
+        let (via, _) =
+            psola_shift_env(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0, 0.0, 0.0, 0);
+        assert_eq!(off, via, "bridge_unvoiced_ms = 0 must be the legacy arm");
+
+        // ⛔⛔ **The island count must survive ANY width.** This is the guard the goose regression
+        // forced: without it a 30 ms dilation collapsed that score 458 islands → 143, i.e. it was
+        // fusing neighbouring notes into one rescue. Covering a note's own onset is the job;
+        // merging notes is not, and no knob setting may turn one into the other.
+        for ms in [5.0, 25.0, 60.0, 200.0, 500.0] {
+            let d = bridge_unvoiced(&f0t, hop, sr, ms, None);
+            assert_eq!(islands_of(&d), 2, "{ms} ms dilation merged the islands");
+        }
+        // …and it still has to actually cover something: the frames just outside each run.
+        let d = bridge_unvoiced(&f0t, hop, sr, 25.0, None);
+        assert!(d[g0] > 0.0, "the frame right after the first run must be covered");
+        assert!(d[g1 - 1] > 0.0, "…and the one right before the second run");
+        assert!(d[(g0 + g1) / 2] == 0.0, "…while the middle of the gap stays a gap");
+        // ⛔ Never invent pitch outside the note: leading / trailing runs stay zero.
+        assert_eq!(d[0], f0t[0]);
+        assert_eq!(d[d.len() - 1], f0t[f0t.len() - 1]);
+
+        let (on, _) =
+            psola_shift_env(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 80.0, 0.0, 0.0, 0);
+        assert_ne!(on, off, "the opt-in arm must actually change the audio");
+        // ⚠ Not asserting `off == x` at the gap edge: the previous island's last grains reach a
+        // little past its last mark, so the very edge is already synthesized even with the arm off.
+        // What the arm promises is that the gap's **edge** now gets grains and its **middle** does
+        // not — the second half is the never-merge guard, and it is the one worth pinning.
+        let e0 = g0 * hop;
+        let e1 = (e0 + 8 * hop).min(x.len());
+        assert!(on[e0..e1] != off[e0..e1], "the gap edge must have been covered");
+        // ⚠ NOT asserting the middle of the gap is bit-untouched: both islands are longer now, so
+        // their outermost grains and the dry-fill ramp reach further in. The never-merge guarantee
+        // is about the **island count** (asserted above over five widths), not about audio bytes
+        // in the middle of a gap — claiming the latter would be a criterion the design never made.
+    }
+
+    /// S154 — ⛔ the cheapest non-self-certifying gate on this whole line, applied to the new arm.
+    ///
+    /// At ratio 1.0 the target pulses ARE the source marks, so the output equals the input and the
+    /// two envelopes are identical ⇒ every corrective gain is exactly 1.0. If this ever fails, the
+    /// restoration is reaching outside the covered span or the envelope is being computed on
+    /// different buffers than it claims.
+
+    /// ⛔ S163 §40 —— `valley = None`（= 出厂关）**逐位同旧**。
+    /// 这是这一刀唯一的免责声明：不开就什么都没变。
+    #[test]
+    fn bridge_valley_off_is_byte_for_byte_the_fixed_width_arm() {
+        let (sr, hop) = (44_100u32, 441usize); // 10 ms
+        // 浊 8 帧 → 缺口 20 帧 → 浊 8 帧
+        let mut f0 = vec![220.0f32; 8];
+        f0.extend(std::iter::repeat(0.0).take(20));
+        f0.extend(std::iter::repeat(196.0).take(8));
+        let n = f0.len() * hop;
+        // 缺口里放一个明显的能量谷（第 22 帧），若 valley 起作用会挪边界
+        let x: Vec<f32> = (0..n)
+            .map(|i| {
+                let fr = i / hop;
+                if (8..28).contains(&fr) && fr != 22 { 0.20 } else if fr == 22 { 0.000_01 } else { 0.5 }
+            })
+            .collect();
+        let off = bridge_unvoiced(&f0, hop, sr, 120.0, None);
+        let off2 = bridge_unvoiced(&f0, hop, sr, 120.0, None);
+        assert_eq!(off, off2, "同样输入两次结果必须相同");
+        let on = bridge_unvoiced(&f0, hop, sr, 120.0, Some(&x));
+        assert_ne!(on, off, "谷摆在那里，开着却什么都没改 —— 这条判据是空的");
+    }
+
+    /// ⛔⛔ S163 §40 —— **只收窄，永不放宽**。
+    /// 谷只在 `[.., ext]` 之内找 ⇒ 开着时被填成浊音的帧必须是关着时的**子集**。
+    /// 这条撑着「S160j 那条耳判拍板的音头覆盖不会被这一刀弄丢」——
+    /// 覆盖只会更小，而更小的那部分是从**能量谷**那一侧退回来的。
+    #[test]
+    fn bridge_valley_only_narrows_never_widens() {
+        let (sr, hop) = (44_100u32, 441usize);
+        for gap in [6usize, 12, 20, 40] {
+            for seed in 0..6u32 {
+                let mut f0 = vec![220.0f32; 6];
+                f0.extend(std::iter::repeat(0.0).take(gap));
+                f0.extend(std::iter::repeat(196.0).take(6));
+                let n = f0.len() * hop;
+                // 伪随机能量剖面，谷的位置随 seed 变
+                let x: Vec<f32> = (0..n)
+                    .map(|i| {
+                        let fr = (i / hop) as u32;
+                        let v = ((fr.wrapping_mul(2_654_435_761).wrapping_add(seed)) >> 8) % 1000;
+                        0.001 + v as f32 / 1000.0
+                    })
+                    .collect();
+                let off = bridge_unvoiced(&f0, hop, sr, 120.0, None);
+                let on = bridge_unvoiced(&f0, hop, sr, 120.0, Some(&x));
+                for (k, (a, b)) in on.iter().zip(off.iter()).enumerate() {
+                    if *a > 0.0 {
+                        assert!(
+                            *b > 0.0,
+                            "gap={gap} seed={seed} 帧 {k}: 开着填了浊音而关着没填 —— 放宽了覆盖"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// ⭐ S163 §40 —— 边界**真的落在能量最低的那一帧上**。
+    /// 若只是「随便挪一下」，这一刀就没有解释力：竖线富集在岛边界（p50 45 ms vs 随机 158），
+    /// 靠的正是把边界挪到**听不见的地方**。
+    #[test]
+    fn bridge_valley_puts_the_island_edge_on_the_quietest_frame() {
+        let (sr, hop) = (44_100u32, 441usize);
+        let quiet = 20usize; // 缺口 [6,26) 内的谷
+        let mut f0 = vec![220.0f32; 6];
+        f0.extend(std::iter::repeat(0.0).take(20));
+        f0.extend(std::iter::repeat(196.0).take(6));
+        let n = f0.len() * hop;
+        let x: Vec<f32> = (0..n)
+            .map(|i| if i / hop == quiet { 0.000_01 } else { 0.30 })
+            .collect();
+        let on = bridge_unvoiced(&f0, hop, sr, 120.0, Some(&x));
+        // 右侧膨胀区是 `(j_r, b)`，j_r 应当就是那一帧 ⇒ 它本身不浊、它右边一帧浊。
+        assert!(!(on[quiet] > 0.0), "谷那一帧被填成了浊音 —— 边界没落在谷上");
+        assert!(on[quiet + 1] > 0.0, "谷右边一帧没被填 —— 右侧膨胀没有停在谷上");
+        // 阴性对照：同样的 f0，没有音频 ⇒ 固定宽度，谷那一帧应当**被填**（ext=12 帧 ≥ 6）
+        let off = bridge_unvoiced(&f0, hop, sr, 120.0, None);
+        assert!(off[quiet] > 0.0, "固定宽度那一版本来就没填到谷 —— 这个夹具证不了东西");
+    }
+
+    #[test]
+    fn ratio_one_stays_the_identity_with_the_envelope_arm_on() {
+        let sr = 44_100;
+        let hop = sr as usize / 200;
+        for f0 in [110.0, 220.0, 440.0] {
+            let (x, _) = pulses(sr, 0.5, |_| f0, |k| if k < 10 { 0.3 } else { 1.0 });
+            let f0t = flat_f0(x.len(), hop, f0 as f32);
+            for ms in [2.0, 5.0, 20.0] {
+                let (y, _d) =
+                    psola_shift_env(&x, sr, 0.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, ms, 0.0, 0.0, 0.0, 0);
+                assert_eq!(y, x, "f0 {f0}, envfix {ms} ms: ratio 1.0 must be the identity");
+            }
+        }
+    }
+
+    /// S154 — the restoration may not reach **outside** the voiced islands.
+    ///
+    /// That boundary is exactly where the defect lives, so a fix that moved it would be trading one
+    /// discontinuity for another. Unvoiced stretches pass through untouched in the legacy arm; they
+    /// must still pass through untouched with the arm on.
+    #[test]
+    fn the_envelope_arm_never_touches_the_unvoiced_pass_through() {
+        let sr = 44_100;
+        let hop = sr as usize / 200;
+        let f0 = 220.0;
+        let (x, _) = pulses(sr, 1.2, |_| f0, |_| 1.0);
+        // Voiced only in the middle third; the two ends are pass-through.
+        let mut f0t = flat_f0(x.len(), hop, f0 as f32);
+        let n = f0t.len();
+        for v in f0t.iter_mut().take(n / 3) {
+            *v = 0.0;
+        }
+        for v in f0t.iter_mut().skip(2 * n / 3) {
+            *v = 0.0;
+        }
+        let (off, _) = psola_shift_infra(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off);
+        let (on, _) = psola_shift_env(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 5.0, 0.0, 0.0, 0.0, 0);
+        // The first and last eighth are comfortably inside the unvoiced pass-through.
+        let e = x.len() / 8;
+        assert_eq!(off[..e], on[..e], "the arm reached into the leading pass-through");
+        assert_eq!(off[x.len() - e..], on[x.len() - e..], "…into the trailing pass-through");
+        assert_ne!(off, on, "…and it still has to have done something in the middle");
+    }
+
+    #[test]
+    fn the_manufactured_baseline_is_the_narrowed_grain_window_s_own_mean() {
+        // ⭐ The mechanism, on synthetic material where the answer is computable in closed form.
+        //
+        // ⛔ This test started life asserting something ELSE — "it needs an asymmetric pulse, a
+        // symmetric source produces none" — and killed it on the first run: a plain sine at the
+        // same ratio injects **more** (0.195 vs 0.104). Asymmetry is not the variable. What is:
+        // on an up-shift both half-widths collapse to `T_src / ratio` (`:1027-1028` takes the
+        // min of target and source spacing), so every grain reads a window **narrower than one
+        // period, centred on the mark** — and the marks are phase-locked onto the energy peaks.
+        // The bell-weighted mean of a sub-period window centred on a peak is not zero, `wsum ≈ 1`
+        // lays that same mean down under every grain, and the result is a baseline. Symmetric or
+        // not is irrelevant; being centred on a peak is the whole of it.
+        let sr = 44_100;
+        let period = 200usize; // 220.5 Hz — an integer period so "zero mean per period" is exact
+        let f0 = f64::from(sr) / period as f64;
+        let hop = sr as usize / 200;
+        let asym = asym_pulses(sr, 1.0, period);
+        let sym: Vec<f32> = sine(sr, 1.0, f0)[..asym.len()].to_vec();
+        let f0t = flat_f0(asym.len(), hop, f0 as f32);
+
+        // Ratio 1.0 is the identity ⇒ the window IS a whole period ⇒ nothing added.
+        let (id, _) = psola_shift_locked(&asym, sr, 0.0, 0.0, &f0t, hop, false, 0.0, 0.30);
+        assert_eq!(id, asym, "ratio 1.0 must still be the identity");
+        let src_ratio = baseline_rms(&asym, sr) / rms(&asym);
+        assert!(
+            src_ratio < 1e-5,
+            "the fixture itself carries a baseline ({src_ratio:.7}) — then nothing below can be              attributed to the process"
+        );
+
+        for (name, x, peak) in [("asym", &asym, 0usize), ("sine", &sym, period / 4)] {
+            let mut last = 0.0f64;
+            for st in [4.0f64, 8.0, 12.0, 16.0] {
+                let (out, diag) = psola_shift_locked(x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30);
+                let got = baseline_rms(&out, sr) / rms(&out);
+                assert!(
+                    got > last,
+                    "{name} +{st} st: the injection must grow with the ratio ({last:.5} → {got:.5})"
+                );
+                last = got;
+                assert!(
+                    diag.infrasonic_frac > 0.001,
+                    "{name} +{st} st: the readout should see it (read {})",
+                    diag.infrasonic_frac
+                );
+
+                // ⭐ THE mechanism gate: predict the baseline from the narrowed window alone.
+                // Half-width `T_src / ratio`, Hann rise on the left of the mark and Hann fall on
+                // the right — exactly `add_bell`'s window — over the source centred on the peak.
+                let half = period as f64 / 2f64.powf(st / 12.0);
+                let h = half.round() as isize;
+                let (mut num, mut den) = (0.0f64, 0.0f64);
+                for j in -h..h {
+                    let len = half;
+                    let ph = ((if j < 0 { j + h } else { j } as f64) + 0.5) / len
+                        * std::f64::consts::PI;
+                    let w = if j < 0 { 0.5 * (1.0 - ph.cos()) } else { 0.5 * (1.0 + ph.cos()) };
+                    let idx = (peak as isize + j).rem_euclid(period as isize) as usize;
+                    num += f64::from(x[idx]) * w;
+                    den += w;
+                }
+                let want = (num / den).abs() / rms(x);
+                assert!(
+                    (got / want.max(1e-9)).max(want.max(1e-9) / got) < 3.0,
+                    "{name} +{st} st: measured baseline {got:.5} vs the grain window's own mean                      {want:.5} — off by more than 3× means the cause is NOT the narrowed window                      and the note on `infrasonic_frac` is wrong"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_cut_is_wide_enough_to_reach_the_audible_part_of_what_this_process_injects() {
+        // ⛔⛔ THE criterion for the constant itself. Without it, widening 8 ms back to 20 ms
+        // leaves this whole file green while the benefit halves — measured, and it is the exact
+        // shape S147 shipped once ("silent halving").
+        //
+        // What it pins: the injection is **not** confined to the inaudible band. Whole-song
+        // measurement against the donor's own pre-PSOLA arm (the only reference that is the same
+        // performance minus this process) says 20-60 Hz runs **+13.2 / +14.5 / +14.7 dB** at
+        // −9 / −12 / −14 st, and the cut has to reach it: 20 ms leaves +10.8/+12.2/+12.3,
+        // 8 ms leaves **+0.6/+2.0/+2.2**.
+        // ⚠ The synthetic fixture here is not the song — the numbers differ — so what is asserted
+        // is the ORDERING and a floor, not the song's dB values.
+        let sr = 44_100;
+        let period = 200usize;
+        let f0 = f64::from(sr) / period as f64;
+        let hop = sr as usize / 200;
+        let x = asym_pulses(sr, 1.0, period);
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+        // Energy in 20-60 Hz, sampled analytically so no filter of our own is involved.
+        let low = |y: &[f32]| -> f64 {
+            [25.0f64, 35.0, 45.0, 55.0].iter().map(|f| tone_mag(y, sr, *f).powi(2)).sum::<f64>()
+        };
+        let (out, _) = psola_shift_locked(&x, sr, 12.0, 0.0, &f0t, hop, false, 0.0, 0.30);
+        let injected = low(&out);
+        assert!(
+            injected > low(&x) * 10.0,   // 实测 25×
+            "the fixture must actually show the injection first ({:.3e} vs {:.3e})",
+            injected,
+            low(&x)
+        );
+        let after = |ms: f64| -> f64 {
+            let lf = infrasonic_baseline_ms(&out, sr, ms);
+            let y: Vec<f32> =
+                out.iter().zip(&lf).map(|(o, l)| (f64::from(*o) - *l) as f32).collect();
+            low(&y)
+        };
+        let cur = after(INFRASONIC_MA_MS);
+        let wide = after(20.0);
+        assert!(
+            cur < injected * 0.10,
+            "the shipped cut must take out ≥90 % of the 20-60 Hz injection, got {:.1} %",
+            100.0 * cur / injected
+        );
+        assert!(
+            wide > cur * 3.0,
+            "…and a 20 ms cut must NOT (it reaches only the inaudible half): 20 ms leaves              {:.1} % vs the shipped {:.1} % — if these are close the constant is unpinned",
+            100.0 * wide / injected,
+            100.0 * cur / injected
+        );
+        // ⚠ and the other side: it must not be so narrow that it eats the voice. Checked at
+        // **882 Hz** (the 2nd harmonic here), i.e. inside production's real output-f0 band of
+        // 830-1480 Hz. ⛔ Not at 441 Hz: the triangular window's response is oscillatory and
+        // still costs 0.07 dB there — that is the documented, analytic behaviour (the other gate
+        // asserts it exactly), not a defect, and pinning zero at 441 would force the cut back to
+        // a width that only reaches the inaudible half.
+        let lf = infrasonic_baseline_ms(&out, sr, INFRASONIC_MA_MS);
+        let y: Vec<f32> = out.iter().zip(&lf).map(|(o, l)| (f64::from(*o) - *l) as f32).collect();
+        let fp = f0 * 2f64.powf(12.0 / 12.0) * 2.0;
+        let d =
+            20.0 * (tone_mag(&y, sr, fp).max(1e-12) / tone_mag(&out, sr, fp).max(1e-12)).log10();
+        assert!(d.abs() < 0.03, "{fp:.0} Hz (production's band) moved {d:+.3} dB");
+    }
+
+    #[test]
+    fn the_infrasonic_arm_removes_the_baseline_without_touching_the_fundamental() {
+        // The honest gate for the arm being ON: a bound on **where it is allowed to act** —
+        // below the fundamental and nowhere else.
+        // ⚠ S155 rewrote the first assertion. It used to read "the baseline should be mostly
+        // gone", which silently assumed the input had none of its own. The differential form's
+        // real contract is **"bring the output's baseline down to the input's, and never below
+        // it"** — strictly stronger, because it also fails when the arm OVER-removes, and
+        // over-removing is the same action that costs ratio 1.0 its bit-exact identity.
+        let sr = 44_100;
+        let f0 = 220.0;
+        let hop = sr as usize / 200;
+        let (x, _) = pulses(sr, 1.0, |_| f0, |_| 1.0);
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+        for st in [-12.0f64, -7.0, 7.0, 12.0, 14.0] {
+            let (off, doff) = psola_shift_locked(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30);
+            let (on, don) = psola_shift_infra(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::PerPeriod);
+
+            let b_off = baseline_rms(&off, sr) / rms(&off);
+            let b_on = baseline_rms(&on, sr) / rms(&on);
+            let b_in = baseline_rms(&x, sr) / rms(&x);
+            if b_off > b_in + 0.01 {
+                assert!(
+                    b_on < b_in + (b_off - b_in) * 0.25,
+                    "{st} st: 注入的基线没被拿掉(输入 {b_in:.5} · 关 {b_off:.5} → 开 {b_on:.5})"
+                );
+            }
+            // 另一侧,而且这一侧是差分式**特有**的:不许把基线压到**输入自己**之下。
+            // 非差分式会(它减的是输出自己的低频)—— 而那正是「ratio 1.0 不再是恒等变换」
+            // 的同一个动作,这条线上最便宜的那道判据就是被它顶掉的。
+            assert!(
+                b_on >= b_in * 0.5 || b_in < 1e-4,
+                "{st} st: 基线被压到输入自己之下(输入 {b_in:.5} → 开 {b_on:.5})—— \
+                 那说明它在减输出自己的低频,不是减这道工序多出来的那部分"
+            );
+            assert!(
+                don.infrasonic_frac <= doff.infrasonic_frac + 1e-6,
+                "{st} st: the BEFORE readout must not depend on the arm"
+            );
+
+            // ⛔⛔ THE bound, and it is **not** "the fundamental does not move". An earlier
+            // version asserted exactly that, and it became a lie the moment the cut went from
+            // 20 ms to 8 ms: at an output f0 of 110 Hz (a −12 st arm on this 220 Hz fixture) the
+            // fundamental really does drop 0.18 dB. Asserting zero there would have pinned the
+            // constant to a value that only fixes the half nobody can hear.
+            // ⇒ what is asserted instead: the arm **is exactly the filter it documents** (two box
+            // passes = a triangular window, analytic), plus a hard zero-cost bound over the band
+            // production actually lives in.
+            let out_f0 = f0 * 2f64.powf(st / 12.0);
+            // S155 —— 宽度现在是**自适应**的 ⇒ 这里必须读诊断里报出来的那个值。
+            // 顺带这就成了 `infrasonic_ma_ms` 自己的判据:报了个假数,下面的解析对拍就红。
+            let used_ms = f64::from(don.infrasonic_ma_ms);
+            assert!(used_ms > 0.0, "{st} st: 臂开着却没报出宽度");
+            // ⛔ 只有**真的出手了**才去对拍解析响应。护栏(`e_out >= e_in`)在没有注入的位移上
+            //    会让这把刀整个跳过 ⇒ 那时输出必须**逐位**同关掉时,而不是「符合某条滤波器曲线」。
+            //    第一版没分这两种情况,于是在 −7 st 上拿一条**根本没运行**的滤波器的预测去比 0.000。
+            if on == off {
+                assert_eq!(don.infrasonic_removed, 0.0, "{st} st: 空操作却报拿掉了东西");
+                continue;
+            }
+            let half = (((f64::from(sr) * used_ms / 1000.0) as usize) / 2).max(1);
+            let l = (2 * half + 1) as f64;
+            for h in [1.0f64, 2.0, 3.0] {
+                let f = out_f0 * h;
+                if f >= f64::from(sr) / 2.0 {
+                    continue;
+                }
+                let (a, b) = (tone_mag(&off, sr, f), tone_mag(&on, sr, f));
+                let d = 20.0 * (b.max(1e-12) / a.max(1e-12)).log10();
+                // Dirichlet kernel of one box, raised to the number of passes the CUT uses;
+                // high-pass = 1 - D^K. ⚠ S155 笔5 把 K 从 2 改成 4(见
+                // `infrasonic_baseline_passes`),而这一行是唯一把「这条臂到底是不是它文档里
+                // 那条滤波器」钉住的地方 —— 它当场红了,拦得对。
+                let ph = std::f64::consts::PI * f / f64::from(sr);
+                let dk = if ph.abs() < 1e-12 { 1.0 } else { (ph * l).sin() / (l * ph.sin()) };
+                let want =
+                    20.0 * (1.0 - dk.powi(CUT_BOX_PASSES as i32)).abs().max(1e-12).log10();
+                assert!(
+                    (d - want).abs() < 0.10,
+                    "{st} st: {f:.0} Hz moved {d:+.3} dB but the {CUT_BOX_PASSES}-pass box \
+                     predicts {want:+.3} — then this arm is not the filter it documents"
+                );
+                // …and over the band production actually uses, the cost must be nil.
+                // ⚠ 800 Hz, not 250: the triangular window's response is oscillatory, and at
+                // 330 Hz it still costs 0.10 dB (matching the analytic value above — the filter
+                // is fine, the threshold was wrong). Production's output f0 is 830-1480 Hz.
+                if f >= 800.0 {
+                    // ⚠ S155 —— 这个上界从 0.03 放到 **0.12**,而理由不是「让它变绿」:
+                    //   宽度现在是自适应的,这个夹具 f0 = 220 Hz ⇒ 宽 4.5 ms ⇒ 989 Hz 落在
+                    //   三角窗响应的第 4-5 个旁瓣上,**解析值本来就是 −0.04 dB** —— 上面那条
+                    //   ±0.10 的解析对拍已经把单点量级钉死了,这里管的只是上界。
+                    //   依据:S148 的可闻性标定是「~2.7 dB 听得出 / ≤0.46 dB 听不出」
+                    //   ⇒ 0.12 dB 仍有近 4 倍余量。
+                    // ⛔ 单点上界不是这里该看的东西 —— 真正该看的是**生产口径**下整条输出
+                    //   基频带的平均代价,那条判据单独写在下面。
+                    assert!(
+                        d.abs() < 0.12,
+                        "{st} st: {f:.0} Hz moved {d:+.3} dB — 超过了这把刀允许的上界"
+                    );
+                }
+            }
+        }
+    }
+
+    /// S155 —— **生产口径**下这把刀的代价:整条输出基频带的平均,而不是某一个点。
+    ///
+    /// ⛔ 为什么单开一条:上一条用的夹具是 f0 = 220 Hz,而生产里 donor 的基频是 **350-880 Hz**
+    /// (探针实测 p05/p50/p95 = 370/559/877 · 234/381/740 · 349/440/659)。自适应宽度
+    /// = 一个源周期 ⇒ 生产是 2.7-4.3 ms,夹具是 4.5 ms —— **不是同一条滤波器**,拿夹具上的
+    /// 单点读数去论证生产的代价是一次口径偷换。
+    ///
+    /// 判据:输出基频带 830-1480 Hz 上逐 50 Hz 取点,**平均** |Δ| < 0.05 dB、**最大** < 0.15 dB。
+    /// (探针整曲实测,差分式 3 ms:三条臂的带内代价 0.006 / 0.040 / 0.001 dB。)
+    #[test]
+    fn the_infrasonic_arm_costs_nothing_over_productions_output_band() {
+        let sr = 44_100;
+        let f0 = 400.0; // donor 的量级,不是 220
+        let hop = sr as usize / 200;
+        let (x, _) = pulses(sr, 1.0, |_| f0, |_| 1.0);
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+        for st in [9.0f64, 12.0, 14.0] {
+            let (off, _) = psola_shift_locked(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30);
+            let (on, don) = psola_shift_infra(
+                &x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::PerPeriod,
+            );
+            assert!(
+                (f64::from(don.infrasonic_ma_ms) - 1000.0 / f0).abs() < 0.05,
+                "{st} st: 宽度应当是一个源周期 {:.2} ms,报的是 {} ms",
+                1000.0 / f0,
+                don.infrasonic_ma_ms
+            );
+            // The frequencies have to be the output's OWN harmonics. The first version of this
+            // swept 830..1480 in 50 Hz steps on a 400 Hz pulse train, i.e. it read `tone_mag` at
+            // frequencies where the fixture has no energy at all — the ratio of two leakage
+            // floors, which is not a cost. Same family as every other ruler on this line that
+            // kept reading past the point where it still meant something.
+            let out_f0 = f0 * 2f64.powf(st / 12.0);
+            let (mut acc, mut worst, mut k) = (0.0f64, 0.0f64, 0usize);
+            for h in 1..=24u32 {
+                let f = out_f0 * f64::from(h);
+                if f < 800.0 || f > f64::from(sr) * 0.4 {
+                    continue;
+                }
+                let (a, b) = (tone_mag(&off, sr, f), tone_mag(&on, sr, f));
+                let d = 20.0 * (b.max(1e-12) / a.max(1e-12)).log10();
+                acc += d.abs();
+                worst = worst.max(d.abs());
+                k += 1;
+            }
+            assert!(k >= 8, "{st} st: 只找到 {k} 个谐波点 —— 判据太薄");
+            let mean = acc / k as f64;
+            assert!(
+                mean < 0.05 && worst < 0.15,
+                "{st} st: 生产带内代价 平均 {mean:.4} dB / 最大 {worst:.4} dB(n={k})"
+            );
+        }
+    }
+
+    #[test]
+    fn the_interpolator_reproduces_a_known_signal_between_samples() {
+        // ⛔ THE gate that stops `sinc_read` being quietly swapped for linear interpolation —
+        // which S146g specifically warned about, because linear reads BETTER on the HNR ruler
+        // purely by low-passing (+0.43…+2.23 dB, and a pure-low-pass control gets +0.40 on its
+        // own). Ground truth is analytic, so no ruler and no taste is involved.
+        let sr = 44_100u32;
+        for fq in [1000.0f64, 5000.0, 8000.0] {
+            let x: Vec<f32> = (0..4096)
+                .map(|i| (2.0 * std::f64::consts::PI * fq * f64::from(i) / f64::from(sr)).sin() as f32)
+                .collect();
+            let mut worst = 0.0f64;
+            for i in 100..3900 {
+                for f in [0.25, 0.5, 0.75] {
+                    let want =
+                        (2.0 * std::f64::consts::PI * fq * (f64::from(i) + f) / f64::from(sr)).sin();
+                    worst = worst.max((sinc_read(&x, f64::from(i) + f) - want).abs());
+                }
+            }
+            // Measured 1.1e-5 (1k) · 1.0e-5 (5k) · 3.1e-5 (8k). Linear interpolation at 8 kHz is
+            // off by ~1e-1 — three to four orders of magnitude, so this bound is not delicate.
+            assert!(worst < 1e-3, "{fq} Hz: interpolation error {worst:.6} is not band-limited");
+        }
+    }
+
+    #[test]
+    fn the_grain_is_actually_read_at_the_fractional_position() {
+        // ⛔⛔ The wiring gate. Without it, `si = i as f64` (residual computed, interpolator
+        // present, and simply not used) stays GREEN on every other criterion here — measured:
+        // the output still differs from the legacy arm, because `d` changes too. "Different"
+        // is not "correct", and this is the shape that mutation exposed.
+        //
+        // One bell maps each source index to exactly one output index, so `acc/wsum` at a covered
+        // output sample IS the value that was read for it — comparable against ground truth.
+        let x: Vec<f32> = (0..600)
+            .map(|i| (f64::from(i) * 0.037).sin() as f32 * 0.5 + (f64::from(i) * 0.31).cos() as f32 * 0.2)
+            .collect();
+        let (s_pos, t_pos) = (300.0f64, 300.5f64);
+        let delta = t_pos - s_pos;
+
+        for frac_transport in [false, true] {
+            let mut acc = vec![0.0f64; x.len()];
+            let mut wsum = vec![0.0f64; x.len()];
+            let mut res = ResidualStat::default();
+            add_bell(
+                &x, &mut acc, &mut wsum, s_pos, t_pos, 12.0, 12.0, 1.0, frac_transport, 1.0,
+                &mut res,
+            );
+
+            let ti = 305usize; // inside the bell, away from its zero-weight edges
+            assert!(wsum[ti] > 1e-3, "the probe index must be covered");
+            let got = acc[ti] / wsum[ti];
+            if frac_transport {
+                let want = sinc_read(&x, f64::from(ti as u32) - delta);
+                assert!(
+                    (got - want).abs() < 1e-9,
+                    "carrying arm must read the source at {} — got {got}, want {want}",
+                    f64::from(ti as u32) - delta
+                );
+                // …and that read must NOT be the whole-sample one, or the arm does nothing.
+                assert!(
+                    (got - f64::from(x[ti - 1])).abs() > 1e-6,
+                    "the fractional offset was computed and then ignored"
+                );
+            } else {
+                assert!(
+                    (got - f64::from(x[ti - 1])).abs() < 1e-9,
+                    "legacy arm must read whole samples — got {got}"
+                );
+            }
+        }
+    }
+
+    /// A pulse train with a controllable per-pulse gain: pulse `i` gets `gain(i)`.
+    /// ⛔ Deliberately NOT the `voiced()` fixture — that one is a sum of cosines whose marks are
+    /// already on the pulses, so it cannot express "the mark is off the pulse", which is the whole
+    /// subject here. Ground truth (where the pulses are) is by construction.
+    /// `f0(k)` lets the period MOVE inside the island — a constant-period fixture cannot tell a
+    /// local radius from an island-wide one, and a mutation swapping them then goes green.
+    fn pulses(
+        sr: u32,
+        secs: f64,
+        f0: impl Fn(usize) -> f64,
+        gain: impl Fn(usize) -> f64,
+    ) -> (Vec<f32>, Vec<f64>) {
+        let n = (f64::from(sr) * secs) as usize;
+        let mut y = vec![0.0f32; n];
+        let mut at = Vec::new();
+        let mut c = f64::from(sr) / f0(0) * 0.5;
+        let mut k = 0usize;
+        loop {
+            let p = f64::from(sr) / f0(k);
+            if c as usize + 2 * p as usize >= n {
+                break;
+            }
+            at.push(c);
+            let g = gain(k);
+            // A damped ring evaluated at the FRACTIONAL distance from the pulse, so the true peak
+            // sits between samples. ⛔ An integer-aligned fixture makes the sub-sample refinement
+            // invisible (mutation ⑤ went green on one).
+            for i in 0..(p * 0.9) as usize {
+                let idx = c as usize + i;
+                let t = idx as f64 - c;
+                if t < 0.0 || idx >= n {
+                    continue;
+                }
+                let v = g * (-t / (p * 0.12)).exp() * (2.0 * std::f64::consts::PI * 3.5 * t / p).sin();
+                y[idx] += v as f32;
+            }
+            c += p;
+            k += 1;
+        }
+        (y, at)
+    }
+
+    #[test]
+    fn the_phase_lock_pulls_marks_onto_the_pulses_and_keeps_every_one() {
+        // ⭐ THE criterion for S150. The defect it fixes is not "the period is wrong" (ours is
+        // right: spacing median 120.00 against praat's 119.75) but "the marks sit at the wrong
+        // PHASE inside the period" (measured scatter ±0.42 of a period, landing energy 2.3-4.4 dB
+        // below praat's). So the assertion has to be about phase, against ground truth.
+        let sr = 44_100u32;
+        let (x, truth) = pulses(sr, 0.5, |_| 300.0, |_| 1.0);
+        let p = f64::from(sr) / 300.0;
+
+        // Marks with the right PERIOD and a drifting PHASE — exactly the shape the correlation
+        // walk produces (it steps by one period and never re-anchors).
+        // ⚠ The drift RATE is the measured one, not a round number: the walk's per-step phase error
+        // is **0.0024 of a period** (median), which is why the accumulated error reaches half a
+        // period only after hundreds of steps. That number is load-bearing here, because a
+        // first-order loop has a steady-state lag of drift/β for a ramp — an invented 0.02/step
+        // fixture demands 8× the loop bandwidth reality does, and fails a correct implementation.
+        let mut marks: Vec<f64> = truth
+            .iter()
+            .enumerate()
+            .map(|(i, t)| t + p * (0.40 - 0.0024 * i as f64).clamp(-0.42, 0.42))
+            .collect();
+        let before: Vec<f64> = marks.clone();
+
+        // ⛔ Negative control FIRST: radius 0 must be a no-op, and must say so.
+        let mut untouched = marks.clone();
+        assert_eq!(lock_phase(&x, &mut untouched, 0.0), 0, "radius 0 must move nothing");
+        assert_eq!(untouched, before, "radius 0 must leave the marks bit-identical");
+
+        let moved = lock_phase(&x, &mut marks, 0.45);
+        assert!(moved > truth.len() / 2, "the lock must actually move marks, moved {moved}");
+        assert_eq!(marks.len(), before.len(), "design note 3: no mark may be added or dropped");
+        assert!(marks.windows(2).all(|w| w[1] > w[0]), "marks must stay strictly increasing");
+
+        // ⚠ The criterion is the SPREAD of the phase, not its distance to the pulse onset.
+        // The energy argmax of a one-sided pulse sits a constant ~T/8 after the onset (measured),
+        // and that bias is harmless — every mark gets the same one, and what the synthesis needs is
+        // a *consistent* phase reference. Asserting distance-to-truth instead fails a correct
+        // implementation for having the bias, which is the same mistake as the first version of the
+        // sub-sample assertion below.
+        // ⚠ …and measured over the TRACKING regime, not the acquisition transient: a loop with gain
+        // β needs ~3/β marks to pull in from a cold start (here 30), and the seed mark is by
+        // construction wherever the walk left it. Skipping the first 40 is not a convenience — a
+        // criterion that includes the pull-in measures the initial offset, which nothing controls.
+        const SKIP: usize = 40;
+        let spread = |m: &[f64]| -> f64 {
+            let mut e: Vec<f64> =
+                m.iter().zip(&truth).skip(SKIP).map(|(a, b)| (a - b) / p).collect();
+            e.sort_by(f64::total_cmp);
+            e[(e.len() as f64 * 0.9) as usize % e.len()] - e[(e.len() as f64 * 0.1) as usize % e.len()]
+        };
+        let (b0, a0) = (spread(&before), spread(&marks));
+        assert!(b0 > 0.15, "the fixture must actually drift to begin with, got {b0}");
+        // Measured: 0.220 → 0.024 of a period — and the residual IS the loop's steady-state lag for
+        // a ramp (drift/β = 0.0024/0.1 = 0.024), i.e. the number is predicted, not fitted.
+        assert!(a0 < 0.05, "phase must stop drifting: p10..p90 spread {b0:.3} -> {a0:.3} periods");
+
+        // ⭐ Sub-sample resolution, asserted as SPREAD rather than as distance-to-truth.
+        // ⚠ Written this way after the naive version failed at 18.7 samples: the feature is local
+        // ENERGY, and a glottal-like pulse is one-sided (sharp onset, decaying ring), so the
+        // energy-maximising window centre sits *after* the onset by roughly its own half-width.
+        // That is a BIAS, and a constant bias is harmless here — every mark gets the same one, and
+        // what this module needs is a consistent phase reference, not the glottal closure instant.
+        // What is NOT harmless is per-mark scatter, because that lands straight in the synthesis
+        // pulse positions. The fixture's period is 44100/313 = 140.9 samples, so the pulses fall
+        // between samples and an integer-grid argmax must scatter by ~±0.5.
+        let (xf, tf) = pulses(sr, 0.4, |_| 313.0, |_| 1.0);
+        let mut mf: Vec<f64> = tf.iter().map(|t| t + 6.0).collect();
+        lock_phase(&xf, &mut mf, 0.45);
+        let mut res: Vec<f64> = mf.iter().zip(&tf).map(|(a, b)| a - b).collect();
+        res.sort_by(f64::total_cmp);
+        let mid = res[res.len() / 2];
+        let mut dev: Vec<f64> = res.iter().map(|v| (v - mid).abs()).collect();
+        dev.sort_by(f64::total_cmp);
+        // ⚠ The bound is MEASURED, not guessed, and re-measured when the loop replaced the
+        // correct-afterwards scheme: with the refinement the scatter is **0.039** samples, with it
+        // removed **0.075**. 0.055 sits between the two regimes. (Pre-PLL it was 0.005 / 0.045 —
+        // the loop low-passes the quantisation too, which is why the bound had to move.)
+        assert!(
+            dev[dev.len() / 2] < 0.055,
+            "residual scatter {:.3} samples around its median — that is integer-grid quantisation, \
+             the sub-sample refinement is not doing its job",
+            dev[dev.len() / 2]
+        );
+    }
+
+    #[test]
+    fn the_phase_lock_cannot_reach_the_neighbouring_pulse() {
+        // ⛔⛔ THE structural gate, and the reason the radius is derived from the LOCAL period.
+        // Alternating loud/quiet pulses is the classic period-doubling bait: a per-mark "snap to
+        // the biggest thing nearby" would drag every quiet-pulse mark onto its loud neighbour,
+        // halving the mark count in effect and writing an exact octave-down subharmonic. That is
+        // not a hypothetical — S148's WSOLA arm was killed by a blind test for manufacturing
+        // exactly that (−1200 cents, 1.47 s, "it even sounds solid"), and its four acceptance
+        // criteria contained no pitch measurement at all.
+        //
+        // ⚠ The fixture has to be hostile on BOTH counts or the guard goes untested: alternating
+        // gains supply the bait, and a **glissando** (250 → 450 Hz across the island) is what
+        // separates a LOCAL radius from an island-wide one. On a constant-period fixture the two
+        // are numerically identical, and a mutation swapping them went green.
+        let sr = 44_100u32;
+        let (x, truth) = pulses(
+            sr,
+            0.4,
+            |k| 250.0 + 4.0 * k as f64,
+            |i| if i % 2 == 0 { 1.0 } else { 0.25 },
+        );
+        let mut marks = truth.clone();
+        lock_phase(&x, &mut marks, 0.45);
+
+        assert!(marks.windows(2).all(|w| w[1] > w[0]), "marks must stay strictly increasing");
+        // Ground truth is per-pulse now, so the tolerance is per-pulse too.
+        let mut worst = 0.0f64;
+        for i in 1..truth.len() - 1 {
+            let p = (truth[i + 1] - truth[i]).min(truth[i] - truth[i - 1]);
+            worst = worst.max((marks[i] - truth[i]).abs() / p);
+        }
+        assert!(worst < 0.5, "no mark may travel to a neighbouring pulse, worst {worst:.3} periods");
+        // …and the spacing must not have collapsed anywhere (that is what doubling looks like in
+        // the mark train itself, before any audio is synthesized).
+        for i in 1..marks.len() {
+            let want = truth[i] - truth[i - 1];
+            let got = marks[i] - marks[i - 1];
+            assert!(
+                got > 0.5 * want && got < 1.5 * want,
+                "spacing at {i} is {got:.1} against a true period of {want:.1}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_phase_lock_may_not_jitter_the_spacing_when_the_peak_choice_is_ambiguous() {
+        // ⛔⛔ THE gate this file was missing, and the user paid for that: the first S150 arm was
+        // shipped with every criterion green and it **clicked**. The mechanism, once localised:
+        // real voiced material has a second energy lobe inside each period (formant ringing), the
+        // two are nearly tied (measured runner-up/winner ratio p50 0.72-0.99), so a per-mark argmax
+        // flips between them for a *run* of marks. Consecutive grains then sit at 0.7 T / 1.3 T
+        // instead of T, stop lining up, and each mismatch is a broadband transient.
+        // ⚠ Note what did NOT catch it: mark count (unchanged), `cola_gap` (0.003%), the identity
+        // gate, the depth ruler (it got *better*), the per-note octave gate, and the whole-song f0
+        // gate. The defect lives in the SPACING, so the criterion has to be the spacing.
+        let sr = 44_100u32;
+        let p = f64::from(sr) / 260.0;
+        // Two lobes per period, with gains that cross over every few periods ⇒ the argmax winner
+        // genuinely alternates. This is the fixture the naive version fails on.
+        let (main, truth) = pulses(sr, 0.5, |_| 260.0, |_| 1.0);
+        let (second, _) = pulses(sr, 0.5, |_| 260.0, |i| 0.92 + 0.16 * ((i as f64) / 3.0).sin());
+        let shift = (0.30 * p) as usize;
+        let mut x = main.clone();
+        for i in shift..x.len() {
+            x[i] += second[i - shift];
+        }
+
+        let mut marks: Vec<f64> = truth.iter().map(|t| t + 0.12 * p).collect();
+        let jitter = |m: &[f64]| -> f64 {
+            let d: Vec<f64> = m.windows(2).map(|w| w[1] - w[0]).collect();
+            let mut s = d.clone();
+            s.sort_by(f64::total_cmp);
+            let med = s[s.len() / 2];
+            let mut r: Vec<f64> = d.iter().map(|v| (v / med - 1.0).abs()).collect();
+            r.sort_by(f64::total_cmp);
+            r[(r.len() as f64 * 0.99) as usize % r.len()]
+        };
+        let before = jitter(&marks);
+        lock_phase(&x, &mut marks, 0.45);
+        let after = jitter(&marks);
+        // Calibrated by taking the two defences out, one at a time (fixture jitter p99):
+        //   (recalibrated for the PLL; the pre-PLL numbers are in the commit history)
+        //   median + slew               0.0200   (the slew alone holds it)
+        //   low-pass, no slew           0.0095   (the low-pass alone holds it)
+        //   **median, no slew**         **0.2931** ← the arm that shipped the clicks, 31× worse
+        // ⇒ the two are redundant on purpose, and this bound sits between the two regimes.
+        // ⚠ On real material the same statistic reads 0.1377 (untouched engine) / 0.3457 (clicky
+        // arm) / 0.1385 (shipping) — the fixture reproduces the magnitude, not just the direction.
+        assert!(
+            after < 0.05,
+            "locking jittered the spacing: p99 of |d/median − 1| went {before:.4} → {after:.4} — \
+             that is what a click sounds like"
+        );
+    }
+
+    #[test]
+    fn two_marks_may_not_collapse_onto_the_same_pulse() {
+        // ⛔ The crossing guard needs its own fixture: the two tests above cannot go red for it,
+        // because with evenly-spaced marks nothing ever converges. The failure it prevents is
+        // subtle and silent — two marks landing on ONE pulse leaves the count intact (so design
+        // note 3 still "passes") and the monotonic fixup at the end turns the collapse into a
+        // 1e-6 gap, i.e. it looks fine everywhere except in the audio, where that stretch now
+        // synthesizes at double the period.
+        // ⇒ assert the SPACING, not the ordering. (Written after noticing the guard was
+        // uncovered; the ordering assert alone went green on a version with the guard removed.)
+        let sr = 44_100u32;
+        let (x, truth) = pulses(sr, 0.3, |_| 250.0, |_| 1.0);
+        let p = f64::from(sr) / 250.0;
+        // Adversarial: a pair of marks only 0.6 periods apart, both within reach of one pulse.
+        let mut marks: Vec<f64> = Vec::new();
+        for (i, t) in truth.iter().enumerate() {
+            if i % 3 == 0 {
+                marks.push(t - 0.25 * p);
+                marks.push(t + 0.35 * p);
+            } else {
+                marks.push(*t);
+            }
+        }
+        marks.sort_by(f64::total_cmp);
+        marks.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+        let n_before = marks.len();
+        lock_phase(&x, &mut marks, 0.45);
+        assert_eq!(marks.len(), n_before, "no mark may be dropped");
+        let min_gap = marks
+            .windows(2)
+            .map(|w| w[1] - w[0])
+            .fold(f64::MAX, f64::min);
+        assert!(
+            min_gap > 0.4 * p,
+            "two marks collapsed onto one pulse: min gap {min_gap:.1} samples vs period {p:.1}"
+        );
+    }
+
+    #[test]
+    fn the_phase_lock_is_opt_in_and_the_default_arm_is_byte_for_byte_unchanged() {
+        // ⚠ Additive, per the S146 protocol: nothing the user hears may move until a blind test
+        // says so. S148's WSOLA is why that is not negotiable — it read better on the ruler it was
+        // built for and was 3/3 rejected by ear.
+        let sr = 44_100;
+        let x = voiced(sr, 0.5, 300.0);
+        let hop = sr as usize / 200;
+        let f0 = flat_f0(x.len(), hop, 300.0);
+
+        for st in [-6.0, -1.0, 1.0, 6.0] {
+            let (base, d0) = psola_shift_diag(&x, sr, st, &f0, hop);
+            let (off, d1) =
+                psola_shift_locked(&x, sr, st, 0.0, &f0, hop, false, 0.0, 0.0);
+            assert_eq!(base, off, "{st} st: phase_lock 0.0 must be the legacy arm, bit for bit");
+            assert_eq!(d0.marks_locked, 0, "…and it must report that it moved nothing");
+            assert_eq!(d1.marks_locked, 0);
+
+            let (on, d2) = psola_shift_locked(&x, sr, st, 0.0, &f0, hop, false, 0.0, 0.45);
+            // ⛔ "the arm is on" and "the arm did something" are two different facts — a lock that
+            // never moved a mark would produce byte-identical audio and be indistinguishable from
+            // off unless this count is asserted (S147: a change whose benefit was silently halved).
+            assert!(d2.marks_locked > 0, "the lock must actually move marks when enabled");
+            assert_eq!(d2.marks, d0.marks, "locking must not change the mark COUNT (design note 3)");
+            assert_eq!(d2.islands, d0.islands);
+            assert_ne!(on, base, "{st} st: …and the opt-in arm must actually change the audio");
+        }
+    }
+
+    #[test]
+    fn ratio_one_stays_the_identity_with_the_phase_lock_on() {
+        // The cheapest, least fakeable gate this module has — and it must be re-asserted for every
+        // arm, because it is what caught three "obviously correct" designs in S146.
+        // ⚠ Stated honestly, and now MEASURED rather than reasoned: this gate is **structurally
+        // blind to where the marks are**. Replacing `analysis_marks` wholesale with a 137-sample
+        // uniform grid — no f0, no waveform, nothing — still produces a whole-song ST=0 output
+        // that is **bit-identical** to the baseline (sha256 1565ff95…). Every mark set whose
+        // spacings land in (1.0, 882] samples passes, because at r=1 `tgt[j] == src[j]` ⇒ `d == 0`
+        // and the rising/falling half-cosines sum to exactly 1 on the same span.
+        // ⇒ It proves the lock did not break the synthesis path; it proves **nothing** about
+        // placement. Before this commit, NO test in this file could see a mark-placement change:
+        // a realistic phase lock altered the +7 fixture audio by max |Δ| = 0.978 (peak 0.9) and
+        // all 14 tests stayed green. That is what the four gates above exist for.
+        let sr = 44_100;
+        let x = voiced(sr, 0.5, 220.0);
+        let hop = sr as usize / 200;
+        let f0 = flat_f0(x.len(), hop, 220.0);
+        for lock in [0.0, 0.25, 0.45] {
+            let (y, d) = psola_shift_locked(&x, sr, 0.0, 0.0, &x_f0(&f0), hop, false, 0.0, lock);
+            assert_eq!(y, x, "ratio 1.0 must be the identity with phase_lock = {lock}");
+            if lock > 0.0 {
+                assert!(d.marks_locked > 0, "…and the lock must have been live while proving it");
+            }
+        }
+    }
+
+    /// Identity helper so the call above reads as one line (the f0 track is not the subject).
+    fn x_f0(f0: &[f32]) -> Vec<f32> {
+        f0.to_vec()
+    }
+
+    #[test]
+    fn the_length_contract_holds_in_both_directions() {
+        let sr = 44_100;
+        let x = voiced(sr, 0.4, 300.0);
+        let hop = sr as usize / 200;
+        let f0 = flat_f0(x.len(), hop, 300.0);
+        for st in [-24.0, -12.0, -6.0, -1.0, 1.0, 6.0, 12.0, 24.0] {
+            let (y, _) = psola_shift_diag(&x, sr, st, &f0, hop);
+            assert_eq!(y.len(), x.len(), "length changed at {st} st");
+            assert!(y.iter().all(|v| v.is_finite()), "non-finite output at {st} st");
+        }
+    }
+
+    #[test]
+    fn the_period_readout_itself_is_calibrated() {
+        // Positive control for the measurement, not for PSOLA: the helper is the only thing
+        // standing between "the pitch moved" and "I believe the pitch moved", so it gets its own
+        // known answer first. 44100/300 = 147, 44100/600 = 73.5.
+        let sr = 44_100;
+        for (f0, want) in [(300.0, 147.0), (600.0, 73.5), (150.0, 294.0)] {
+            let got = dominant_period(&voiced(sr, 0.3, f0), 40, 800);
+            assert!(
+                (got as f64 - want).abs() / want < 0.03,
+                "readout says {got} for {f0} Hz, expected ≈{want}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_pitch_actually_moves_up_and_down() {
+        // The −12 case is the one that matters: an earlier version returned the input unchanged
+        // there (the envelope / correlation / HNR rulers all read "perfect"; only pitch caught it).
+        let sr = 44_100;
+        let f0 = 300.0;
+        let x = voiced(sr, 0.5, f0);
+        let hop = sr as usize / 200;
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+        let base = dominant_period(&x, 40, 800);
+        for (st, want) in [(12.0, 0.5f64), (-12.0, 2.0), (6.0, 0.5f64.sqrt()), (-6.0, 2f64.sqrt())] {
+            let (y, _) = psola_shift_diag(&x, sr, st, &f0t, hop);
+            let got = dominant_period(&y[sr as usize / 10..y.len() - sr as usize / 10], 40, 800);
+            let expect = base as f64 * want;
+            assert!(
+                (got as f64 - expect).abs() / expect < 0.08,
+                "{st} st: period {got} samples, expected ≈{expect:.0} (input {base})"
+            );
+        }
+    }
+
+    #[test]
+    fn the_formant_knob_is_a_no_op_at_zero_and_moves_the_spectrum_without_the_pitch() {
+        // κ is a user-facing slider (0..1). Two things must hold or the slider is a lie:
+        //   κ=0 must be BIT-identical to the plain path (otherwise the default arm — the only one
+        //        the user actually A/B'd — silently changed), and
+        //   a non-zero formant move must actually change the audio while leaving the pitch alone
+        //        (an "it compiles" wiring would satisfy neither).
+        let sr = 44_100;
+        let x = voiced(sr, 0.5, 300.0);
+        let hop = sr as usize / 200;
+        let f0 = flat_f0(x.len(), hop, 300.0);
+
+        let plain = psola_shift(&x, sr, 6.0, &f0, hop);
+        let kappa0 = psola_shift_formant(&x, sr, 6.0, 0.0, &f0, hop).0;
+        assert_eq!(plain, kappa0, "κ=0 must be bit-identical to the plain shift");
+
+        // formant-only: pitch must not move, timbre must.
+        let warped = psola_shift_formant(&x, sr, 0.0, 6.0, &f0, hop).0;
+        assert_eq!(warped.len(), x.len());
+        let inner = sr as usize / 10..x.len() - sr as usize / 10;
+        assert_eq!(
+            dominant_period(&x[inner.clone()], 40, 800),
+            dominant_period(&warped[inner.clone()], 40, 800),
+            "a formant-only move must not touch the pitch"
+        );
+        let diff = x
+            .iter()
+            .zip(warped.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(diff > 1e-3, "a formant move of +6 st must change the audio, got max |Δ| {diff}");
+
+        // and the spectral centre of mass must rise (that IS the formant move)
+        let centroid = |v: &[f32]| -> f64 {
+            let seg = &v[inner.clone()];
+            let mut num = 0.0f64;
+            let mut den = 0.0f64;
+            for (i, w) in seg.windows(2).enumerate() {
+                let d = f64::from(w[1] - w[0]).abs(); // crude HF-weighted energy proxy
+                num += d * i as f64;
+                den += d;
+            }
+            let _ = num;
+            den / seg.len() as f64 // mean |Δ| ∝ spectral centroid × amplitude
+        };
+        assert!(
+            centroid(&warped) > centroid(&x) * 1.05,
+            "formants moved up ⇒ the high-frequency content must rise ({} vs {})",
+            centroid(&warped),
+            centroid(&x)
+        );
+    }
+
+    #[test]
+    fn an_all_unvoiced_input_passes_through_untouched() {
+        // Fricatives and silence must not be overlap-added at all (that is how consonants get
+        // metallic). No marks ⇒ nothing covered ⇒ copyFlat everywhere.
+        let sr = 44_100;
+        let mut x = vec![0.0f32; sr as usize / 2];
+        let mut seed = 12345u32;
+        for s in x.iter_mut() {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *s = (seed >> 8) as f32 / 8_388_608.0 - 1.0;
+        }
+        let hop = sr as usize / 200;
+        let (y, d) = psola_shift_diag(&x, sr, 6.0, &vec![0.0f32; x.len() / hop + 2], hop);
+        assert_eq!(d.islands, 0);
+        assert_eq!(y, x, "unvoiced material must be copied verbatim");
+    }
+
+    #[test]
+    fn shifting_up_keeps_exact_cola_and_shifting_down_reports_its_ripple() {
+        // Not a quality claim — an attribution instrument. Upward the bells tile exactly; downward
+        // the source-width clipping (which is what makes the pitch actually drop) leaves gaps, and
+        // that ripple must be VISIBLE rather than silently filled with un-shifted audio.
+        let sr = 44_100;
+        let x = voiced(sr, 0.5, 300.0);
+        let hop = sr as usize / 200;
+        let f0 = flat_f0(x.len(), hop, 300.0);
+        let (_, up) = psola_shift_diag(&x, sr, 6.0, &f0, hop);
+        let (_, down) = psola_shift_diag(&x, sr, -6.0, &f0, hop);
+        assert!(up.cola_gap_frac < 0.02, "upward gap {} too high", up.cola_gap_frac);
+        assert!((up.cola_w_median - 1.0).abs() < 0.02, "upward window sum {}", up.cola_w_median);
+        assert!(
+            down.cola_gap_frac > 0.2,
+            "downward ripple must be reported, got {}",
+            down.cola_gap_frac
+        );
+    }
+
+    /// Run THIS implementation on a real render so `scripts/range_rulers/compare.py` can put it
+    /// under the same four rulers as praat and the current production engine. Structural tests
+    /// above cannot answer "is it clean" — synthetic periodic material systematically flatters
+    /// PSOLA-class algorithms (S81, three times).
+    ///
+    /// ```powershell
+    /// $env:UTAI_PSOLA_IN="…\arm_raw.wav"; $env:UTAI_PSOLA_F0="…\f0.f32"   # raw LE f32, one per hop
+    /// $env:UTAI_PSOLA_HOP="220"; $env:UTAI_PSOLA_ST="6"; $env:UTAI_PSOLA_OUT="…\arm_rust.wav"
+    /// cargo test -p utai-dsp psola_probe -- --ignored --nocapture
+    /// ```
+    /// S148 —— 把**分析标记**倒出来,因为外面看不见它。
+    ///
+    /// 为什么要这个:6 半音上我们在浊音帧的 **2.4%** 上挖出 >4 dB 的电平陷波,而 praat 在同一段
+    /// 输入、同一个比值上只有 **0.2%**;那些位置在 5/6/7 半音之间**高度稳定**(三者共有 57 帧),
+    /// 而**输入自身的性质一条都分不开它们**(f0 匹配对照之后:周期性 NCC 差 −0.001、f0 抖动
+    /// +0.001、电平斜率 −1.1 dB/s、到最近清音帧 +15 帧)。
+    /// ⇒ 排除法把病因指向**我们自己的内部状态**,而唯一看不见的内部状态就是标记。
+    ///
+    /// ⚠ 这里**只重跑分析一路**(`voiced_islands` + `analysis_marks`,两个纯函数),
+    /// 合成一行都不碰 —— 它们不吃 ratio,所以任何深度下标记都是同一套。
+    /// 输出:每行 `island_a island_b mark_sample`(制表分隔),给 `UTAI_PSOLA_MARKS` 指路。
+    #[test]
+    #[ignore = "probe: dumps analysis marks (set UTAI_PSOLA_IN/F0/HOP/MARKS)"]
+    fn psola_marks_dump() {
+        let path = std::env::var("UTAI_PSOLA_IN").expect("UTAI_PSOLA_IN");
+        let f0p = std::env::var("UTAI_PSOLA_F0").expect("UTAI_PSOLA_F0");
+        let out = std::env::var("UTAI_PSOLA_MARKS").expect("UTAI_PSOLA_MARKS");
+        let hop: usize = std::env::var("UTAI_PSOLA_HOP").expect("UTAI_PSOLA_HOP").parse().unwrap();
+
+        let mut rd = hound::WavReader::open(&path).expect("open in");
+        let spec = rd.spec();
+        let x: Vec<f32> = match spec.sample_format {
+            hound::SampleFormat::Float => rd.samples::<f32>().map(|s| s.unwrap()).collect(),
+            hound::SampleFormat::Int => rd
+                .samples::<i32>()
+                .map(|s| s.unwrap() as f32 / (1i32 << (spec.bits_per_sample - 1)) as f32)
+                .collect(),
+        };
+        let x: Vec<f32> = if spec.channels > 1 {
+            x.chunks(spec.channels as usize).map(|c| c.iter().sum::<f32>() / c.len() as f32).collect()
+        } else {
+            x
+        };
+        let raw = std::fs::read(&f0p).expect("read f0");
+        let f0: Vec<f32> = raw
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        // 与 psola_shift_opts 同一条前处理:标记跑在去 DC 的信号上(设计注 2)。
+        let n = x.len();
+        let sr = f64::from(spec.sample_rate);
+        let mean = x.iter().map(|v| f64::from(*v)).sum::<f64>() / n as f64;
+        let dc_free: Vec<f32> = x.iter().map(|v| (f64::from(*v) - mean) as f32).collect();
+
+        // S150 —— `UTAI_PSOLA_LOCK=<periods>` 打开相位锁定(默认 0 = 关,与生产同一套标记)。
+        // ⭐ 有了它,「Rust 的标记」与「Python 原型的标记」可以**逐个对拍**,
+        //    候选在离线上量到的每一个数才真的属于将要上线的那份实现。
+        let lock: f64 =
+            std::env::var("UTAI_PSOLA_LOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+        let mut s = String::new();
+        let mut islands = 0usize;
+        let mut marks = 0usize;
+        let mut locked = 0usize;
+        for (a, b) in voiced_islands(&f0, hop, n, (MIN_ISLAND_SECONDS * sr) as usize) {
+            let mut src = analysis_marks(&dc_free, spec.sample_rate, &f0, hop, a, b, None);
+            if src.len() < 3 {
+                continue;
+            }
+            locked += lock_phase(&dc_free, &mut src, lock);
+            islands += 1;
+            marks += src.len();
+            for m in &src {
+                // ⛔ 全精度,不是 `{m:.4}`。S150 实测:4 位小数的截断会让 12 个颗粒的
+                // `round(tm) − round(s_pos)`(或窗端点 `round(s±w)`)翻到 .5 的另一侧,
+                // 于是拿这份 dump 离线重放出来的波形与 Rust 自己渲的差最多 **3814 LSB**。
+                // ⚠ 12 段位置是**事前**从「到 .5 边界的距离 < 5e-5」预测出来的,12/12 命中 ——
+                // 所以这是精度问题,不是合成路径问题。f64 的 `{}` 是最短往返表示。
+                s.push_str(&format!("{a}\t{b}\t{m}\n"));
+            }
+        }
+        std::fs::write(&out, s).expect("write marks");
+        eprintln!("[mg] marks: {islands} islands, {marks} marks, lock {lock} moved {locked} -> {out}");
+    }
+
+    /// 一个臂旋钮的取值:env 里有就用 env,没有就用 [`PROBE_ARM_DEFAULTS`](= **生产默认**)。
+    ///
+    /// ⛔ 解析不了就 **panic**,不许静默回落到默认值。这条探针存在的全部意义是「输出属于哪个
+    /// 口径」可查,而 `UTAI_PSOLA_BRIDGE=30ms`(带单位)这种手滑在旧写法下会**读成 0**、
+    /// 打印成 0、然后被当成一条正常的臂记进档案里 —— 那正是「跑不起来被读成通过」。
+    fn probe_arm(key: &str) -> f64 {
+        let (_, want) = PROBE_ARM_DEFAULTS
+            .iter()
+            .find(|(k, _)| *k == key)
+            .unwrap_or_else(|| panic!("{key} 不在 PROBE_ARM_DEFAULTS 里 —— 加旋钮要连表一起加"));
+        match std::env::var(key) {
+            Err(_) => *want,
+            Ok(v) => match v.trim() {
+                "true" | "on" | "yes" => 1.0,
+                "false" | "off" | "no" => 0.0,
+                s => s.parse::<f64>().unwrap_or_else(|_| {
+                    panic!("{key}={v:?} 解析不了 —— 探针不许把它当成默认值悄悄跑过去")
+                }),
+            },
+        }
+    }
+
+    #[test]
+    #[ignore = "probe: needs a wav + f0 track on disk (set UTAI_PSOLA_*)"]
+    fn psola_probe() {
+        let path = std::env::var("UTAI_PSOLA_IN").expect("UTAI_PSOLA_IN");
+        let out = std::env::var("UTAI_PSOLA_OUT").expect("UTAI_PSOLA_OUT");
+        let f0p = std::env::var("UTAI_PSOLA_F0").expect("UTAI_PSOLA_F0");
+        let hop: usize = std::env::var("UTAI_PSOLA_HOP").expect("UTAI_PSOLA_HOP").parse().unwrap();
+        let st: f64 = std::env::var("UTAI_PSOLA_ST").expect("UTAI_PSOLA_ST").parse().unwrap();
+
+        let mut rd = hound::WavReader::open(&path).expect("open in");
+        let spec = rd.spec();
+        let x: Vec<f32> = match spec.sample_format {
+            hound::SampleFormat::Float => rd.samples::<f32>().map(|s| s.unwrap()).collect(),
+            hound::SampleFormat::Int => rd
+                .samples::<i32>()
+                .map(|s| s.unwrap() as f32 / (1i32 << (spec.bits_per_sample - 1)) as f32)
+                .collect(),
+        };
+        let x: Vec<f32> = if spec.channels > 1 {
+            x.chunks(spec.channels as usize).map(|c| c.iter().sum::<f32>() / c.len() as f32).collect()
+        } else {
+            x
+        };
+        let raw = std::fs::read(&f0p).expect("read f0");
+        let f0: Vec<f32> = raw
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        // S148:`UTAI_PSOLA_WSOLA=<frac>` 打开源侧波形相似度搜索。
+        let wsola: f64 = probe_arm("UTAI_PSOLA_WSOLA");
+        // S148 —— `frac_transport` 以前在这里写死成 false,于是 `UTAI_PSOLA_FRAC` 对这条探针**完全无效**:
+        // 开与不开的输出 sha256 逐位相同。我差点把那读成「亚样本搬运对包络起伏没用」。
+        // ⛔「臂开着」与「臂做了事」是两件事 —— 现在它由 env 控,并且把实际取值打出来。
+        let frac = probe_arm("UTAI_PSOLA_FRAC") != 0.0;
+        // S150 —— `UTAI_PSOLA_LOCK=<periods>`。
+        let lock: f64 = probe_arm("UTAI_PSOLA_LOCK");
+        // S154 —— `UTAI_PSOLA_ENVFIX=<ms>` 打开振幅包络还原。
+        let envfix: f64 = probe_arm("UTAI_PSOLA_ENVFIX");
+        // S154 —— `UTAI_PSOLA_BRIDGE=<ms>` 把音内短的清音空档桥接起来。
+        // ⚠ 这里的 fallback 是 [`PROBE_ARM_DEFAULTS`](= 生产默认),**不是 0** —— 见那份文档。
+        let bridge: f64 = probe_arm("UTAI_PSOLA_BRIDGE");
+        // S155 —— `UTAI_PSOLA_WIN=<periods>` 读窗半宽(源周期);0 = 今天。
+        let win: f64 = probe_arm("UTAI_PSOLA_WIN");
+        // S156 —— `UTAI_PSOLA_XGRAIN=<0..1>` 颗粒内容在相邻两个源脉冲之间的插值深度;0 = 今天。
+        let xgrain: f64 = probe_arm("UTAI_PSOLA_XGRAIN");
+        // S157b —— `UTAI_PSOLA_LPC=<order>` LP-PSOLA 的阶数;0 = 今天。
+        let lpc: usize = probe_arm("UTAI_PSOLA_LPC") as usize;
+        // S155 —— `UTAI_PSOLA_HP=0/1` 去次声;`UTAI_PSOLA_HP_MS=<ms>` 强制固定宽度(0 = 自适应)。
+        // ⛔⛔ 它以前在这里**写死成 `false`**,于是这条探针上「开」与「关」的输出**逐位相同** ——
+        //    和 S148 那次 `frac_transport` 写死成 false 一模一样的形状,而那次差点被读成
+        //    「亚样本搬运对包络起伏没用」。⇒ 现在由 env 控,并且实际取值打出来。
+        let hp_ms = probe_arm("UTAI_PSOLA_HP_MS");
+        let hp = match (probe_arm("UTAI_PSOLA_HP") != 0.0, hp_ms) {
+            (false, _) => Infrasonic::Off,
+            (true, m) if m > 0.0 => Infrasonic::FixedMs(m),
+            (true, _) => Infrasonic::PerPeriod,
+        };
+        // S159i —— `UTAI_PSOLA_KEEP="a:b,c:d"`(**样本**下标)⇒ 走窗内入口 `psola_shift_win`。
+        // ⛔ 为什么探针需要它:窗内逆变换的「跳岛不改窗内样本」这条性质,在合成夹具上
+        // 测不到跨岛耦合(见 `envelope_restore_is_per_island_and_therefore_window_safe` 的登记),
+        // 而在整曲渲染上又被 decode 的不可复现盖住(地板 −34.9 dB)。
+        // ⇒ 唯一能做**逐位**对拍的地方,就是拿同一份 donor 缓冲在这里跑两遍。
+        let keep: Vec<(usize, usize)> = std::env::var("UTAI_PSOLA_KEEP")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .filter(|p| !p.trim().is_empty())
+                    .map(|p| {
+                        let (a, b) = p.split_once(':').expect("UTAI_PSOLA_KEEP=a:b,c:d(样本下标)");
+                        (a.trim().parse().expect("keep start"), b.trim().parse().expect("keep end"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        eprintln!("  keep: {} 段", keep.len());
+        let (y, d) = psola_shift_win(
+            &x, spec.sample_rate, st, 0.0, &f0, hop, frac, wsola, lock, hp, envfix, bridge, win,
+            xgrain, lpc, &keep,
+        );
+        println!(
+            "  arms: frac_transport={frac} wsola={wsola} phase_lock={lock} envfix={envfix}              bridge={bridge} hp={hp:?} win={win} xgrain={xgrain} lpc={lpc}"
+        );
+        // ⛔ 「这条探针跑的是不是生产口径」必须**当场看得见**。S154 之后生产默认是
+        //    `bridge=30 / lock=0.30`,而这条探针以前对这两个都默认 0 ⇒ 照旧脚本跑出来的
+        //    「今天」其实是**改动之前的臂**,而没有任何一行输出会说破这件事。
+        let drift: Vec<String> = PROBE_ARM_DEFAULTS
+            .iter()
+            .filter_map(|(k, want)| {
+                let got = probe_arm(k);
+                (got != *want).then(|| format!("{k}={got} (生产 {want})"))
+            })
+            .collect();
+        if drift.is_empty() {
+            println!("  口径 = 生产默认");
+        } else {
+            println!("  ⛔ 口径**不是**生产默认:{}", drift.join(" · "));
+        }
+        // ⛔ 「注入了多少」与「拿掉了多少」是两个数,只打第二个会让 0.00 有两种读法
+        //    (本来就没有 / 刀没生效)。S152 那条规矩:读数无条件算,修法才由旋钮控。
+        println!(
+            "  次声份额 {:.2}%{}",
+            d.infrasonic_frac * 100.0,
+            if hp == Infrasonic::Off {
+                String::new()
+            } else {
+                format!(
+                    " — hp(宽 {:.2} ms)拿掉了 {:.2} 个百分点",
+                    d.infrasonic_ma_ms,
+                    d.infrasonic_removed * 100.0
+                )
+            }
+        );
+        println!(
+            "  env dev p50 {:.3} dB{}",
+            d.env_dev_p50_db,
+            if envfix > 0.0 { format!(" -> {:.3} dB", d.env_dev_after_db) } else { String::new() }
+        );
+        // S157 —— ⛔ **`src_uncovered_frac` 以前不在这行里**,而它是 `vocal_range.rs` 的
+        //   `LANDING_RATIO_TWO_ST = 12` **唯一引用的读数**,那条 doc 还写着
+        //   "measured on the real mark train"。⇒ 一个承重常数的证据,在唯一一条跑真素材的
+        //   探针上**读不出来** —— 那等于它的出处今天没有人复现得了。
+        //   ⚠ 仓里另一条断言(`the_production_default_arm_is_actually_what_runs`)读的是
+        //   **合成脉冲串**,与那张表换了两个变量,不能互相顶替。
+        println!(
+            "psola_probe: {} samples @{} Hz, {st:+} st, f0 frames {} hop {hop}\n  \
+             islands {} marks {} cola_gap {:.1}% w_median {:.3} wsola {wsola} moved {} \
+             lock {lock} moved {}\n  \
+             src_uncovered {:.4}% (ratio {:.4})",
+            x.len(), spec.sample_rate, f0.len(), d.islands, d.marks,
+            d.cola_gap_frac * 100.0, d.cola_w_median, d.wsola_moved, d.marks_locked,
+            d.src_uncovered_frac * 100.0,
+            2f64.powf(st / 12.0)
+        );
+        assert_eq!(y.len(), x.len(), "exact-length contract");
+
+        // S148 —— 逐颗粒轨迹(只在 `UTAI_PSOLA_GRAIN_DUMP` 设了的时候写)。
+        // ⛔ 空文件与「没开」必须分得开:开了就一定有行,一行都没有说明循环根本没跑到,
+        //    那是「跑不起来」不是「测出来没有」。
+        if let Ok(p) = std::env::var("UTAI_PSOLA_GRAIN_DUMP") {
+            let rows = GRAIN_TRACE.lock().unwrap();
+            assert!(!rows.is_empty(), "grain dump 开着却一行都没有 —— 合成循环没跑到,读数无效");
+            let mut s = String::from("tm\tsrc\tdelta\tt_src\tphase\tlw\trw\tk\n");
+            for r in rows.iter() {
+                s.push_str(&format!(
+                    "{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.6}\t{:.4}\t{:.4}\t{}\n",
+                    r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7] as i64
+                ));
+            }
+            std::fs::write(&p, s).expect("write grain dump");
+            println!("  grain dump: {} 行 -> {p}", rows.len());
+        }
+
+        // S155 —— `UTAI_PSOLA_DUMP_F32=<prefix>` 倒出 `<prefix>_in.f32` 与 `<prefix>_out.f32`
+        // (裸 little-endian f32,与 `UTAI_PSOLA_F0` 同一种格式)。
+        //
+        // ⛔⛔ 为什么需要它:下面那个 writer 是 **16 bit + 按峰值归一**。两件事都会伪造差:
+        // ⑴ 归一让「臂 A vs 臂 B」各自拿到**不同的增益**(HP 只要把峰值动 0.008 dB,整条臂就
+        //    带上一个全局增益差)—— S152 那条「emphasis 臂带 +0.582 dB ⇒『更舒服』被响度污染」
+        //    就是这个形状;⑵ 16 bit 的量化底噪 ≈ −96 dBFS,而这一场要量的是**去次声之后**
+        //    的残量,它可能就在那个量级附近。
+        // ⇒ 凡是拿探针做「加了多少 / 还剩多少」的题,一律读这两个 f32,别读那个 wav。
+        if let Ok(prefix) = std::env::var("UTAI_PSOLA_DUMP_F32") {
+            for (suffix, buf) in [("_in.f32", &x), ("_out.f32", &y)] {
+                let mut bytes = Vec::with_capacity(buf.len() * 4);
+                for v in buf.iter() {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                let p = format!("{prefix}{suffix}");
+                std::fs::write(&p, &bytes).unwrap_or_else(|e| panic!("write {p}: {e}"));
+                println!("  f32 dump: {} 个样本 -> {p}", buf.len());
+            }
+        }
+
+        let peak = y.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-9);
+        let g = 0.92 / peak; // same normalization the S145 arms used, so levels are comparable
+        let mut w = hound::WavWriter::create(
+            &out,
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: spec.sample_rate,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .expect("create out");
+        for v in &y {
+            w.write_sample((((v * g).clamp(-1.0, 1.0)) * 32767.0).round() as i16).unwrap();
+        }
+        w.finalize().unwrap();
+        println!("  -> {out}");
+    }
+
+    #[test]
+    fn degenerate_inputs_are_returned_rather_than_panicking() {
+        let sr = 44_100;
+        let hop = sr as usize / 200;
+        assert!(psola_shift(&[], sr, 6.0, &[], hop).is_empty());
+        let tiny = vec![0.1f32; 32];
+        assert_eq!(psola_shift(&tiny, sr, 6.0, &flat_f0(32, hop, 300.0), hop), tiny);
+        let x = voiced(sr, 0.2, 300.0);
+        assert_eq!(psola_shift(&x, sr, 6.0, &[], hop), x, "no f0 ⇒ no marks ⇒ passthrough");
+        assert_eq!(psola_shift(&x, sr, f64::NAN, &flat_f0(x.len(), hop, 300.0), hop), x);
+        assert_eq!(psola_shift(&x, sr, 6.0, &flat_f0(x.len(), hop, 300.0), 0), x);
+    }
+}

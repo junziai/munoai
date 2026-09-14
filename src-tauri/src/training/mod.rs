@@ -1,0 +1,6477 @@
+//! Training run lifecycle: spawns `python -m utai_train.runner` (training/ package,
+//! its own venv), relays the stdout JSONL protocol v2 as tauri events, keeps the
+//! loss history for the training page, and owns the graceful-stop flag file.
+//!
+//! Everything is app_dir/data_dir absolute (the opus4.6-era module was cwd-relative
+//! — that debt is gone with this rewrite). stdout belongs to the protocol; stderr
+//! goes to a ring buffer surfaced LOUDLY on abnormal exit (antivirus kills, OOM).
+//! Post-processing (pth→onnx conversion, registry import, audition rendering) is
+//! driven by the frontend through the EXISTING model-import command chain — this
+//! module ends at the protocol `done`.
+
+use std::collections::{HashMap, VecDeque};
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
+use tauri::Emitter;
+
+use crate::{Result, UtaiError};
+
+pub mod bundled_code;
+pub mod diagnostics;
+pub mod dsmanifest;
+pub mod resume_lock;
+pub mod tpool;
+pub mod tproject;
+pub mod trun;
+
+/// 把一个数据根里的每一个训练槽往前折的**那条链** —— 顺序就是这个函数体,别处不许再排一遍。
+///
+/// ## 为什么它是一个函数,而不是三行 copy 两份
+///
+/// 每一步都提交**同一个** `slot.json` 的 layout 数字,而后一步的早退条件是「layout ≥ 我」:
+/// * `tproject::migrate_legacy_layout` 建出 family 槽 —— 不先跑它,下面两步无槽可折;
+/// * `tpool::migrate_all` 把预处理产物折进 `pools/<身份>/`(提交 layout 2);
+/// * `trun::migrate_all` 把 run 产物折进 `runs/<id>/`(提交 layout 3,早退于 `>= 3`)。
+///
+/// 顺序反了不是报错而是**静默退休**:先盖 layout 3,`tpool::migrate_slot` 从此对这个槽永远
+/// 答 `AlreadyDone`,预处理产物永久留在槽根,连一行 warn 都没有(`plan_slot_runs` 把它们归进
+/// `staying` 而不是 `unknown`)。
+///
+/// ⛔ 而它有**两个**调用点:开机一次,以及**换数据根时对旧根**再一次。漏掉第二个的后果不是
+/// 「旧根停在上一档」—— `SyncLevel::Slots` 逐**数字**比较槽 layout,两侧不同就整槽拒绝合并,
+/// 于是整棵 `training/` 子树**既不合并也不删除**(`commands/settings.rs` 的
+/// `sync_failed > 0 ⇒ continue`)。这是这条链最贵的一种漏法,而它长得像一次遗忘。
+///
+/// ⇒ 把顺序与调用点收成一个函数,是为了让「**加一步而漏掉一个调用点**」这件事不可能发生。
+///
+/// ★§F2⒝ ④d 的第四步 `tpool::migrate_identity_all` 挂在**最后**,而这一步的顺序理由与前三步
+/// **不同**:前三步是「先盖章的那个会让后面的永远 AlreadyDone」,这一步是「它盖的章同时打开
+/// python 的 v2 公式」(`tpool::identity_version`)。排到前面去 = 先告诉 python 盘上是 v2 文本,
+/// 再让另外两个迁移器去搬那些还写着 v1 文本的字节。
+pub fn migrate_layouts(root: &Path) {
+    // S168: FIRST, undo any stamp/fold an earlier boot left inside the bundled code dirs
+    // (`RESERVED_TRAINING_DIRS`). Every walk below now skips those names, but a damaged
+    // install needs the artifacts gone before the trainer imports cleanly again. Deliberately
+    // NOT named `*::migrate_*` — the boot-chain ratchet counts those and this is a repair,
+    // not a layout step.
+    tproject::unfold_reserved_dirs(root);
+    tproject::migrate_legacy_layout(root);
+    tpool::migrate_all(root);
+    trun::migrate_all(root);
+    tpool::migrate_identity_all(root);
+}
+
+/// 把**一个**槽折到当前 layout —— 与 [`migrate_layouts`] **同一条链**,只是逐槽,而且**按需**。
+///
+/// ## 它为什么必须存在(不是一个便利函数)
+///
+/// §F2⒝ ④e 的「再训一个」会在这个槽里铸**第二个** run。而 `tpool::slot_facts` 在槽里看到两份
+/// `run_manifest.json` 时**直接 Err** ⇒ `plan_slot_identity` Err ⇒ 3→4 对这个槽**永久**
+/// `Refused`;把 run 全删光(④e 的另一半招牌功能)撞的是同一个函数的**零份**那条出口。
+/// 而 [`migrate_layouts`] **只在开机跑** ⇒「先长出第二个 run,再重启一次让它自愈」这条路
+/// **不存在**。⇒ 唯一堵得住的地方是**预防**:让这个槽在长出第二个 run **之前**就已经到
+/// layout 4 —— 那之后 `migrate_slot_identity` 早退 `AlreadyDone`,`slot_facts` 再也不会被问到。
+///
+/// ## 与开机链的关系
+///
+/// ⛔ 顺序**不许**在这里重排。理由逐条写在 [`migrate_layouts`] 的 doc 上(每一步都提交同一个
+/// `slot.json` 的数字,先盖章的那个会让后面的永远 `AlreadyDone`),而两条链由
+/// `trun::tests::the_boot_chain_folds_pools_before_runs` **逐步对拍** —— 加一步而只改一条,
+/// 或者在这里换个次序,都当场红。
+///
+/// ⚠ 少了根级的 `tproject::migrate_legacy_layout`,这是**有意**的:那一步的活是把一个 pre-S76
+/// 的项目**建出** family 槽,而本函数的前提恰恰是「这个槽已经在那里、而且里面有东西」——
+/// 一个连槽都还没建出来的项目走不到「再训一个」。
+///
+/// ## 失败就是失败
+///
+/// ⛔ `IdentityOutcome::Refused` 在开机链里是**一个真实的答案**(那个槽继续按身份 v1 工作,
+/// 用户什么都不用付,下次开机再看一眼)。**在这里它必须是 `Err`**:调用方接着就要铸第二个 run,
+/// 而那一铸下去,这个槽就再也迁不动了 —— 「下次开机再看」在那之后永远等不到。
+pub fn migrate_one_slot(data_dir: &Path, project_id: &str, family: &str) -> Result<()> {
+    let slot = tproject::family_dir(data_dir, project_id, family);
+    tpool::migrate_slot(&slot, family)?;
+    trun::migrate_slot_runs(data_dir, project_id, family)?;
+    match tpool::migrate_slot_identity(&slot, family)? {
+        tpool::IdentityOutcome::Refused(why) => {
+            Err(UtaiError::Training(format!("SLOT_NOT_MIGRATABLE: {why}")))
+        }
+        _ => Ok(()),
+    }
+}
+
+const STDERR_RING_CAP: usize = 200;
+// D7.2-003 fix: 40K points × ~200B/point ≈ 8MB was an aggressive upper bound that
+// pushed the OOM ceiling on 4GB-memory machines. 15K still gives loss curves that are
+// visually smooth for any normal training length (the step emitter sends every step
+// but the frontend's visible range is only the last few thousand anyway).
+const HISTORY_CAP: usize = 15_000;
+const SEED: u32 = 1234;
+
+fn d_true() -> bool {
+    true
+}
+fn d_save_every() -> u32 {
+    5
+}
+fn d_save_steps() -> u32 {
+    800
+}
+fn d_keep_ckpts() -> u32 {
+    3
+}
+fn d_total_steps() -> u32 {
+    100_000
+}
+fn d_force_save() -> u32 {
+    10_000
+}
+fn d_crop_mel() -> u32 {
+    32
+}
+
+/// Workspace lineage for the cross-backend collision guard: sovits_diff shares
+/// the sovits workspace (that is the whole point — the diffusion companion
+/// reuses the main model's preprocessing caches), rvc stays its own family.
+/// The manifest stores THIS value under its historical "backend" key, so
+/// pre-S39 manifests need zero migration.
+pub(crate) fn backend_family(backend: &str) -> &str {
+    match backend {
+        "sovits_diff" => "sovits",
+        other => other,
+    }
+}
+
+/// S68b loud-degradation preflight (community RTX 3080 report: GPU box + CPU-only
+/// runtime pack silently trained on CPU; the only warn was log-file-only AND gated
+/// behind !force_cpu, so nobody ever saw it). Refuses with TRAINING_RUNTIME_CPU_ONLY
+/// — trilingual message names both ways out (install the matching GPU pack / check
+/// 强制 CPU 训练). Fires ONLY when a GPU runtime pack is actually offerable on this
+/// box (variant_supported): Pascal/cc<7.5 NVIDIA, TheRock-unsupported AMD and non-Arc
+/// Intel machines have no in-app pack to install, so they keep training on CPU exactly
+/// as before (review round 1: the unconditional refusal sent those users chasing a
+/// download the Settings UI deliberately hides). The nvidia-smi/DXGI probes only run
+/// on the rare cpu-pack path — zero cost for every GPU-pack install.
+///
+/// ⚠ S116 — that enumeration is INCOMPLETE, and for the missing member the stated reason does
+/// not hold. Since S74b `variant_supported`'s NVIDIA arm reads `nvidia_compute_caps_cc10()`,
+/// which is EMPTY whenever nvidia-smi is absent, exits non-zero, or misses the 8 s cap (a wedged
+/// driver — the probe's own comment says so) ⇒ a perfectly supported RTX card on a sick driver
+/// also lands in the silent set, and for THAT box "has no in-app pack to install" is false: the
+/// pack exists, local-file install is ungated, and fixing the driver brings the entry back.
+/// ⛔ The BEHAVIOUR is still right and must not be "fixed" to fire: refusing there would print
+/// "install the runtime pack matching your GPU in Settings" while that entry is fail-closed out
+/// of the list — the exact review-round-1 regression. And the box is not left mute: it shows up
+/// in `training_gpu_list` as non-selectable with reason `TRAINING_GPU_CC_UNKNOWN`, wired through
+/// backendError.ts into all three locales.
+fn refuse_cpu_only_runtime(app_dir: &Path, force_cpu: bool) -> Result<()> {
+    if force_cpu {
+        return Ok(());
+    }
+    let device_backend = crate::pyenv::training_interpreter(app_dir, false).device_backend;
+    if device_backend != "cpu" {
+        return Ok(());
+    }
+    let gpus = crate::commands::settings::query_gpu_adapters();
+    let nv_cc10 = crate::commands::settings::nvidia_compute_caps_cc10();
+    let offerable = ["nv-cu130", "amd", "xpu"]
+        .iter()
+        .any(|v| crate::commands::settings::variant_supported(v, &gpus, &nv_cc10));
+    if offerable {
+        return Err(UtaiError::Training("TRAINING_RUNTIME_CPU_ONLY".into()));
+    }
+    Ok(())
+}
+
+/// ①c one co-trained speaker: a display name + its own audio files. The id
+/// (emb_g row / config.spk value) is the group's index in the request order.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeakerGroup {
+    pub name: String,
+    pub files: Vec<String>,
+}
+
+/// Every disk asset one training run needs, resolved from (backend, version, sample_rate,
+/// aug_copies) — THE single source shared by try_start's up-front verification and the S66
+/// `training_required_assets` pre-flight command (the frontend's "missing base model"
+/// dialog), so the two can never drift. Pure path math except the 4.0 diffusion-base
+/// probe, whose OPTIONALITY is existence-defined (present = used, absent = from-scratch).
+pub struct ResolvedTrainingAssets {
+    /// (label, path) in the exact order try_start verifies them; labels are the stable
+    /// English tokens that ride in the TRAINING_ASSET_MISSING detail payload.
+    pub required: Vec<(String, PathBuf)>,
+    pub contentvec: PathBuf,
+    pub rmvpe_pt: PathBuf,
+    pub pretrain_g: PathBuf,
+    pub pretrain_d: PathBuf,
+    pub nsf_hifigan_model: PathBuf,
+    pub diffusion_pretrain: PathBuf,
+    pub vocoder_pretrain: PathBuf,
+}
+
+pub fn resolve_training_assets(
+    data_dir: &Path,
+    backend: &str,
+    version: &str,
+    sample_rate: &str,
+    aug_copies: u32,
+) -> Result<ResolvedTrainingAssets> {
+    let aux_dir = data_dir.join("models").join(crate::models::AUX_DIR_NAME);
+    let sovits_train_dir = data_dir.join("models").join("training").join("sovits");
+    // one-ContentVec-space principle: the training extractor must be the same
+    // aux graph inference uses — rvc v1 / sovits(_diff) 4.0 / sovits_v2 = 256l9,
+    // rvc v2 / sovits(_diff) 4.1 = 768l12
+    let use_256 = version == "v1" || version == "4.0" || version == "4.0-v2";
+    let contentvec = aux_dir.join(if use_256 {
+        "contentvec_256l9.onnx"
+    } else {
+        "contentvec_768l12.onnx"
+    });
+    // rmvpe is TWO different lineages: aux/rmvpe.pt = RVC's raw-state-dict E2E;
+    // so-vits vendors the yxlllc/RMVPE fork (E2E0, +unet.tf.* layers, wrapped
+    // as {'model': sd}) — the files are NOT interchangeable.
+    // vocoder also gets the SOVITS lineage: its own f0 products are
+    // parselmouth-blooded and measurably blind to PSOLA glitches, so the
+    // S41 aug quality gate re-analyzes the audio with the sovits RMVPE
+    // (gate_aug_semantic part 4 keeps the blind spot on record)
+    // sovits_v2 is its own workspace family but the same yxlllc rmvpe lineage
+    let rmvpe_pt = if matches!(backend_family(backend), "sovits" | "sovits_v2") || backend == "vocoder" {
+        sovits_train_dir.join("rmvpe.pt")
+    } else {
+        aux_dir.join("rmvpe.pt")
+    };
+    // per-backend required files beyond contentvec+rmvpe
+    let mut required: Vec<(String, PathBuf)> = Vec::new();
+    let mut pretrain_g = PathBuf::new();
+    let mut pretrain_d = PathBuf::new();
+    let mut nsf_hifigan_model = PathBuf::new();
+    let mut diffusion_pretrain = PathBuf::new();
+    let mut vocoder_pretrain = PathBuf::new();
+    match backend {
+        "rvc" => {
+            let pretrain_dir = data_dir.join("models").join("training").join("rvc").join(
+                if version == "v1" {
+                    "pretrained"
+                } else {
+                    "pretrained_v2"
+                },
+            );
+            pretrain_g = pretrain_dir.join(format!("f0G{}.pth", sample_rate));
+            pretrain_d = pretrain_dir.join(format!("f0D{}.pth", sample_rate));
+            required.push(("pretrained base G".into(), pretrain_g.clone()));
+            required.push(("pretrained base D".into(), pretrain_d.clone()));
+        }
+        "sovits" => {
+            let pretrain_dir =
+                sovits_train_dir.join(if version == "4.0" { "vec256" } else { "vec768" });
+            pretrain_g = pretrain_dir.join("G_0.pth");
+            pretrain_d = pretrain_dir.join("D_0.pth");
+            required.push(("pretrained base G".into(), pretrain_g.clone()));
+            required.push(("pretrained base D".into(), pretrain_d.clone()));
+        }
+        "sovits_v2" => {
+            // 4.0-v2 (VISinger2): the official base pair from the 4.0-v2
+            // branch, its own asset dir (the ckpt layout is NOT interchangeable
+            // with the 4.x vec256/vec768 bases)
+            let pretrain_dir = data_dir.join("models").join("training").join("sovits_v2");
+            pretrain_g = pretrain_dir.join("G_0.pth");
+            pretrain_d = pretrain_dir.join("D_0.pth");
+            required.push(("pretrained base G".into(), pretrain_g.clone()));
+            required.push(("pretrained base D".into(), pretrain_d.clone()));
+        }
+        "vocoder" => {
+            // NSF-HiFiGAN finetune (S40): the ONLY asset is the classic
+            // 2024.02 community base checkpoint (lightning format, G+D).
+            // CC BY-NC-SA weights — never bundled, but S75 made them
+            // pack-distributed (`training-vocoder`, mirrored + license-badged;
+            // the label no longer has to carry download instructions).
+            // ⚠️ NOT interchangeable with the aux default vocoder onnx: that
+            // one is generator-only and a whole release older (2022.12).
+            // ContentVec/RMVPE/configs/mute are NOT used by this pipeline
+            // (设计红队 A17: required 收敛进各臂).
+            vocoder_pretrain = data_dir
+                .join("models")
+                .join("training")
+                .join("vocoder")
+                .join("nsf_hifigan_44.1k_hop512_128bin_2024.02.ckpt");
+            required.push((
+                "vocoder finetune base ckpt (NSF-HiFiGAN 2024.02, CC BY-NC-SA 4.0)".into(),
+                vocoder_pretrain.clone(),
+            ));
+        }
+        "sovits_diff" => {
+            // sovits_diff: the mel recipe IS the vocoder's (torch ckpt, not
+            // the aux onnx) + the diffusion base model. The vec256 ecosystem
+            // has NO public diffusion base (the one community HF repo went
+            // private, 2026-07) — 4.0 trains from scratch, loudly surfaced
+            // in the params UI; the vec768 base ships as a dev asset and is
+            // hard-required so its absence can never silently degrade.
+            nsf_hifigan_model = sovits_train_dir.join("nsf_hifigan").join("model");
+            required.push(("NSF-HiFiGAN vocoder (model)".into(), nsf_hifigan_model.clone()));
+            required.push((
+                "NSF-HiFiGAN config (config.json)".into(),
+                sovits_train_dir.join("nsf_hifigan").join("config.json"),
+            ));
+            let base = sovits_train_dir
+                .join("diffusion")
+                .join(if version == "4.0" { "vec256" } else { "vec768" })
+                .join("model_0.pt");
+            if version == "4.0" {
+                if base.is_file() {
+                    diffusion_pretrain = base;
+                } else {
+                    tracing::warn!("no vec256 diffusion base model — training from scratch");
+                }
+            } else {
+                diffusion_pretrain = base.clone();
+                required.push(("diffusion base model (model_0.pt)".into(), base));
+            }
+        }
+        // the whitelist match above already rejected unknown backends —
+        // this arm exists so a future backend CANNOT silently inherit
+        // another backend's asset resolution (设计红队 A17)
+        other => {
+            return Err(UtaiError::Training(format!(
+                "TRAINING_INTERNAL_ASSET_BRANCH: {}",
+                other
+            )));
+        }
+    }
+    if backend != "vocoder" {
+        // the vocoder pipeline extracts neither features nor f0-by-model
+        // (parselmouth is in-process) — requiring these would be a lie
+        required.push(("ContentVec feature extractor".into(), contentvec.clone()));
+        required.push(("RMVPE pitch model (rmvpe.pt)".into(), rmvpe_pt.clone()));
+    } else if aug_copies > 0 {
+        // ...except the S41 aug quality gate, which is rmvpe-blooded by
+        // design (see the lineage comment above) — only when augmenting
+        required.push((
+            "RMVPE pitch model (rmvpe.pt, augmentation quality gate)".into(),
+            rmvpe_pt.clone(),
+        ));
+    }
+    Ok(ResolvedTrainingAssets {
+        required,
+        contentvec,
+        rmvpe_pt,
+        pretrain_g,
+        pretrain_d,
+        nsf_hifigan_model,
+        diffusion_pretrain,
+        vocoder_pretrain,
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartTrainingRequest {
+    pub model_name: String,
+    /// S76 batch 4: WHICH PROJECT this run trains into. Empty = resolve by `model_name`, the
+    /// pre-batch-4 behaviour.
+    ///
+    /// It has to be explicit. `model_name` became「本次训练名」— editable, defaulting to the
+    /// project name but free to differ — and it is also the artifact identity
+    /// (`slugify(model_name)` = `hps.name` / `weights/<slug>*`). Resolving the DIRECTORY from
+    /// it too would mean that renaming a run forks a second project: the old checkpoints keep
+    /// existing with nothing able to reach them, and `find_by_name` then picks between two
+    /// same-named projects by directory order.
+    #[serde(default)]
+    pub project_id: String,
+    pub backend: String, // "rvc" | "sovits" | "sovits_v2" | "sovits_diff" | "vocoder"
+    /// rvc: "v1" | "v2" — sovits/sovits_diff: "4.1" | "4.0" — sovits_v2: fixed
+    /// "4.0-v2" — vocoder: fixed "nsf_hifigan" (manifest markers, 一期单格式类)
+    pub version: String,
+    /// rvc: "32k" | "40k" | "48k" — sovits/vocoder: fixed "44k"
+    pub sample_rate: String,
+    pub dataset_files: Vec<String>,
+    /// ①c multi-speaker co-training (SoVITS = α, RVC = α′). Empty or 1 group =
+    /// single-speaker = the byte-identical legacy path (uses dataset_files).
+    /// >1 groups = per-speaker subdir import + run.json "speakers"; the emb_g
+    /// speaker id is the group's index (list order, frozen in the manifest).
+    #[serde(default)]
+    pub speakers: Vec<SpeakerGroup>,
+    pub total_epoch: u32,
+    pub batch_size: u32,
+    #[serde(default = "d_save_every")]
+    pub save_every_epoch: u32,
+    #[serde(default = "d_true")]
+    pub save_every_weights: bool,
+    #[serde(default = "d_true")]
+    pub keep_only_latest: bool,
+    #[serde(default)]
+    pub cache_gpu: bool,
+    #[serde(default = "d_true")]
+    pub fp16: bool,
+    /// Device identity in the ACCELERATOR'S own namespace, straight from
+    /// get_hardware_info.training_gpus: an NVIDIA UUID ("GPU-…", what
+    /// CUDA_VISIBLE_DEVICES actually accepts) or a vendor-relative index.
+    /// The UI id of the picked device (`TrainingGpu.id`, e.g. `nvidia:GPU-8a2c…` / `amd:0`);
+    /// "" = auto (leave visibility unset → torch's own default device).
+    /// ⚠ S75: this is an IDENTITY, not the device mask. try_start resolves it against a freshly
+    /// built device list and takes the mask from THAT entry — the mask alone is only unique
+    /// within a vendor, so a mask-keyed payload silently resolved to the wrong card on a
+    /// multi-vendor box. S67 (the ancestor of that bug): it was once a raw WMI adapter index, and
+    /// on an iGPU+NVIDIA box SELECTING the NVIDIA card masked every GPU and training fell back to
+    /// CPU silently.
+    #[serde(default)]
+    pub gpu: String,
+    #[serde(default)]
+    pub force_cpu: bool,
+    #[serde(default)]
+    pub spk_id: u32,
+    /// true = 重训 (wipe the workspace), false = 续训 (resume from latest ckpt)
+    #[serde(default)]
+    pub fresh: bool,
+    /// The user answered a destructive-wipe dialog with「重训」for THIS run. Fail-closed
+    /// (`#[serde(default)]` = false): a caller that forgets the field gets a loud refusal,
+    /// never a silent wipe.
+    ///
+    /// Why this exists: `fresh` alone could not tell「用户按了重训」from「前端探测挂了,于是
+    /// 默认当作全新」. onStart seeds `let fresh = true` and only narrows it inside the three
+    /// dialog branches, each gated on a probe whose failure is swallowed by `catch` — so a
+    /// broken/renamed probe command made every start a no-dialog `remove_dir_all` of a
+    /// workspace holding hours of training. The frontend now refuses to start on a probe
+    /// failure; this is the backstop that makes the same mistake impossible to reintroduce.
+    #[serde(default)]
+    pub wipe_confirmed: bool,
+    /// S41 PSOLA data augmentation: pitch-shifted copies per slice (0-3, 0 =
+    /// off). Applies to rvc / sovits / vocoder; sovits_diff IGNORES the
+    /// request value and inherits the workspace manifest's (shared dataset_44k
+    /// — same posture as vol_embedding/loudnorm).
+    #[serde(default)]
+    pub aug_copies: u32,
+    // ---- SoVITS-only knobs (ignored by the rvc backend) ----
+    /// 响度嵌入 (couples train.vol_aug + model.vol_embedding, like upstream --vol_aug)
+    #[serde(default)]
+    pub vol_embedding: bool,
+    /// resample 响度归一 (upstream default ON; ours OFF — lossy per upstream README)
+    #[serde(default)]
+    pub loudnorm: bool,
+    /// 聚类中心 (kmeans) instead of the default retrieval matrix
+    #[serde(default)]
+    pub kmeans: bool,
+    /// ckpt/eval cadence in global steps (upstream eval_interval)
+    #[serde(default = "d_save_steps")]
+    pub save_every_steps: u32,
+    /// how many G_/D_ checkpoints to keep (upstream keep_ckpts; *_0.pth exempt)
+    #[serde(default = "d_keep_ckpts")]
+    pub keep_ckpts: u32,
+    /// ★S117 §F2⒜ — which archive a 续训 continues from: "latest" (default, = every previous
+    /// release) or "best" (the resumable snapshot written next to `weights/<name>_best.pth`).
+    ///
+    /// ⚠ Deliberately NOT in `resume_lock`'s table: that table is about values baked into
+    /// artifacts that already exist, and this one chooses WHICH artifact to read. It changes
+    /// nothing about what the slot is allowed to contain.
+    #[serde(default)]
+    pub resume_from: String,
+    /// ★§F2⒝ batch 2 step ④ — WHICH RUN of the slot this start addresses. Same posture as
+    /// `resume_from` above and for the same reason: a PRODUCT SELECTOR, never a lock-table row.
+    /// It picks which existing artifacts get read and written; it changes nothing about what the
+    /// slot is allowed to contain.
+    ///
+    /// Empty = "the slot holds at most one run, use it" — which is what `trun::resolve_run_dir`
+    /// asserts and REFUSES to guess about. That is why the field can be added a batch before the
+    /// one that mints a second run: while every slot has one run, empty is right everywhere, and
+    /// the batch that starts minting hands a real id to each call site or hears `RUN_AMBIGUOUS`.
+    #[serde(default)]
+    pub run_id: String,
+    /// cache the whole dataset in RAM (upstream all_in_mem)
+    #[serde(default)]
+    pub all_in_mem: bool,
+    // ---- sovits_diff-only knobs (ignored by the other backends) ----
+    /// completion target in global steps (diffusion epochs are tiny sentinel
+    /// units — upstream itself thinks in steps; total_epoch is sent as 0)
+    #[serde(default = "d_total_steps")]
+    pub total_steps: u32,
+    /// 0 = full diffusion (train all 1000 t), else shallow k_step_max
+    #[serde(default)]
+    pub k_step_max: u32,
+    /// milestone keep cadence in steps — normalized to a multiple of
+    /// save_every_steps (upstream's delete-previous rule only ever keeps
+    /// checkpoints on the save grid, so a non-multiple would silently shift
+    /// the real milestone grid to the lcm)
+    #[serde(default = "d_force_save")]
+    pub interval_force_save: u32,
+    /// cache the whole dataset in RAM during diffusion training
+    #[serde(default = "d_true")]
+    pub cache_all_data: bool,
+    // ---- vocoder-only knobs (ignored by the other backends) ----
+    /// dataset crop window in mel frames (upstream crop_mel_frames; 32 = the
+    /// ft_hifigan 16G preset, 48 = 24G)
+    #[serde(default = "d_crop_mel")]
+    pub crop_mel_frames: u32,
+    /// freeze the MPD discriminator (upstream README: small-step finetunes
+    /// may benefit; couples freezing_enabled + frozen_params python-side)
+    #[serde(default)]
+    pub freeze_mpd: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct StageInfo {
+    pub stage: String,
+    pub done: Option<u64>,
+    pub total: Option<u64>,
+    pub progress: Option<f32>,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StepInfo {
+    pub step: u64,
+    pub total_steps: u64,
+    pub epoch: u32,
+    pub total_epochs: u32,
+    pub lr: f64,
+    pub losses: HashMap<String, f64>,
+    pub eta_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StepPoint {
+    pub step: u64,
+    pub lr: f64,
+    pub losses: HashMap<String, f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CkptInfo {
+    pub kind: String, // periodic | best | final | stop
+    pub path: String,
+    pub step: u64,
+    pub epoch: u32,
+    pub metric: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct TrainingSnapshot {
+    /// idle | starting | running | completed | stopped | error
+    pub state: String,
+    pub error: Option<String>,
+    pub backend: String,
+    pub model_name: String,
+    pub model_slug: String,
+    /// S76: which training PROJECT this run belongs to. Filled at start; empty while idle.
+    /// Batch 2's export ledger and batch 4's explicit routing both key on it, so it is
+    /// carried from the very first batch rather than bolted on later.
+    #[serde(default)]
+    pub project_id: String,
+    /// The RUN directory of this run — where `weights/` and the audition cache live.
+    ///
+    /// ★§F2⒝ batch 2: it was the family slot while a slot could only ever hold one run. It is
+    /// resolved through `trun::resolve_run_dir` now, which answers with the slot root for as long
+    /// as there is no `runs/` container — so every frontend consumer that joins `audition/<stem>`
+    /// or reads `weights/` off it keeps working byte-for-byte, and starts addressing the right run
+    /// the moment the layout migration is turned on.
+    ///
+    /// ⚠ NOT the same value as the `workspace` key in the sidecar's run config: that one is the
+    /// SLOT, because python resolves its preprocessing pool relative to it.
+    pub workspace: String,
+    /// ★§F2⒝-B2-⑤ / §E2E-M25: WHICH run this is, as the id the project page's rows carry.
+    ///
+    /// Derived from `workspace` by [`trun::run_id_of`] at the same place and from the same binding,
+    /// so the two can never name different runs. The frontend needs it because `RunDetail` has no
+    /// path field: without this, 「这一行是不是正在跑的那个」 is unanswerable on the project page
+    /// (the archive segment answers it by comparing `workspace` against a per-row export context —
+    /// an async probe per row, which a card wall cannot pay for).
+    ///
+    /// ## ⛔ Three states, and two of them are the SAME string
+    ///
+    /// * **`""` while idle** — `Default`. Says nothing; `state` is what answers 「有没有 run 在跑」.
+    /// * **`""` while running** — a POSITIVE fact: the slot root IS this run (layout ≤ 2), which is
+    ///   also exactly what `RunDetail.id` carries for that slot's single row.
+    /// * **non-empty** — the run id, byte-identical to the one `trun::list_runs` reports.
+    ///
+    /// ⇒ A consumer MUST gate on `state` before comparing this to a row id. Reading `""` as 「没有」
+    /// makes an unmigrated slot's only row read as 「正在训练」 forever, idle included — the same
+    /// absence-inference `rowIdentity.ts` bans in its header, wearing different clothes.
+    ///
+    /// ⚠ Not cleared when a run ENDS: only `reset_display` clears the snapshot, and the user
+    /// triggers that with 「清空结果」. `state` is the liveness; this is only the identity.
+    #[serde(default)]
+    pub run_id: String,
+    pub total_epochs: u32,
+    pub stage: Option<StageInfo>,
+    pub step: Option<StepInfo>,
+    pub ckpts: Vec<CkptInfo>,
+    pub summary: Option<serde_json::Value>,
+    pub stop_requested: bool,
+    pub elapsed_secs: u64,
+    /// last stderr lines — populated when state == error (loud failures)
+    pub stderr_tail: Vec<String>,
+    /// ①c: ordered speaker DISPLAY names for a multi-speaker run (index = emb_g id), so the
+    /// audition speaker picker can label by name without depending on the editable DataStep
+    /// state. Empty for single-speaker runs. Reflects the RUN (frozen at start), not the form.
+    #[serde(default)]
+    pub speakers: Vec<String>,
+    /// S114 §F5-1: stable CODEs for things that went wrong WHILE THE RUN IS STILL ALIVE —
+    /// the frontend localizes them through the same `backendError.ts` map as failures.
+    ///
+    /// This exists because the community's "training just froze" report has no failure to
+    /// report: the DataLoader's feeder thread dies inside a daemon thread, the main process
+    /// waits forever on a queue nobody will fill, and `error`/`done` never arrive. Everything
+    /// this struct could previously say was "running". A warning is deliberately NOT a state
+    /// change: the run may still be fine (a first-conv MIOpen compile legitimately stalls a
+    /// gfx1103 box for minutes), so it informs and never aborts.
+    ///
+    /// `skip_serializing_if` keeps the wire byte-identical to pre-S114 for every healthy run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+struct Inner {
+    snapshot: Mutex<TrainingSnapshot>,
+    history: Mutex<Vec<StepPoint>>,
+    stderr_ring: Mutex<VecDeque<String>>,
+    child: Mutex<Option<std::process::Child>>,
+    stop_file: Mutex<Option<PathBuf>>,
+    running: AtomicBool,
+    /// Hard-abort request covering the PRE-SPAWN window (dataset import → spawn →
+    /// child slotting): force_stop/quit can otherwise only kill an already-slotted
+    /// child, silently no-oping during a minutes-long import.
+    abort: AtomicBool,
+    started_at: Mutex<Option<Instant>>,
+    /// S114 §F5-1: when the sidecar last said ANYTHING on the protocol. The stall
+    /// watchdog reads it; `None` = nothing has been heard yet, so it is not armed.
+    last_progress_at: Mutex<Option<Instant>>,
+}
+
+/// S114 §F5-1 diagnostics that can be raised while a run is still alive.
+mod warn_code {
+    /// Windows commit limit exhausted -> a DataLoader worker could not create the
+    /// shared file mapping for its batch (error 1455). The exception lands in
+    /// multiprocessing's daemon feeder thread, which prints and carries on, so the
+    /// trainer hangs instead of failing: without this we have nothing to say.
+    pub const HOST_MEMORY: &str = "TRAINING_HOST_MEMORY_EXHAUSTED";
+    /// Nothing on the protocol for a long time. Deliberately generic — it catches
+    /// the 1455 hang AND every other cause we have not met yet.
+    pub const NO_PROGRESS: &str = "TRAINING_NO_PROGRESS";
+}
+
+/// How long the sidecar may say nothing before the watchdog speaks up.
+///
+/// ⚠ Generous ON PURPOSE, and the number has a reason: a gfx1103 (780M) box
+/// compiles its first conv configuration for 6-8 minutes with no output at all
+/// (MIOpen ships no pre-built kernel DB for it — see util.rs FIND_MODE=5). A
+/// threshold under that would fire on every AMD iGPU run and train users to
+/// ignore it. It also only arms after the first protocol message, so a long
+/// preprocessing stage cannot trip it either.
+const STALL_WARN_SECS: u64 = 15 * 60;
+
+/// Raise `code` once per run. Returns true if it was newly raised.
+///
+/// Idempotent because both raisers can fire repeatedly: the 1455 traceback is
+/// printed once PER WORKER (five in the field report) and the watchdog re-checks
+/// on a timer. A warning list that grows without bound would push the real first
+/// occurrence out of view.
+fn raise_warning(inner: &Inner, app: &tauri::AppHandle, code: &str) -> bool {
+    if !push_warning_code(&mut inner.snapshot.lock(), code) {
+        return false;
+    }
+    tracing::error!("training warning: {}", code);
+    let _ = app.emit("training-warning", code.to_string());
+    true
+}
+
+/// The dedupe half of `raise_warning`, split out so it is testable: the emit half
+/// needs a `tauri::AppHandle` and tauri ships no test feature here, so anything
+/// left inside the handle-taking function is unreachable from `cargo test`.
+fn push_warning_code(s: &mut TrainingSnapshot, code: &str) -> bool {
+    if s.warnings.iter().any(|w| w == code) {
+        return false;
+    }
+    s.warnings.push(code.to_string());
+    true
+}
+
+pub struct TrainingManager {
+    app_dir: PathBuf,
+    inner: Arc<Inner>,
+}
+
+/// The family SLOT directory for a (model name, backend) pair — the frontend's "does a
+/// resumable workspace exist?" probes need the same mapping `try_start` uses.
+///
+/// S76: identity moved from「模型名 → 目录」to「模型名 → 项目 → 架构槽」, so the backend is
+/// now part of the question. When no project exists yet the returned path is deliberately one
+/// that cannot exist, so every `.exists()` probe answers false instead of erroring.
+pub fn slot_path(data_dir: &Path, model_name: &str, backend: &str) -> PathBuf {
+    let family = backend_family(backend);
+    match tproject::find_by_name(data_dir, model_name) {
+        Some(p) => tproject::family_dir(data_dir, &p.id, family),
+        None => tproject::family_dir(data_dir, &slugify(model_name), family),
+    }
+}
+
+/// Structured workspace facts for the frontend confirm dialogs: the main
+/// retrain dialog warns when it would also wipe diffusion progress; the
+/// diffusion card phrases its dialog by resume-vs-cache-reuse. Read-only.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceInfo {
+    pub exists: bool,
+    /// manifest family ("rvc"/"sovits"); "" when absent/unreadable
+    pub family: String,
+    /// manifest version ("v1"/"v2"/"4.1"/"4.0"); "" when absent — the frontend
+    /// must not offer「续训」across a version mismatch (the Rust resume guard
+    /// would refuse it anyway, but only AFTER the dialog promised it)
+    pub version: String,
+    /// manifest sample rate ("32k"/"40k"/"48k"/"44k"); "" when absent
+    pub sample_rate: String,
+    /// any main-model checkpoint (G_*.pth) at the workspace root
+    pub has_main_progress: bool,
+    /// max numbered diffusion checkpoint step (model_<n>.pt); 0 = none/base only
+    pub diff_steps: u64,
+    /// ★S117 §F2⒜ — the step of the resumable BEST snapshot, or None when this slot has none.
+    /// Drives the「从最佳存档继续」option in the resume dialog: offering it when the directory
+    /// is absent or half-written would be a button that silently does something else.
+    pub best_resume_step: Option<u64>,
+    /// ★S118 §F8⒜ — the SHALLOW-DIFFUSION best snapshot's step (`<slot>/diffusion/resume_best/`).
+    /// ⛔ A SEPARATE field on purpose: `backend_family("sovits_diff") == "sovits"`, so a diffusion
+    /// probe gets the sovits slot and `best_resume_step` above therefore describes the MAIN GAN
+    /// model's G+D snapshot. Driving a diffusion「从最佳存档继续」button off that field would
+    /// print the main model's step for a diffusion run — a lie in the label AND in the effect.
+    /// ⚠ Serde: `WorkspaceInfo` has NO `rename_all`, so the TS mirror is snake_case.
+    pub diff_best_resume_step: Option<u64>,
+    /// manifest aug_copies (S41 数据增强份数) — diff runs inherit it from the
+    /// main training; surfaced so the diff params page shows the real value
+    pub aug_copies: u64,
+    /// ★§F2⒝ 批 2 ④d — the loudness-normalisation flag this slot's PREPROCESSING was built with.
+    /// `None` = nothing on disk answers (a slot that never ran, or a manifest old enough to
+    /// predate the field with no single pool fingerprint to read it out of).
+    ///
+    /// ⛔ `Option`, not `bool`, and the difference is the whole point: the params-page form
+    /// restore has to tell "this slot was built WITHOUT loudnorm" apart from "nobody knows".
+    /// `loudnorm` is folded into the sovits-family dataset fingerprint
+    /// (`utai_train/sovits/pipeline.py`'s `extract_cache_fp_text`), so it is not a display
+    /// preference — it NAMES the pool. A form that forgets it and sends `false` against a pool
+    /// built with `true` resolves a different pool and re-slices + re-extracts every file in it,
+    /// with one `logger.info` as the only sign. Collapsing unknown into `false` is exactly how
+    /// that happens, which is why this field refuses to.
+    pub loudnorm: Option<bool>,
+    /// a reusable shared slice pool exists (prior completed import): diff runs
+    /// may start WITHOUT re-importing data when this is true (S41 共享池模式)
+    pub has_dataset: bool,
+    /// ★S142 §E2E-M10-⒜ — does THIS SLOT hold preprocessing ([`slot_has_preprocessing`])?
+    ///
+    /// ⛔ **与上面那个 `has_dataset` 是两件事,别混**:`has_dataset` 问的是**项目**导入过音频没有
+    /// (`tproject::has_dataset`,槽还没跑过也可以为真);这一条问的是**这个槽**已经把那些音频
+    /// 切过片、抽过 f0 与特征没有 —— 也就是「改一个池级字段要不要再付一遍那几个小时」。
+    /// ⛔⛔ 也**别**读成 `commands::storage::WorkspaceUsage::has_pool` —— 那个同名字段的赋值是
+    /// `tproject::has_dataset(..)`,也就是这里的 `has_dataset`,**正好是另一件事**。名字里带
+    /// `preprocessing` 就是为了让这两个名字不可能被顺手抄错(仓里已经为 `poolCount` 付过一次账)。
+    ///
+    /// 它存在的理由:参数页的「改这一项会重跑预处理」此前拿**这个 run 的 manifest**当近似,
+    /// 而那份近似在**重训路径**上是错的(S132 的 flip 之后重训不再清空整槽,池是槽级、内容
+    /// 寻址、跨 run 共享的 ⇒ 池还在、代价还在,而提示消失了)。
+    pub has_preprocessing: bool,
+    /// ①c resume config-diff: manifest vol_embedding (SoVITS main model) — None when absent /
+    /// not sovits. Surfaced so the resume dialog can show a mismatch BEFORE start (the Rust guard
+    /// rejects it otherwise, but only after the dialog already promised 续训).
+    pub vol_embedding: Option<bool>,
+    /// ①c: manifest n_speakers (multi-speaker co-train); 1 when absent (single-speaker).
+    pub n_speakers: u64,
+    /// ①c: ordered speaker DISPLAY names, index = emb_g row id = the order the data page listed
+    /// them in; empty for single-speaker. Read from the MANIFEST's `speaker_names`, which is
+    /// merge-preserved — `run.json` is only the pre-fix fallback, and a later `sovits_diff` run
+    /// rewrites that file WITHOUT a speakers key. (The manifest's `speakers` array is the
+    /// matching slug list, same order.)
+    pub speakers: Vec<String>,
+    /// ①c: manifest diff_k_step_max (sovits_diff); 0 when absent.
+    pub diff_k_step_max: u64,
+}
+
+/// The `loudnorm` flag a pool FINGERPRINT TEXT records, or `None` when the text does not answer.
+///
+/// The four fingerprint formulas (`utai_train/{sovits,sovits_v2,rvc,vocoder}/pipeline.py`) all
+/// build a `|`-joined token list, and only the sovits family carries this token — so "no answer"
+/// is the ordinary case here, not a corruption.
+///
+/// ⛔ Deliberately NOT the `text.contains("|loudnorm=1")` this replaced. That shape had three
+/// failure modes and no way to report any of them:
+/// * `|loudnorm=10` reads as true (a value that is not a flag at all);
+/// * `|note=|loudnorm=1` reads as true (the token embedded in another token's VALUE);
+/// * it cannot say "unknown", so every one of those collapsed into `false` at the call site —
+///   and `false` is a legal answer that then gets written into the manifest as fact.
+/// Tokenising is free and lets both callers distinguish absent from off.
+///
+/// ⚠ A token without `=` is normal input: a multi-speaker RVC fingerprint is a `|`-join of bare
+/// hashes (`rvc/pipeline.py`), so skipping those is required, not defensive.
+/// ⚠ Two `loudnorm` tokens that disagree answer `None`. No formula can emit that, so it is a text
+/// we do not understand — and not guessing at a text we do not understand is the entire job.
+pub(crate) fn loudnorm_from_fingerprint(text: &str) -> Option<bool> {
+    let mut seen: Option<bool> = None;
+    for tok in text.trim().split('|') {
+        let Some(raw) = tok.strip_prefix("loudnorm=") else {
+            continue;
+        };
+        let v = match raw {
+            "0" => false,
+            "1" => true,
+            _ => return None,
+        };
+        match seen {
+            Some(prev) if prev != v => return None,
+            _ => seen = Some(v),
+        }
+    }
+    seen
+}
+
+/// LEGACY-SHAPE predicate: a pre-S76 workspace where `dataset/` and `dataset.fingerprint`
+/// were siblings of the checkpoints. Still meaningful for exactly two callers — the
+/// wipe-consent guard and the migration's empty-shell test, both of which look at directories
+/// that may still have the old shape. The live "is there a reusable pool?" question is now
+/// [`tproject::has_dataset`], asked of the PROJECT.
+pub(crate) fn has_dataset_pool(ws: &Path) -> bool {
+    ws.join("dataset.fingerprint").is_file()
+        && std::fs::read_dir(ws.join("dataset"))
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false)
+}
+
+/// Does this SLOT hold anything a wipe would destroy? = any run's checkpoints, any run's
+/// diffusion progress, or an imported dataset pool (which cost a multi-minute import). An
+/// empty leftover directory — try_start's `create_dir_all` runs before the run can fail —
+/// holds nothing and stays freely wipeable.
+///
+/// Single source for the fail-closed wipe-consent guard; keep it a superset of every artifact
+/// class the resume paths can read back (add a family ⇒ add its ckpt shape here).
+///
+/// ⛔ **PLURAL over runs, and that is a safety property, not tidiness.** A 「重训」 erases the
+/// whole slot, so the question is "does ANY run hold work". Asking only one run would let this
+/// answer `false` while another run's gigabytes sit right there — and `false` here removes the
+/// backend's last refusal of an unconfirmed wipe (`TRAINING_WIPE_NOT_CONFIRMED`) *and* makes the
+/// sibling-slot `PROJECT_DATASET_IN_USE` pre-check fail open. Both failures are silent: the
+/// destructive dialog hangs off `WorkspaceInfo::exists`, not off this, so the prompt would still
+/// appear while the guard behind it was gone.
+///
+/// ⚠ It was named `workspace_holds_work` while "workspace" meant both the slot and the run. The
+/// name changed with the meaning: three of its arms are per-RUN questions and three are per-SLOT.
+pub(crate) fn slot_holds_work(slot: &Path) -> bool {
+    // ⛔★S132 §F2⒝ ④e — an UNREADABLE `runs/` answers 「yes, there is work」, never 「no」.
+    // This predicate's only two consumers are refusals (`TRAINING_WIPE_NOT_CONFIRMED` and the
+    // sibling-slot `PROJECT_DATASET_IN_USE`), so the safe answer under uncertainty is the one that
+    // REFUSES. `list_runs` used to swallow the error into an empty list, which made an ACL blip
+    // read as「this slot is empty」 — i.e. it removed the last guard in front of an unconfirmed
+    // wipe, silently. The dialog would still have appeared (it hangs off `WorkspaceInfo::exists`),
+    // so nothing on screen would have differed.
+    let runs = match trun::run_dirs(slot) {
+        Ok(runs) => runs,
+        Err(e) => {
+            tracing::error!(
+                "cannot enumerate the runs of {} ({e}) — answering 「holds work」 so every guard \
+                 in front of a destructive action stays closed",
+                slot.display()
+            );
+            return true;
+        }
+    };
+    runs.iter().any(|run| {
+        has_main_progress(run)
+            // ★S119 §F8⒝ — the resumable BEST snapshot counts as work too, for the same reason the
+            // diffusion arm below was widened in S118: it can outlive the numbered grid, and then a
+            // wipe with no dialog would destroy the only thing the slot could be continued from.
+            // ⚠ `voc_snapshot_step` reads the payload list out of the marker, so this also picks up
+            // the GAN pair's `resume_best/` — a slot that used to read as「无活」when its numbered
+            // files were gone now reads as「有活」. That is a widening, deliberately: it can only
+            // ever ADD a consent dialog, never remove one.
+            || vocoder_progress_step(run).is_some()
+            // ★S118 §F8⒜ — the SNAPSHOTS count as diffusion work too, and they can outlive the
+            // numbered grid (the archive cleanup and a user freeing disk space both delete the big
+            // numbered files first). Asking only `max_diffusion_step` here would let a slot whose
+            // only resume point is a snapshot be wiped with no dialog at all.
+            || diffusion_progress_step(run).unwrap_or(0) > 0
+    })
+        // ⚠ These three are per-SLOT questions and stay on the slot: the pool is shared by every
+        // run of it, which is the entire point of layout 2. ★S142 — they moved into
+        // [`slot_has_preprocessing`] because the params page needs to ask the SAME question.
+        || slot_has_preprocessing(slot)
+}
+
+/// Does this slot hold PREPROCESSING — i.e. would changing a pool-level field cost hours again?
+///
+/// Preprocessing counts as work: slicing + f0 + feature extraction is the multi-HOUR part of a
+/// training run, and a slot that has it but no checkpoint yet is the normal state of「刚开始练」.
+/// `dataset.fingerprint` is the one artifact every family writes (python does it on ENTERING
+/// preprocessing — `utai_train/pool.py`), which makes it the single portable judge. Without this
+/// the wipe-consent guard would let a half-trained slot be erased with no dialog, and the
+/// shared-dataset guard would not recognise a sibling slot as "using this data".
+///
+/// ★§F2⒝ — that judge now lives INSIDE the pool. All three arms are kept on purpose: the second
+/// is not a fallback, it is the shape of a slot that has not been through the layout migration
+/// (and `tproject::empty_shell` still depends on it for pre-S76 trees). Dropping it would make an
+/// unmigrated slot read as「无活」and wipeable with no dialog.
+///
+/// ★S142 §E2E-M10-⒜ — it became its own function because it has a SECOND consumer now:
+/// `slot_info` sends it to the params page as `has_pool`, so the「改这一项会重跑预处理」hint asks
+/// the same question the wipe guard asks. Before that the page手抄了一份近似 ——「这个 **run** 的
+/// manifest 说它跑过」—— and that approximation is WRONG on the retrain path, where the pool is
+/// still there (S132 的 flip 之后重训不再清空整槽) while the hint disappeared.
+/// ⛔ 不许再手抄第四份:池是**槽级**的,而「有没有池」只有这一个答案。
+///
+/// ⛔⛔ **失败语义:读不动 ⇒ 答 true。** 这一条到 S142 为止的理由是「它的两个消费者都是**拒绝**」
+/// (`tpool::slot_has_pool` 的注释与 S132 的判断都这么写),而 `has_pool` 是**第三个消费者、
+/// 而且它不是拒绝**——它只是屏幕上的一句话。答案仍然一样,但**理由变了,必须写下来**:
+/// 不确定时**说出代价**比**静默**安全(静默的代价是几小时,而说错的代价是一句多余的提示)。
+/// ⇒ 将来若有人给它加一个「不确定时应该沉默」的消费者,这里必须分叉,而不是改这个默认值。
+pub(crate) fn slot_has_preprocessing(slot: &Path) -> bool {
+    tpool::slot_has_pool(slot)
+        || slot.join(tpool::FINGERPRINT).is_file()
+        // pre-S76 shape only (dataset/ used to be a sibling of the checkpoints); still true
+        // for a directory the migration has not folded yet.
+        || has_dataset_pool(slot)
+}
+
+// `workspace_info(name, backend)` lived here until S76 batch 4. Every consumer now knows WHICH
+// PROJECT it means and calls `slot_info` — display names became user-editable in that batch, so
+// resolving a workspace from one could only ever go stale. Its one extra behaviour (probing the
+// legacy slug path so an UNMIGRATED pre-S76 workspace still reported `exists`) moved to where it
+// belongs: `list_project_summaries` lists such directories as「待迁移」rows, which is visible
+// instead of merely non-empty.
+
+/// Structured facts about ONE RUN of ONE architecture slot — the id-keyed form, which is
+/// the only one that stays correct across a rename.
+///
+/// ⛔ Every field except `exists` and `has_dataset` describes a RUN: the frozen manifest values,
+/// the progress probes, the resume points, the speaker order. It therefore resolves the run
+/// through [`trun::resolve_run_dir`] and RETURNS AN ERROR rather than guessing when a slot holds
+/// more than one and no id was given — an Err here is how a forgotten call site says so out loud.
+/// Answering with an empty `WorkspaceInfo` instead would blank `has_main_progress` and `version`,
+/// which the parameters page reads to decide whether the four resume-locked controls are locked:
+/// the user would get them unlocked, change one, and be refused by Rust with a CODE they did
+/// nothing to earn.
+///
+/// ★§F2⒝ batch 2 step ④ — `run_id` is how a caller says WHICH run it means. `None` keeps the
+/// pre-④ meaning exactly: "this slot has at most one run". Both are checked, neither guesses.
+pub fn slot_info(
+    data_dir: &Path,
+    project_id: &str,
+    backend: &str,
+    run_id: Option<&str>,
+) -> Result<WorkspaceInfo> {
+    let ws = tproject::family_dir(data_dir, project_id, backend_family(backend));
+    let run = trun::resolve_run_dir(&ws, run_id)?;
+    let manifest = std::fs::read_to_string(run.join("run_manifest.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .unwrap_or_default();
+    let field = |k: &str| manifest[k].as_str().unwrap_or("").to_string();
+    // ①c: display speaker names, ordered = emb_g id. The carriers and their precedence live in
+    // ONE place (`frozen_speakers_of_run`) so this and the project's dataset view can never
+    // disagree about who row i is. Empty for single-speaker — and also when NO carrier holds a
+    // name, so the pre-existing "nothing to compare" semantics of the resume dialog are preserved
+    // (a vec of blanks would read as a speaker mismatch).
+    let speakers: Vec<String> = {
+        let mut v: Vec<String> = frozen_speakers_of_run(&run)?
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        if v.iter().all(|n| n.is_empty()) {
+            v.clear();
+        }
+        v
+    };
+    Ok(WorkspaceInfo {
+        // ⚠ the SLOT's existence, not the run's: the destructive-retrain dialog hangs off this
+        // one field, and a slot that holds pools but no run must still prompt.
+        exists: ws.exists(),
+        family: field("backend"),
+        version: field("version"),
+        sample_rate: field("sample_rate"),
+        has_main_progress: has_main_progress(&run),
+        diff_steps: diffusion_progress_step(&run).unwrap_or(0),
+        // ★S119 §F8⒝ — the vocoder's marker records a lightning GLOBAL step while every other
+        // number this struct carries for that backend is REAL (`model_ckpt_steps_3644.ckpt` is
+        // step 1822 everywhere the user can see it). Halving here, once, keeps the resume
+        // dialog's 「从最佳存档继续（第 N 步）」 in the same units as the rest of the card.
+        best_resume_step: if backend_family(backend) == "vocoder" {
+            voc_best_resume_step(&run)
+        } else {
+            best_resume_step(&run)
+        },
+        diff_best_resume_step: diff_snapshot_step(&run, "resume_best"),
+        aug_copies: manifest["aug_copies"].as_u64().unwrap_or(0),
+        // ★§F2⒝ 批 2 ④d — manifest first, then the pool's own fingerprint. The order is not
+        // arbitrary: the manifest records what was REQUESTED, the fingerprint records what the
+        // products on disk were actually BUILT with, and they agree except in the one case the
+        // fallback exists for — an S38-era manifest that predates the key. Reading the pool there
+        // is the same recovery `try_start` already does for a diffusion run's inheritance
+        // (see `eff_loudnorm`), asked of the same two places in the same order.
+        // ⚠ `sole_pool_fingerprint` answers `None` with more than one pool, and that is the
+        // honest answer: with two pools nothing on disk says which one this run belongs to
+        // (nothing records the run↔pool edge yet). The caller then leaves the form alone.
+        loudnorm: manifest["loudnorm"].as_bool().or_else(|| {
+            tpool::sole_pool_fingerprint(&ws)
+                .or_else(|| std::fs::read_to_string(ws.join(tpool::FINGERPRINT)).ok())
+                .and_then(|s| loudnorm_from_fingerprint(&s))
+        }),
+        // S76: the reusable pool is the PROJECT's dataset, shared by every slot — not a
+        // sibling of this slot's checkpoints any more.
+        has_dataset: tproject::has_dataset(data_dir, project_id),
+        // ★S142 §E2E-M10-⒜ — the SLOT's own preprocessing, asked through the SAME predicate the
+        // wipe-consent guard uses. ⚠ `ws` here is the slot (see `exists` above), which is the
+        // right granularity: the pool is shared by every run of it.
+        has_preprocessing: slot_has_preprocessing(&ws),
+        vol_embedding: manifest["vol_embedding"].as_bool(),
+        n_speakers: manifest["n_speakers"].as_u64().unwrap_or(1),
+        speakers,
+        diff_k_step_max: manifest["diff_k_step_max"].as_u64().unwrap_or(0),
+    })
+}
+
+/// Everything the resume guard learns FROM DISK about one run.
+///
+/// ⛔ Extracted so a test can reach it, and the gap it closes is structural rather than a coverage
+/// number: `check_resume_locks` is fed FOUR disk reads, and if any one of them silently answers
+/// "nothing here" the guard's very first line (`let old = st.manifest?`) returns `None` and
+/// **every lock disappears at once** — a slot resumed with a mismatched version streams 4.1
+/// weights into a 4.0 graph and degrades to near-scratch while claiming「续训」.
+///
+/// Both existing test suites hand-write their `serde_json` manifests and their `has_main` /
+/// `max_diffusion_step` / `frozen_speakers` literals, so NOT ONE of them touches a filesystem.
+/// Re-point any of these reads at the wrong directory — exactly what per-run does — and the whole
+/// table goes quiet with the suite still green. That is why this is a function and not four
+/// expressions inline in `try_start` (which no test can drive: it needs a pyenv, a tauri `State`
+/// and a live process).
+pub(crate) struct ResumeLockFacts {
+    pub has_main: bool,
+    pub max_diffusion_step: Option<u64>,
+    pub frozen_speakers: Vec<dsmanifest::DsSpeaker>,
+}
+
+impl ResumeLockFacts {
+    /// The manifest is read separately by `try_start` (its family guard needs it BEFORE the wipe),
+    /// so it is passed in rather than re-read — one read, one truth.
+    pub fn state<'a>(&'a self, manifest: Option<&'a serde_json::Value>) -> resume_lock::ResumeState<'a> {
+        resume_lock::ResumeState {
+            manifest,
+            has_main: self.has_main,
+            max_diffusion_step: self.max_diffusion_step,
+            frozen_speakers: &self.frozen_speakers,
+        }
+    }
+}
+
+pub(crate) fn resume_lock_facts(run: &trun::RunDir) -> Result<ResumeLockFacts> {
+    Ok(ResumeLockFacts {
+        has_main: has_main_progress(run),
+        // ★S118 §F8⒜ — the k_step_max lock hangs off this being >0. It must therefore see the
+        // SNAPSHOTS too: a slot whose numbered grid was cleaned away still holds a resume point,
+        // and letting k_step_max change under it would silently retrain a different diffusion
+        // distribution into the same model.
+        max_diffusion_step: diffusion_progress_step(run),
+        // ⛔ 这里必须 `?`:`check_resume_locks` 的第一行是 `let old = st.manifest?`,而
+        // `frozen_speakers` 一空,说话人那一族的锁就整组消失 —— 与「读不动」正好同形。
+        frozen_speakers: frozen_speakers_of_run(run)?,
+    })
+}
+
+/// Drop the audition cache of every checkpoint directly under `going` — call it IMMEDIATELY
+/// before deleting them.
+///
+/// ⛔★S133 §F2⒝ ④e. The cache is keyed by the checkpoint's file STEM
+/// (`commands::audition::audition_dir`), and a hit is decided by `<dir>/model.json` existing and
+/// nothing else — so a checkpoint that is replaced by a DIFFERENT one of the same name (the
+/// diffusion products are fixed-name: `model_best.pt`) keeps serving the old converted graph, the
+/// old rendered wav and the old measured vocal range, with nothing on screen to tell them apart.
+///
+/// ⚠ Per checkpoint, never the whole `audition/` directory: the sibling entries belong to the MAIN
+/// model, which a 「重训(仅扩散)」 does not touch, and they hold the only copy of a measured vocal
+/// range (nothing re-measures it). Extracted as a function because that is what a test can drive —
+/// `try_start` cannot be driven at all.
+///
+/// Returns how many entries were removed. Best-effort by design: a cache that cannot be dropped is
+/// worth a log line, not a refused retrain (the training itself is still correct).
+fn evict_audition_of(run: &trun::RunDir, going: &Path) -> usize {
+    let cache = run.join("audition");
+    if !cache.is_dir() {
+        return 0;
+    }
+    let Ok(rd) = std::fs::read_dir(going) else { return 0 };
+    let mut n = 0;
+    for e in rd.flatten() {
+        // Only FILES: a snapshot subdirectory (`resume_best/`, …) is not a candidate anyone can
+        // audition, and its name is not a cache key.
+        if !e.path().is_file() {
+            continue;
+        }
+        let Some(stem) = e.path().file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        let dir = cache.join(&stem);
+        if !dir.is_dir() {
+            continue;
+        }
+        match crate::util::remove_dir_all_robust(&dir) {
+            Ok(()) => n += 1,
+            Err(err) => tracing::warn!(
+                "stale audition cache {} could not be dropped ({err}) — 试听 may replay the \
+                 previous run's render for this checkpoint",
+                dir.display()
+            ),
+        }
+    }
+    n
+}
+
+/// The manifest a resume guard judges against — read from THE RUN, never the slot.
+pub(crate) fn read_run_manifest(run: &trun::RunDir) -> Option<serde_json::Value> {
+    std::fs::read_to_string(run.join("run_manifest.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+}
+
+/// The `(slug, display name)` pairs ONE RUN froze, in emb_g row order. Empty when that run
+/// never co-trained speakers.
+///
+/// SINGLE SOURCE for「第 i 号歌手是谁」 — `slot_info` reports the names half of it.
+/// `slugify` is one-way, so without this a `dataset/<slug>/` directory can never be shown as
+/// the singer it holds, and the order is exactly what a manual rebuild must reproduce.
+///
+/// ⛔ `run` is a RUN directory. Both carriers are run products, and the value is what decides
+/// which emb_g row a singer occupies — reading another run's copy would silently map this run's
+/// speakers onto that one's rows (`effective_speaker_slugs` adopts frozen slugs whenever the
+/// COUNT matches, which two runs of the same project routinely do).
+///
+/// Two carriers, in this order:
+/// * `run_manifest.json` — `speakers` (slugs) + `speaker_names`. Durable: merge-preserved
+///   across a later `sovits_diff` run.
+/// * `run.json` — `speakers[]` with `slug` AND `name` per entry. Older workspaces predate
+///   `speaker_names` and this is the only place their names survive (verified against this
+///   machine's real 2-singer projects). Matched BY SLUG, never by position: a `sovits_diff`
+///   run rewrites `run.json` without the key at all, and a mismatched pair would print one
+///   singer's name against another's emb_g row — the exact confusion this is meant to end.
+/// ⛔★★S133 §F2⒝ ④e —— **「载体不在」与「载体读不动」不是同一个答案**,而它们此前是同一个
+/// `.ok()`。空是这条链上的**宽容**答案(见 [`frozen_speakers`] 的 over-strict 那一段),所以把
+/// 权限/杀软/网盘占用/半写坏的 JSON 收成空 = **恰好在文件系统已经出问题的时候**把
+/// `DATASET_SPEAKERS_FROZEN` 那道拒绝拿掉:
+/// `frozen_structure_family` 答 None ⇒ 数据页放行 ⇒ `delete_files(.., drop_empty_speaker_dirs =
+/// frozen.is_none())` 连空掉的 `dataset/<slug>/` 一起删 ⇒ 等文件重新读得动时,那套 `G_*.pth`
+/// 已经永久 `RESUME_SPEAKER_COUNT_MISMATCH`,全程零报错。
+///
+/// ⚠ 这不是「A 有而 B 没有」的缺席推断:这个函数**自己上面两行**的文档就写着「EMPTY 是宽容
+/// 答案 ⇒ 没有诚实的 in-band 值表示『我没看成』」,而它引入的判据在两行之下就用 `.ok()`
+/// 违反了那句话;而**同一个文件名**在 `tpool::slot_facts` 里是 fail-**closed** 的
+/// (S131 笔 2 花一笔买回来的区分)—— 同一份文件、同一种故障,一个消费者拒绝、一个放行,
+/// 而放行的那个是毁数据方向。
+pub fn frozen_speakers_of_run(ws: &trun::RunDir) -> Result<Vec<dsmanifest::DsSpeaker>> {
+    let read_json = |p: PathBuf| -> Result<Option<serde_json::Value>> {
+        let raw = match std::fs::read_to_string(&p) {
+            Ok(s) => s,
+            // 真的没有:单歌手 run 不写 `speakers`,`sovits_diff` 的 run.json 也可能没有这一段。
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(UtaiError::Training(format!(
+                    "FROZEN_SPEAKERS_UNREADABLE: {}: {e}",
+                    p.display()
+                )))
+            }
+        };
+        // 半写/损坏的 JSON 同样不是「没冻歌手」—— 它是「我读不懂这个载体」。
+        serde_json::from_str(&raw).map(Some).map_err(|e| {
+            UtaiError::Training(format!("FROZEN_SPEAKERS_UNREADABLE: {}: {e}", p.display()))
+        })
+    };
+    // `run.json` pairs, whether or not the manifest needs them.
+    let run_pairs: Vec<(String, String)> = read_json(ws.join("run.json"))?
+        .and_then(|v| {
+            v.get("speakers").and_then(|s| s.as_array()).map(|arr| {
+                arr.iter()
+                    .filter_map(|e| {
+                        Some((
+                            e.get("slug")?.as_str()?.to_string(),
+                            e.get("name")?.as_str()?.to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+    let Some(manifest) = read_json(ws.join("run_manifest.json"))? else {
+        return Ok(run_pairs
+            .into_iter()
+            .map(|(slug, name)| dsmanifest::DsSpeaker { slug, name })
+            .collect());
+    };
+    let str_array = |k: &str| -> Vec<String> {
+        manifest[k]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let slugs = str_array("speakers");
+    if slugs.is_empty() {
+        // single-speaker (no key) — or a manifest that lost it; `run.json` only ever carries
+        // the array for a genuine co-training, so this stays empty for single-speaker runs.
+        return Ok(run_pairs
+            .into_iter()
+            .map(|(slug, name)| dsmanifest::DsSpeaker { slug, name })
+            .collect());
+    }
+    let names = str_array("speaker_names");
+    Ok(slugs
+        .into_iter()
+        .enumerate()
+        .map(|(i, slug)| {
+            let name = names
+                .get(i)
+                .filter(|n| !n.is_empty())
+                .cloned()
+                .or_else(|| {
+                    run_pairs
+                        .iter()
+                        .find(|(s, _)| *s == slug)
+                        .map(|(_, n)| n.clone())
+                })
+                .unwrap_or_default();
+            dsmanifest::DsSpeaker { slug, name }
+        })
+        .collect())
+}
+
+/// The speaker set this SLOT has frozen — the answer the PROJECT-level guards need.
+///
+/// ⛔ **PLURAL over runs, and deliberately over-strict.** Its consumers ask 「这个项目的歌手结构
+/// 还能不能改」, and the load-bearing one is a REFUSAL: `delete_project_dataset_files` returns
+/// `DATASET_SPEAKERS_FROZEN` when a delete would empty a singer and any slot has frozen the set
+/// (`commands::training`). Answering EMPTY here removes that refusal — the delete then goes
+/// through, the singer's files are gone, and the speaker set has changed under a model that can
+/// no longer resume from it. (The `drop_empty_speaker_dirs` flag the same call passes is the
+/// small half: it only removes a directory that is already empty. Pointing a fix at the flag
+/// instead of at the refusal is how this reads if you skim it.)
+///
+/// Saying "frozen" when only one of several runs froze a set costs a refused edit; saying "not
+/// frozen" costs the data. Over-strict is the only safe direction, so this is a first-non-empty
+/// over every run rather than a question about one of them.
+///
+/// ⚠ It is NOT the right answer for「这一次 run 从哪些 slug 续训」— that is
+/// [`frozen_speakers_of_run`], asked of the run that is actually resuming.
+/// ⛔★S132 §F2⒝ ④e — returns a Result rather than answering EMPTY when the runs cannot be
+/// enumerated. Empty is the permissive answer here (see the over-strict note above), so swallowing
+/// an unreadable `runs/` into `vec![]` would remove `DATASET_SPEAKERS_FROZEN` exactly when the
+/// filesystem is already misbehaving. There is no honest in-band value for「I could not look」:
+/// a placeholder speaker would show up in the UI's singer list, so the refusal has to travel.
+pub fn frozen_speakers(
+    data_dir: &Path,
+    project_id: &str,
+    family: &str,
+) -> Result<Vec<dsmanifest::DsSpeaker>> {
+    let slot = tproject::family_dir(data_dir, project_id, backend_family(family));
+    for run in trun::run_dirs(&slot)? {
+        // ⛔ `?` 而不是 `.ok()`:这一条的返回值决定的是一道**拒绝**,而空是宽容答案。
+        // 一个读不动的 run 被跳过 ⇒ 它冻的那组歌手对整个项目**隐形**。
+        let v = frozen_speakers_of_run(&run)?;
+        if !v.is_empty() {
+            return Ok(v);
+        }
+    }
+    Ok(Vec::new())
+}
+
+/// ★S117 §F2⒜ / S118 §F8⒜ — the step of a COMPLETE resume snapshot under `<dir>/<sub>/`, or None.
+///
+/// Python owns the layout (`utai_train/resume_state.save_snapshot`): the payload file(s) first,
+/// `state.json` LAST, and the marker itself records WHICH files the payload was (`files`).
+/// Requiring the marker AND every file it names means a kill mid-write reads as "there is no
+/// snapshot" instead of offering a half-written one as a resume point.
+/// ⚠ Keep the two in step — python owns the layout, this only reads it. `fallback` covers markers
+/// written before `files` existed, where the payload was always the GAN pair.
+fn snapshot_step(dir: &Path, sub: &str, fallback: &[&str]) -> Option<u64> {
+    let d = dir.join(sub);
+    let raw = std::fs::read_to_string(d.join("state.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let listed: Vec<String> = v["files"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let files: Vec<String> = if listed.is_empty() {
+        fallback.iter().map(|s| (*s).to_string()).collect()
+    } else {
+        listed
+    };
+    if files.is_empty() || !files.iter().all(|f| d.join(f).is_file()) {
+        return None;
+    }
+    v["global_step"].as_u64()
+}
+
+/// The GAN trainers' resumable best snapshot: `<slot>/resume_best/{G.pth,D.pth,state.json}`.
+fn best_resume_step(run: &trun::RunDir) -> Option<u64> {
+    snapshot_step(run, "resume_best", &["G.pth", "D.pth"])
+}
+
+/// The shallow-diffusion snapshots, which live one level down in `<slot>/diffusion/` and hold ONE
+/// payload file each (that trainer's checkpoint is one file, not a G+D pair).
+fn diff_snapshot_step(run: &trun::RunDir, sub: &str) -> Option<u64> {
+    snapshot_step(&run.join("diffusion"), sub, &["model.pt"])
+}
+
+/// ★S119 §F8⒝ — the vocoder's resumable best snapshot, in GLOBAL lightning units.
+///
+/// It lives in the SAME `<slot>/resume_best/` directory as the GAN pair, and `snapshot_step` does
+/// not care which payload is in there because python records the payload names in the marker
+/// (`files`). What differs is the payload name — one lightning `model.ckpt` carrying generator,
+/// discriminator, BOTH optimizers and the loop state — and the units: the number in that marker
+/// is `trainer.global_step`, which for this manual-optimization GAN is 2× the real step
+/// (设计红队 A8). Every other vocoder number Rust and the UI show is REAL, so the halving happens
+/// in `voc_best_resume_step` and nowhere else.
+fn voc_snapshot_step(run: &trun::RunDir, sub: &str) -> Option<u64> {
+    snapshot_step(run, sub, &["model.ckpt"])
+}
+
+/// The vocoder's best snapshot in REAL steps — what the resume dialog's 「从最佳存档继续（第 N
+/// 步）」 must say, and what the target guard compares against `total_steps`.
+fn voc_best_resume_step(run: &trun::RunDir) -> Option<u64> {
+    voc_snapshot_step(run, "resume_best").map(|g| g / 2)
+}
+
+/// How far the VOCODER has actually progressed in this slot, in GLOBAL units: the numbered grid
+/// or the best snapshot, whichever is further.
+///
+/// ★S119 §F8⒝, and the reason is the same one S118 wrote for `diffusion_progress_step`: the
+/// archive cleanup and a user freeing disk space both delete the big numbered files first, so a
+/// slot whose only resume point is the snapshot must still read as「有活」— otherwise the
+/// wipe-consent dialog goes missing and the manifest guard stops guarding.
+fn vocoder_progress_step(run: &trun::RunDir) -> Option<u64> {
+    [
+        max_vocoder_ckpt_step(run),
+        voc_snapshot_step(run, "resume_best"),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+}
+
+/// How far shallow diffusion has ACTUALLY progressed in this slot: the numbered grid, or either
+/// resume snapshot, whichever is further.
+///
+/// ★S118 §F8⒜ — `max_diffusion_step` alone answers "the highest numbered file", and that stopped
+/// being the same question. `resume_latest/` is the only artifact that always carries the
+/// optimizer (upstream's `save_opt: false` makes the numbered grid optimizer-less), and the
+/// archive cleanup can leave a slot whose progress lives ONLY in the snapshots. Every consumer
+/// that asks "is there diffusion work here / how far is it" must use this one, or a wipe-consent
+/// dialog goes missing and a resume lock silently stops locking.
+fn diffusion_progress_step(run: &trun::RunDir) -> Option<u64> {
+    [
+        max_diffusion_step(run),
+        diff_snapshot_step(run, "resume_latest"),
+        diff_snapshot_step(run, "resume_best"),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+}
+
+/// Does this RUN hold a main-model generator?
+///
+/// ⛔ `run` is a RUN directory ([`trun::resolve_run_dir`]), not the family slot. This predicate is
+/// the load-bearing one of the whole per-run change: it drives `diff_partial_wipe`, and when it
+/// goes false a shallow-diffusion 「重训」 stops meaning "clear `diffusion/`" and becomes
+/// `remove_dir_all_robust` of the entire slot — taking the main model and the preprocessing pools
+/// with it. Handing it a slot root once the products live one level down answers `false` with no
+/// error anywhere.
+///
+/// ⚠ `is_file()` is not decoration: this scans a directory listing, and a DIRECTORY named
+/// `G_something.pth` would otherwise read as a checkpoint. Same guard the sibling scanners below
+/// and `tproject::scan_project_ckpts` need, for the same reason.
+fn has_main_progress(run: &trun::RunDir) -> bool {
+    std::fs::read_dir(run)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok()).any(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n.starts_with("G_") && n.ends_with(".pth") && e.path().is_file()
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Max numbered model_ckpt_steps_<N>.ckpt at the RUN root — the vocoder
+/// backend's lightning checkpoints (mirrors get_latest_checkpoint_path in the
+/// sidecar). ⚠️ N is in lightning GLOBAL units: the manual-opt GAN counts the
+/// D and G optimizer steps separately, so N = 2 × 实际步 — every comparison
+/// against total_steps must divide by 2 first (设计红队 A8).
+fn max_vocoder_ckpt_step(run: &trun::RunDir) -> Option<u64> {
+    let rd = std::fs::read_dir(run).ok()?;
+    let mut max: Option<u64> = None;
+    for e in rd.filter_map(|e| e.ok()) {
+        let n = e.file_name().to_string_lossy().into_owned();
+        if let Some(num) = n
+            .strip_prefix("model_ckpt_steps_")
+            .and_then(|s| s.strip_suffix(".ckpt"))
+        {
+            if let Ok(v) = num.parse::<u64>() {
+                if e.path().is_file() {
+                    max = Some(max.map_or(v, |m| m.max(v)));
+                }
+            }
+        }
+    }
+    max
+}
+
+/// Max numbered model_<n>.pt in <run>/diffusion — mirrors the sidecar's
+/// load_model resume scan (model_0.pt = the seeded base counts as 0).
+///
+/// ⚠ `diffusion/` is a RUN product, so this takes the run directory. It must stay ONE level below
+/// the run root rather than becoming it: python's snapshot scan slices checkpoint paths by a fixed
+/// prefix length (`SNAPSHOT_DIR_MIN_LEN`), and a run root has `eval/` and `logs/` inside its scope.
+fn max_diffusion_step(run: &trun::RunDir) -> Option<u64> {
+    let rd = std::fs::read_dir(run.join("diffusion")).ok()?;
+    let mut max: Option<u64> = None;
+    for e in rd.filter_map(|e| e.ok()) {
+        let n = e.file_name().to_string_lossy().into_owned();
+        if let Some(num) = n.strip_prefix("model_").and_then(|s| s.strip_suffix(".pt")) {
+            if let Ok(v) = num.parse::<u64>() {
+                // `resume_best/` and `resume_latest/` are directories here, and the diffusion
+                // snapshot payload inside them is `model.pt` — a directory that happened to be
+                // named `model_<digits>.pt` would be reported as the newest checkpoint and then
+                // handed to the resume path as one.
+                if e.path().is_file() {
+                    max = Some(max.map_or(v, |m| m.max(v)));
+                }
+            }
+        }
+    }
+    max
+}
+
+/// ASCII-safe workspace slug for a (possibly CJK) display name: the original
+/// RVC/SoVITS toolchains choke on non-ANSI experiment paths, so the workspace
+/// stays ASCII and the unicode name lives only in our registry / final artifacts.
+pub(crate) fn slugify(name: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut base: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(24)
+        .collect();
+    if base.is_empty() {
+        base = "model".to_string();
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut h);
+    format!("{}_{:08x}", base, h.finish() as u32)
+}
+
+/// THE artifact identity this run trains under: `hps.name`, the `weights/<slug>*` prefix, the
+/// `audition/<slug>_*` cache stems, the `config.spk` key, and — single-speaker SoVITS — the
+/// `<pool>/dataset_44k/<slug>/` slice directory.
+///
+/// ★§F2⒝ batch 2 step ④b —— **训练名从此只是标签:改变它永远不搬动任何字节。** Until this, the
+/// slug was `slugify(req.model_name)` recomputed on every start, which made the display name the
+/// identity. Three things hung off that, all of them silent:
+///
+/// * a renamed run's `weights/` and `audition/` entries become orphans, and the plain
+///   `weights/<slug>.pth` written at natural completion would exist TWICE, both classified
+///   `CkptKind::Final` (a kind whose doc says "one per slot");
+/// * `best_state.json` is name-INDEPENDENT (it sits at the run root) while `weights/<slug>_best.pth`
+///   is not, so a run continuing under a new name inherits the old best METRIC and may never write
+///   a best snapshot under the new name at all;
+/// * worst, the single-speaker SoVITS slice directory lives in the pool that runs SHARE, and the
+///   pool is selected by `dataset.fingerprint` CONTENT — the slug is not in it. A second name
+///   therefore grows a second full preprocessing tree inside the SAME pool, which nothing ever
+///   reclaims and which `extract.py` re-decodes in full on every later run, forever.
+///
+/// ⛔ Why the fallback is an ADOPTION and not a "the new way found nothing, use the old way" arm:
+/// `run.json[model_slug]` is a POSITIVE fact written by this very function's previous run — it is
+/// the value the artifacts on disk actually carry. Absence means the run never started, and a run
+/// that never started has nothing to orphan. (The banned shape — see `utai_train/pool.py:30-32` —
+/// is the one where absence is indistinguishable from a forgotten wiring change.)
+///
+/// `wipes_this_run` mints instead: a full 重训 erases the slot, so there are no artifacts left to
+/// keep the old identity for, and choosing a new name there is exactly the point of the button.
+///
+/// ⛔★ It is NOT `req.fresh`. That was this function's first form and it was WRONG on exactly one
+/// branch — `diff_partial_wipe` (see `try_start`): a 「重训(仅扩散)」 sets `fresh` and yet deletes
+/// only `<run>/diffusion/`, leaving the pool, `weights/`, `audition/` and `run.json` in place. So
+/// on that branch a minted slug is not「没有产物需要保住旧身份」, it is a rename applied to a run
+/// whose products all still exist:
+///   * the diffusion chain slices into `<pool>/dataset_44k/<newslug>/` — a SECOND full tree beside
+///     the first, inside the SAME pool (the pool is chosen by fingerprint CONTENT, which has no
+///     slug in it), and the two share ONE flat `<pool>/aug_meta` whose entries they then delete
+///     from each other;
+///   * `run.json` is rewritten wholesale with the new slug, so the MAIN model's frozen identity is
+///     silently re-pointed and its `weights/<oldslug>*` / `audition/<oldslug>_*` become orphans;
+///   * the main `config.json` keeps the OLD slug as its `config.spk` key, and nothing compares them.
+/// The rename button (§F2⒝ ④b) is what made that reachable, which is why the caller now composes
+/// the flag from the one `diff_partial_wipe` binding rather than from `req.fresh` alone.
+///
+/// ⚠ §F2⒝ ④d narrowed the FIRST and THIRD bullets, and only for a slot whose pools carry identity
+/// v2 ([`tpool::identity_version`]): there a SOLE speaker's slice directory and `config.spk` key
+/// are the constant [`tpool::SOLE_SPEAKER_DIR`], derived from arity rather than from the run's
+/// name, so a rename no longer moves either. The slug still names `weights/<slug>*`,
+/// `audition/<slug>_*` and `hps.name`, so the second bullet — and this whole guard — stands
+/// unchanged; and on an identity-v1 slot (one the 3→4 migration has not committed) all three
+/// bullets are still literally true.
+/// ⛔ Do NOT widen it to「工作区会不会被删」in general: the FULL wipe branch must keep minting, or
+/// 重训 stops being able to change the name — which is what that button is for.
+///
+/// Same early-out, same reason, as [`effective_speaker_slugs`].
+fn effective_artifact_slug(
+    run: &trun::RunDir,
+    req: &StartTrainingRequest,
+    wipes_this_run: bool,
+) -> String {
+    if wipes_this_run {
+        return slugify(&req.model_name);
+    }
+    tproject::run_artifact_slug(run).unwrap_or_else(|| slugify(&req.model_name))
+}
+
+/// 这次 start 该把哪个名字写进 `run.json`。
+///
+/// ⛔⛔ S141 —— **一次 start 绝不许改掉一个【已经有名字的】run 的名字。**
+///
+/// 名字是**标签**(§F2⒝ ④b 把产物身份冻进了 `run.json[model_slug]`),而标签有它自己的入口
+/// 与自己的三道闸:`rename_training_run` 拒运行中改、拒空名、拒另一个实例在动同一棵树。
+/// 一次 start 顺手把请求里的名字盖上去,等于**绕过那三道闸**。
+///
+/// ⚠ 它不是理论问题,是实机第一次开窗口就撞上的:用户走「再训一个」、给新 run 起名
+/// `run2-rvc`,然后在下一屏的对话框里改主意选了「从最佳存档继续」⇒ 没有铸新 run,而那个新
+/// 名字被写进了**旧 run** 的 `run.json`。此后卡片上写着 `run2-rvc`,而 `model_slug` 与
+/// `weights/<slug>*` 全是第一个 run 的 `test-rvc_ea3c92d9` —— **屏幕与产物指着两个不同的 run,
+/// 而全程没有任何东西说过一句话。**
+///
+/// ⇒ 规则只有一条,而且不需要知道这次 start 铸不铸新 run:**已经有名字的就保留它**。
+/// 铸新臂天然安全 —— 那是一个全新的目录,`run.json` 还不存在 ⇒ `existing` 是 `None`。
+/// 首次训练同理(那个 run 还没有名字,这时候写下去正是它该被命名的时刻)。
+fn name_to_persist(existing: Option<&str>, requested: &str) -> String {
+    match existing {
+        // ⚠ 原样保留,连 trim 都不做:这条规则是「一次 start **不改**这个字段」,而不是
+        // 「一次 start 把它规范化一下」—— 后者仍然是一次没人同意过的改名。
+        Some(kept) if !kept.trim().is_empty() => kept.to_string(),
+        _ => requested.to_string(),
+    }
+}
+
+/// The `(display name, slug)` this run must use for each co-trained speaker.
+///
+/// Fresh run ⇒ derive from the names. RESUME of a slot that already froze a speaker set ⇒ REUSE
+/// the frozen slugs, matched to the current names BY POSITION (the emb_g row order is what the
+/// resume guard demands be identical anyway).
+///
+/// Why reuse rather than re-derive: `slugify` hash-suffixes with `DefaultHasher` (SipHash-1-3),
+/// which std explicitly does not promise to keep stable across Rust releases — and the slug is
+/// the `dataset/<slug>/` directory name, the `dataset_44k/<slug>/` slice directory and the
+/// `config.spk` key. Re-deriving on every start means one toolchain bump turns every existing
+/// multi-speaker project unresumable AND orphans its data directories. (Frozen values are only
+/// adopted when the COUNT matches; anything else is a genuine structure change and falls through
+/// to the resume guard, which refuses it with a specific CODE.)
+fn effective_speaker_slugs(
+    run: &trun::RunDir,
+    req: &StartTrainingRequest,
+) -> Result<Vec<(String, String)>> {
+    if req.speakers.len() <= 1 {
+        return Ok(Vec::new());
+    }
+    let fresh = assign_speaker_slugs(&req.speakers);
+    if req.fresh {
+        return Ok(fresh);
+    }
+    // ⛔ THIS run's frozen slugs, never the slot's. The adoption test below is only "the COUNT
+    // matches", which two runs of one project routinely do — reading a sibling run's list here
+    // would map this run's singers onto that one's emb_g rows and preprocess them into that one's
+    // `dataset_44k/<slug>/` directories, with nothing anywhere reporting a mismatch.
+    // ⛔ `?`:读不动时退回 `fresh` 会把这一次续训的歌手**重新分配 slug**,于是预处理落进另一组
+    // `dataset_44k/<slug>/` 目录、emb_g 行号整体错位 —— 而这个函数存在的理由正是防这件事。
+    let frozen = frozen_speakers_of_run(run)?;
+    if frozen.len() != req.speakers.len() {
+        return Ok(fresh);
+    }
+    Ok(req
+        .speakers
+        .iter()
+        .zip(frozen.iter())
+        .map(|(sp, fz)| (sp.name.clone(), fz.slug.clone()))
+        .collect())
+}
+
+/// ①c deterministic ASCII slug per co-trained speaker — the slug is the
+/// dataset_44k subdir name AND the config.spk key AND (by list order) the
+/// emb_g id, so it MUST be stable across resume (frozen in the manifest) and
+/// unique (two speakers sharing a subdir would clobber each other's slices).
+/// slugify already hash-suffixes so distinct names rarely collide; dedupe
+/// defensively (identical slugs -> _2, _3 …). Returns (display_name, slug) in
+/// request order — do NOT sort (id order is authoritative).
+fn assign_speaker_slugs(speakers: &[SpeakerGroup]) -> Vec<(String, String)> {
+    let mut used = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(speakers.len());
+    for sp in speakers {
+        let base = slugify(&sp.name);
+        let mut slug = base.clone();
+        let mut n = 2;
+        while used.contains(&slug) {
+            slug = format!("{}_{}", base, n);
+            n += 1;
+        }
+        used.insert(slug.clone());
+        out.push((sp.name.clone(), slug));
+    }
+    out
+}
+
+impl TrainingManager {
+    pub fn new(app_dir: PathBuf) -> Self {
+        Self {
+            app_dir,
+            inner: Arc::new(Inner {
+                snapshot: Mutex::new(TrainingSnapshot {
+                    state: "idle".into(),
+                    ..Default::default()
+                }),
+                history: Mutex::new(Vec::new()),
+                stderr_ring: Mutex::new(VecDeque::new()),
+                child: Mutex::new(None),
+                stop_file: Mutex::new(None),
+                running: AtomicBool::new(false),
+                abort: AtomicBool::new(false),
+                started_at: Mutex::new(None),
+                last_progress_at: Mutex::new(None),
+            }),
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.inner.running.load(Ordering::SeqCst)
+    }
+
+    pub fn status(&self) -> TrainingSnapshot {
+        let mut s = self.inner.snapshot.lock().clone();
+        // started_at is Some only while the run is live; afterwards the final
+        // elapsed is frozen into the snapshot (finalize_elapsed)
+        if let Some(t) = *self.inner.started_at.lock() {
+            s.elapsed_secs = t.elapsed().as_secs();
+        }
+        s
+    }
+
+    pub fn history(&self) -> Vec<StepPoint> {
+        self.inner.history.lock().clone()
+    }
+
+    /// Reset the DISPLAY state of a finished run back to idle (snapshot, loss
+    /// history, stderr ring). Purely cosmetic — workspace files/checkpoints are
+    /// untouched and the run stays resumable. Refused while a run is live.
+    pub fn reset_display(&self) -> Result<()> {
+        if self.is_active() {
+            return Err(UtaiError::Training("TRAINING_ACTIVE".into()));
+        }
+        *self.inner.snapshot.lock() = TrainingSnapshot {
+            state: "idle".into(),
+            ..Default::default()
+        };
+        self.inner.history.lock().clear();
+        self.inner.stderr_ring.lock().clear();
+        *self.inner.started_at.lock() = None;
+        *self.inner.last_progress_at.lock() = None;
+        Ok(())
+    }
+
+    /// Graceful stop: create the flag file; the sidecar saves + finalizes at the
+    /// next safe boundary and reports `done(stopped)` through the protocol. If the
+    /// run hasn't reached its workspace yet (validation window), fall back to abort.
+    pub fn stop(&self) -> Result<()> {
+        if !self.is_active() {
+            return Ok(());
+        }
+        self.inner.snapshot.lock().stop_requested = true;
+        match self.inner.stop_file.lock().clone() {
+            Some(stop_file) => {
+                std::fs::write(&stop_file, "stop")?;
+                tracing::info!("training stop requested via {}", stop_file.display());
+            }
+            None => {
+                self.inner.abort.store(true, Ordering::SeqCst);
+            }
+        }
+        Ok(())
+    }
+
+    /// Hard kill — quit flow / user-confirmed force stop. No finalization. The
+    /// abort flag closes the pre-spawn window: the worker checks it during dataset
+    /// import and inside the child-slotting critical section, so either the worker
+    /// self-terminates or the child is here to be killed.
+    ///
+    /// ⛔ D7.2-004/D7.2-001/D7.2-009 fixes:
+    ///   - child.take() BEFORE drop锁: wait() must NOT hold the Mutex (force_stop cannot
+    ///     be blocked by the exit window; the worker similarly takes-then-drops before wait)
+    ///   - kill() + wait(): both required — without wait the child becomes a zombie on Unix
+    ///     and the process table entry leaks on Windows
+    ///   - stop_file clear: a stale stop_file would cause the NEXT start to trigger python's
+    ///     self-stop immediately (python writes this file on its own clean stop request path)
+    pub fn force_stop(&self) -> Result<()> {
+        self.inner.abort.store(true, Ordering::SeqCst);
+
+        // D7.2-009: clear stop_file BEFORE we do anything else — even if the child hasn't
+        // been slotted yet and force_stop effectively no-ops, the next resume must not read
+        // this stale sentinel.
+        let stale_stop = self.inner.stop_file.lock().take();
+        if let Some(path) = stale_stop.as_ref() {
+            let _ = std::fs::remove_file(path);
+        }
+
+        // D7.2-001 + D7.2-004: take the child OUT of the slot (drops the Mutex), then kill + wait
+        // in lock-free space so a concurrent force_stop does not pile up.
+        let child_opt = self.inner.child.lock().take();
+        if let Some(mut child) = child_opt {
+            let _ = child.kill();
+            let _ = child.wait();
+            tracing::warn!("training force-killed");
+        } else {
+            tracing::info!("force_stop: child not yet slotted or already cleaned up");
+        }
+        Ok(())
+    }
+
+    pub fn start(
+        &self,
+        app: tauri::AppHandle,
+        data_dir: PathBuf,
+        req: StartTrainingRequest,
+    ) -> Result<()> {
+        if self
+            .inner
+            .running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(UtaiError::Training("TRAINING_ALREADY_RUNNING".into()));
+        }
+        let launched = self.try_start(app, data_dir, req);
+        if launched.is_err() {
+            self.inner.running.store(false, Ordering::SeqCst);
+        }
+        launched
+    }
+
+    fn try_start(
+        &self,
+        app: tauri::AppHandle,
+        data_dir: PathBuf,
+        req: StartTrainingRequest,
+    ) -> Result<()> {
+        // reset the per-run controls FIRST: a stale stop_file path would let stop()
+        // write into the previous workspace; a stale abort flag would kill this run
+        self.inner.abort.store(false, Ordering::SeqCst);
+        *self.inner.stop_file.lock() = None;
+
+        match req.backend.as_str() {
+            "rvc" => {
+                if !matches!(req.version.as_str(), "v1" | "v2") {
+                    return Err(UtaiError::Training(format!(
+                        "TRAINING_BAD_RVC_VERSION: {}",
+                        req.version
+                    )));
+                }
+                if !matches!(req.sample_rate.as_str(), "32k" | "40k" | "48k") {
+                    return Err(UtaiError::Training(format!(
+                        "TRAINING_BAD_SAMPLE_RATE: {}",
+                        req.sample_rate
+                    )));
+                }
+            }
+            "sovits" | "sovits_diff" => {
+                if !matches!(req.version.as_str(), "4.1" | "4.0") {
+                    return Err(UtaiError::Training(format!(
+                        "TRAINING_BAD_SOVITS_VERSION: {}",
+                        req.version
+                    )));
+                }
+                if req.sample_rate != "44k" {
+                    return Err(UtaiError::Training(format!(
+                        "TRAINING_SR_FIXED_44K: {}",
+                        req.sample_rate
+                    )));
+                }
+                if req.save_every_steps == 0 {
+                    return Err(UtaiError::Training("TRAINING_SAVE_INTERVAL_ZERO".into()));
+                }
+                if req.backend == "sovits_diff" && req.total_steps == 0 {
+                    return Err(UtaiError::Training("TRAINING_TOTAL_STEPS_ZERO".into()));
+                }
+            }
+            "sovits_v2" => {
+                // S68: VISinger2 backend — its own family/workspace, one fixed
+                // version string ("4.0-v2" is what the exported sidecar carries)
+                if req.version != "4.0-v2" {
+                    return Err(UtaiError::Training(format!(
+                        "TRAINING_BAD_SOVITS_VERSION: {}",
+                        req.version
+                    )));
+                }
+                if req.sample_rate != "44k" {
+                    return Err(UtaiError::Training(format!(
+                        "TRAINING_SR_FIXED_44K: {}",
+                        req.sample_rate
+                    )));
+                }
+                if req.save_every_steps == 0 {
+                    return Err(UtaiError::Training("TRAINING_SAVE_INTERVAL_ZERO".into()));
+                }
+            }
+            "vocoder" => {
+                // version is a manifest marker (一期单格式类), not a user choice
+                if req.version != "nsf_hifigan" {
+                    return Err(UtaiError::Training(format!(
+                        "TRAINING_BAD_VOCODER_FORMAT: {}",
+                        req.version
+                    )));
+                }
+                if req.sample_rate != "44k" {
+                    return Err(UtaiError::Training(format!(
+                        "TRAINING_SR_FIXED_44K: {}",
+                        req.sample_rate
+                    )));
+                }
+                if req.save_every_steps == 0 {
+                    return Err(UtaiError::Training("TRAINING_SAVE_INTERVAL_ZERO".into()));
+                }
+                if req.total_steps == 0 {
+                    return Err(UtaiError::Training("TRAINING_TOTAL_STEPS_ZERO".into()));
+                }
+                if req.crop_mel_frames == 0 {
+                    return Err(UtaiError::Training("TRAINING_CROP_FRAMES_ZERO".into()));
+                }
+            }
+            other => {
+                return Err(UtaiError::Training(format!(
+                    "TRAINING_BACKEND_UNSUPPORTED: {}",
+                    other
+                )));
+            }
+        }
+        if req.aug_copies > 3 {
+            return Err(UtaiError::Training(format!(
+                "TRAINING_AUG_COPIES_MAX: {}",
+                req.aug_copies
+            )));
+        }
+        if req.model_name.trim().is_empty() {
+            return Err(UtaiError::Training("TRAINING_NAME_EMPTY".into()));
+        }
+        // S68b loud-degradation guard, at PREFLIGHT: refuse before the workspace wipe /
+        // dataset import (review: the run_worker placement cost a wiped workspace plus a
+        // multi-minute import before erroring on a fully-decidable condition).
+        refuse_cpu_only_runtime(&self.app_dir, req.force_cpu)?;
+
+        // ★S75 device resolution — HERE, for the same reason as the guard above. The chosen GPU
+        // decides which runtime drives the run, so a choice that no longer resolves is decidable
+        // the moment the button is pressed; deciding it in run_worker would burn the workspace
+        // and the whole dataset copy first. `req.gpu` is the UI id, re-derived against a freshly
+        // built list (never trusted): id → entry → (variant, mask).
+        let (gpu_mask, want_variant, mut gpu_gfx_target, gpu_label) = if req.force_cpu {
+            ("-1".to_string(), None, None, None)
+        } else if req.gpu.is_empty() {
+            (String::new(), None, None, None)
+        } else {
+            let g = crate::commands::settings::training_gpu_by_id(&self.app_dir, &req.gpu)
+                .ok_or_else(|| {
+                    UtaiError::Training(format!("TRAINING_GPU_UNKNOWN: {}", req.gpu))
+                })?;
+            if !g.selectable {
+                return Err(UtaiError::Training(
+                    g.reason.unwrap_or_else(|| "TRAINING_GPU_UNSUPPORTED".to_string()),
+                ));
+            }
+            (g.value, g.variant, g.gfx_target, Some(g.label))
+        };
+        let crate::pyenv::TrainingInterpreter { python, device_backend, variant: runtime_variant } =
+            crate::pyenv::training_interpreter_for(
+                &self.app_dir,
+                req.force_cpu,
+                want_variant.as_deref(),
+            )
+            .ok_or_else(|| {
+            // Only reachable if the pack vanished between the UI listing it and this call — fail
+            // CLOSED rather than fall back to whatever else happens to be installed.
+                UtaiError::Training(format!(
+                    "TRAINING_RUNTIME_VARIANT_MISSING: {}",
+                    want_variant.clone().unwrap_or_default()
+                ))
+            })?;
+        if !req.force_cpu && device_backend == "cpu" {
+            tracing::warn!(
+                "Training runtime is the CPU variant: this run will train on CPU (slow). For GPU training install the runtime pack matching your GPU in Settings → Training Environment."
+            );
+        }
+        // S169, auto lane: no GPU was picked but the resolver settled on the ROCm pack. An
+        // unmasked HIP process defaults to device 0, which on mixed-arch laptops can be an
+        // uncovered iGPU (the exact wrong-silicon shape the arch mask exists to prevent) — so
+        // derive the target from the first selectable AMD adapter, same source the UI default
+        // would have offered. Explicitly-picked GPUs already carried theirs from the entry.
+        if gpu_gfx_target.is_none()
+            && !req.force_cpu
+            && runtime_variant.as_deref() == Some("amd")
+        {
+            gpu_gfx_target =
+                crate::commands::settings::amd_first_selectable_gfx_target(&self.app_dir);
+            // ⛔ Fail CLOSED when no adapter qualifies (S169 adversarial review): "amd
+            // resolved but nothing selectable" means the installed pack drives none of this
+            // machine's dies (typically v1-only + RDNA3 dGPU — the S168 population). Letting
+            // the run proceed UNMASKED here would re-open the exact burn-the-workspace-then-
+            // hipErrorInvalidImage path this whole lane exists to close, on precisely those
+            // boxes. Same CODE the dropdown shows for the same condition; same remedy.
+            if gpu_gfx_target.is_none() {
+                return Err(UtaiError::Training(
+                    "TRAINING_GPU_NEEDS_PACK_UPDATE".to_string(),
+                ));
+            }
+        }
+
+        // READ-ONLY view of the target project, for the pre-flight checks below. Deliberately
+        // not `resolve_or_create`: creation stays after every check that can still refuse, so a
+        // rejected start never leaves an empty project behind. Keyed by id when the caller gave
+        // one — otherwise「复用项目数据集」would look up the editable 本次训练名 and answer
+        // TRAINING_NO_DATA for a project whose `dataset/` is right there.
+        let existing_project: Option<tproject::ProjectMeta> = if req.project_id.trim().is_empty() {
+            tproject::find_by_name(&data_dir, &req.model_name)
+        } else {
+            tproject::read_meta(&data_dir, &req.project_id)
+        };
+
+        // ①c multi-speaker co-training (>1 group): the dataset lives in the
+        // per-speaker `speakers` files, NOT dataset_files, so validate those and
+        // skip the single-speaker empty-dataset gate below. Single-speaker (0 or
+        // 1 group) falls through to the byte-identical legacy path.
+        let is_multi = req.speakers.len() > 1;
+        if is_multi {
+            // ①c: multi-speaker co-train = SoVITS (α) + RVC (α′) + SoVITS 4.0-v2
+            // (S68, natively multi-speaker upstream). Shallow-diffusion / vocoder
+            // stay single-speaker (their loaders assume one speaker).
+            if !matches!(req.backend.as_str(), "sovits" | "rvc" | "sovits_v2") {
+                return Err(UtaiError::Training("TRAINING_MULTI_BACKEND".into()));
+            }
+            // RVC emb_g is a FIXED 109-row table (spk_embed_dim in the config templates) — cap
+            // the co-train count so a huge set fails loud here, not as an out-of-range train id.
+            if req.backend == "rvc" && req.speakers.len() > 109 {
+                return Err(UtaiError::Training(format!(
+                    "TRAINING_SPEAKER_LIMIT: {}",
+                    req.speakers.len()
+                )));
+            }
+            // sovits_v2 keeps the base model's 200-row emb_spk table (n_speakers
+            // stays the template 200, upstream v2 semantics) — same loud cap.
+            if req.backend == "sovits_v2" && req.speakers.len() > 200 {
+                return Err(UtaiError::Training(format!(
+                    "TRAINING_SPEAKER_LIMIT: {}",
+                    req.speakers.len()
+                )));
+            }
+            let mut seen = std::collections::HashSet::new();
+            for sp in &req.speakers {
+                let name = sp.name.trim();
+                if name.is_empty() {
+                    return Err(UtaiError::Training("TRAINING_SPEAKER_NAME_EMPTY".into()));
+                }
+                if !seen.insert(name.to_string()) {
+                    // duplicate display names would collapse the release config's
+                    // spk dict (train.py) -> a missing sidecar speaker
+                    return Err(UtaiError::Training(format!(
+                        "TRAINING_SPEAKER_NAME_DUP: {}",
+                        name
+                    )));
+                }
+                for f in &sp.files {
+                    if !Path::new(f).is_file() {
+                        return Err(UtaiError::Training(format!(
+                            "TRAINING_DATA_FILE_MISSING: {}",
+                            f
+                        )));
+                    }
+                }
+            }
+            // ── S78: 结构声明式复用 ──────────────────────────────────────────
+            // Every group empty = 「就用这个项目盘上已有的这套歌手结构」, the multi-speaker twin
+            // of the flat reuse path. Expressing it as「把磁盘上那些文件的路径原样传回来」would
+            // also work today (an exactly-matching plan is a no-op) but only by coincidence: one
+            // removed file renumbers the rest, one renamed singer changes a slug, and the request
+            // silently becomes a full REPLACE of the shared dataset instead.
+            //
+            // The declaration is checked against the disk here, loudly, because nothing later
+            // will: the import loop has nothing to copy and python would just train on whatever
+            // subdirectories happen to exist.
+            let declared_only = req.speakers.iter().all(|s| s.files.is_empty());
+            let partial = !declared_only && req.speakers.iter().any(|s| s.files.is_empty());
+            if partial {
+                // half a declaration is not a declaration — the empty ones would silently get an
+                // emb_g row with no audio
+                let who = req
+                    .speakers
+                    .iter()
+                    .find(|s| s.files.is_empty())
+                    .map(|s| s.name.clone())
+                    .unwrap_or_default();
+                return Err(UtaiError::Training(format!("TRAINING_SPEAKER_NO_DATA: {who}")));
+            }
+            if declared_only {
+                let existing = existing_project.as_ref();
+                let ds = match existing {
+                    Some(p) => tproject::dataset_dir(&data_dir, &p.id),
+                    None => return Err(UtaiError::Training("TRAINING_NO_DATA".into())),
+                };
+                let on_disk: std::collections::BTreeSet<String> = std::fs::read_dir(&ds)
+                    .map(|rd| {
+                        rd.flatten()
+                            .filter(|e| e.path().is_dir())
+                            .map(|e| e.file_name().to_string_lossy().into_owned())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let declared: std::collections::BTreeSet<String> = effective_speaker_slugs(
+                    &trun::resolve_run_dir(
+                        &tproject::family_dir(
+                            &data_dir,
+                            &existing.unwrap().id,
+                            backend_family(&req.backend),
+                        ),
+                        // ★step ④ — THIS run's frozen slugs. `effective_speaker_slugs` adopts a
+                        // frozen list whenever the COUNT matches, which two runs of one project
+                        // routinely do, so a sibling's list here would map these singers onto that
+                        // run's emb_g rows and then check the dataset against the wrong names.
+                        Some(req.run_id.trim()).filter(|s| !s.is_empty()),
+                    )?,
+                    &req,
+                )?
+                .into_iter()
+                .map(|(_, s)| s)
+                .collect();
+                if on_disk.is_empty() || on_disk != declared {
+                    return Err(UtaiError::Training("PROJECT_DATASET_SHAPE".into()));
+                }
+                // a speaker directory with no audio would train an emb_g row on nothing
+                for slug in &declared {
+                    let empty = std::fs::read_dir(ds.join(slug))
+                        .map(|mut d| d.next().is_none())
+                        .unwrap_or(true);
+                    if empty {
+                        return Err(UtaiError::Training(format!(
+                            "TRAINING_SPEAKER_NO_DATA: {slug}"
+                        )));
+                    }
+                }
+            }
+        } else if req.dataset_files.is_empty() {
+            // 复用项目数据集(S76 拓宽)。dataset/ 现在住在项目层、由全部架构槽共享,所以
+            // 「不带数据启动」的正当性判据从「浅扩散 + 宿主是 sovits」拓宽成「这个项目已经
+            // 有导入好的数据」——这正是工作区化最核心的那件事:一份数据喂多个架构。
+            // 防「空数据逃课」的权威闸门仍在:项目里一个音频都没有就一律拒绝(前端禁用只是
+            // 第一道线)。CODE 按后端分流保持不变,浅扩散那条对话框链的文案依赖它。
+            let existing = existing_project.as_ref();
+            let pool_ok = existing
+                .map(|p| tproject::has_dataset(&data_dir, &p.id))
+                .unwrap_or(false);
+            if !pool_ok {
+                return Err(UtaiError::Training(if req.backend == "sovits_diff" {
+                    "TRAINING_NO_SHARED_POOL".into()
+                } else {
+                    "TRAINING_NO_DATA".to_string()
+                }));
+            }
+            // Reuse carries no speaker groups, so it can only consume a FLAT dataset. Handing
+            // a per-speaker (multi-singer) dataset to a run that believes it is single-speaker
+            // would either crash the slicer or — worse, if it silently skipped the
+            // subdirectories — fingerprint the empty set and freeze the caches forever.
+            // Refuse here; re-importing with the speaker groups is the way through until the
+            // data page learns to reuse a multi-speaker project (batch 5).
+            // `pool_ok` above already proved `existing` is Some.
+            let ds = tproject::dataset_dir(&data_dir, &existing.unwrap().id);
+            let has_subdirs = std::fs::read_dir(&ds)
+                .map(|rd| rd.flatten().any(|e| e.path().is_dir()))
+                .unwrap_or(false);
+            if has_subdirs {
+                return Err(UtaiError::Training("PROJECT_DATASET_SHAPE".into()));
+            }
+        }
+        for f in &req.dataset_files {
+            if !Path::new(f).is_file() {
+                return Err(UtaiError::Training(format!(
+                    "TRAINING_DATA_FILE_MISSING: {}",
+                    f
+                )));
+            }
+        }
+
+        // ---- resolve + verify every asset up front (loud, specific errors) ----
+        // Resolution lives in resolve_training_assets — the SINGLE SOURCE shared with the
+        // S66 training_required_assets pre-flight command, so the "missing base model"
+        // dialog can never drift from what start() actually demands.
+        let assets = resolve_training_assets(
+            &data_dir,
+            &req.backend,
+            &req.version,
+            &req.sample_rate,
+            req.aug_copies,
+        )?;
+        let ffmpeg = crate::audio::find_ffmpeg()
+            .ok_or_else(|| UtaiError::Training("FFMPEG_MISSING".into()))?;
+        for (label, p) in &assets.required {
+            if !p.is_file() {
+                return Err(UtaiError::Training(format!(
+                    "TRAINING_ASSET_MISSING: {} -> {}",
+                    label,
+                    p.display()
+                )));
+            }
+        }
+        let ResolvedTrainingAssets {
+            contentvec,
+            rmvpe_pt,
+            pretrain_g,
+            pretrain_d,
+            nsf_hifigan_model,
+            diffusion_pretrain,
+            vocoder_pretrain,
+            ..
+        } = assets;
+
+        // Directory identity — separate from the artifact identity (see `effective_artifact_slug`,
+        // resolved below once the run is known), and NOT derived from
+        // the model name whenever the caller knows better (see `StartTrainingRequest.project_id`).
+        // An id that names nothing is a hard refusal: silently falling back to name resolution
+        // would create a SECOND project under the display name and train into it, which is the
+        // exact fork this field exists to prevent.
+        let project = if req.project_id.trim().is_empty() {
+            // Pre-batch-4 path: resolve by name, create on first use. Reproduces the pre-S76
+            // mapping exactly, including for a migrated workspace whose display name could not
+            // be recovered (find_by_name falls back to the legacy slug).
+            tproject::resolve_or_create(&data_dir, &req.model_name)?
+        } else {
+            // Same lookup the pre-flight above already did — reused rather than repeated so the
+            // two can never disagree about which project this run is for.
+            let m = existing_project
+                .ok_or_else(|| UtaiError::Training("PROJECT_META_UNREADABLE".into()))?;
+            // Same refusal `resolve_or_create` makes: an undecidable directory still holds its
+            // content wherever migration found it, possibly at the project root where our
+            // `dataset/` would land on top of it.
+            if let Some(reason) = m.needs_attention.clone() {
+                return Err(UtaiError::Training(format!("PROJECT_NEEDS_ATTENTION: {reason}")));
+            }
+            m
+        };
+        let family = backend_family(&req.backend).to_string();
+        let workspace = tproject::family_dir(&data_dir, &project.id, &family);
+        // ★§F2⒝ batch 2 — the SLOT and the RUN are two different directories now, and every
+        // preflight below is one or the other:
+        //   * SLOT — the wipe, `slot_holds_work`, the shared-dataset pre-check, and the
+        //     `workspace` key handed to python (python resolves its POOL relative to that, see
+        //     `utai_train/pool.open_pool`, so re-pointing it at a run would make every migrated
+        //     slot mint an empty pool inside the run and re-preprocess for hours, silently);
+        //   * RUN — the manifest, every progress probe, the frozen speaker set, the resume locks.
+        // Resolved BEFORE any deletion, exactly like the manifest read below: these guards exist
+        // to judge the PRE-wipe state.
+        // ★step ④ — the run the REQUEST names (empty = "this slot holds at most one"). Every
+        // guard below reads THIS run's manifest and progress, so answering with a sibling run's
+        // would let a resume continue from weights the locks were never checked against.
+        let req_run = Some(req.run_id.trim()).filter(|s| !s.is_empty());
+        let run = trun::resolve_run_dir(&workspace, req_run)?;
+
+        // ---- shared-dataset guard (PREFLIGHT, never in run_worker) ----
+        // `dataset/` belongs to the project now. Replacing it re-fingerprints every sibling
+        // slot, so their next「续训」would rmtree hours of preprocessing AND continue on data
+        // the user never meant to switch to — silently, since the fingerprint mismatch reads
+        // as a legitimate change. Refuse while any OTHER slot holds work; the run's own slot
+        // may still swap its data (that is the pre-S76 behaviour, unchanged).
+        // The placement matters: `training/mod.rs`'s own history says a refusal on a fully
+        // decidable condition must never cost a wiped slot plus a multi-minute import.
+        let dataset_dir = tproject::dataset_dir(&data_dir, &project.id);
+        // ①c/S78: the run's EFFECTIVE speaker slugs, decided once here and carried in `RunCtx`.
+        // A RESUME reuses what the slot froze instead of re-deriving from the names — `slugify`
+        // hash-suffixes with `DefaultHasher`, which std does not promise to keep stable across
+        // Rust releases, and every one of those slugs is a directory name on disk plus a
+        // `config.spk` key. Re-deriving would mean a toolchain bump silently renames every
+        // co-trained speaker's data directory out from under a half-trained model.
+        let eff_speakers = effective_speaker_slugs(&run, &req)?;
+        let planned = dataset_plan(&req, &eff_speakers);
+        if !planned.is_empty() {
+            let replacing = !current_dataset_listing(&dataset_dir).is_empty()
+                && !dataset_matches(&dataset_dir, &planned);
+            if replacing {
+                if let Some(other) = tproject::FAMILIES.iter().find(|f| {
+                    **f != family
+                        && slot_holds_work(&tproject::family_dir(&data_dir, &project.id, f))
+                }) {
+                    return Err(UtaiError::Training(format!(
+                        "PROJECT_DATASET_IN_USE: {}",
+                        other
+                    )));
+                }
+                // A source that lives INSIDE the dataset we are about to replace would be
+                // deleted by the swap and then fail to copy. Unreachable from today's UI
+                // (the data page only offers外部文件), which is exactly why it is worth
+                // nailing shut before batch 5 makes the project's own files selectable.
+                let inside = req
+                    .dataset_files
+                    .iter()
+                    .chain(req.speakers.iter().flat_map(|s| s.files.iter()))
+                    .any(|f| Path::new(f).starts_with(&dataset_dir));
+                if inside {
+                    return Err(UtaiError::Training("TRAINING_DATASET_SELF_SOURCE".into()));
+                }
+            }
+        }
+
+        // READ the manifest BEFORE any deletion: the family guard must hold on
+        // the fresh path too — a diffusion「重训」must never partial-wipe a
+        // same-named RVC workspace (RVC roots also contain G_*.pth, so file
+        // heuristics alone cannot tell the families apart).
+        let mut old_manifest: Option<serde_json::Value> = read_run_manifest(&run);
+        let old_family = old_manifest
+            .as_ref()
+            .and_then(|m| m["backend"].as_str())
+            .unwrap_or("")
+            .to_string();
+        if !old_family.is_empty() && old_family != family {
+            if req.backend == "sovits_diff" {
+                // refuse even on retrain: the diff card's「重训」semantics are
+                // "clear diffusion progress", never "sacrifice a foreign
+                // workspace" — the user meant a different model name
+                return Err(UtaiError::Training(format!(
+                    "WORKSPACE_BACKEND_MISMATCH: {}",
+                    old_family
+                )));
+            }
+            if !req.fresh {
+                return Err(UtaiError::Training(format!(
+                    "WORKSPACE_BACKEND_MISMATCH: {} -> {}",
+                    old_family, family
+                )));
+            }
+            // main backends keep the S37 behavior: retrain wipes with user consent
+        }
+        // a diff resume must never silently colonize a manifest-less workspace
+        // — its family is unknowable, and the diff pipeline would then slice /
+        // flist / extract INTO whatever那是 (红队 A2)
+        if req.backend == "sovits_diff"
+            && !req.fresh
+            && workspace.exists()
+            && old_manifest.is_none()
+        {
+            return Err(UtaiError::Training("WORKSPACE_MANIFEST_MISSING".into()));
+        }
+
+        let has_main = has_main_progress(&run);
+        // a manifest-less workspace that still holds checkpoints is an anomaly
+        // (every run since S37 writes the manifest before spawning): resuming
+        // into it would let e.g. 4.1 weights stream into a 4.0 graph through
+        // the tolerant checkpoint loader — silently degrading to near-scratch
+        // while claiming「续训」. Refuse loudly; retrain wipes it.
+        if !req.fresh && workspace.exists() && old_manifest.is_none() && has_main {
+            return Err(UtaiError::Training("WORKSPACE_MANIFEST_MISSING".into()));
+        }
+        // vocoder twin: a manifest-less workspace holding lightning checkpoints
+        // would let get_latest_checkpoint_path resume into it AND silently skip
+        // the finetune base seeding (setup() only loads the base when no ckpt
+        // exists) — the S39 尾修 4 lineage of "quiet fake resume"
+        if req.backend == "vocoder"
+            && !req.fresh
+            && workspace.exists()
+            && old_manifest.is_none()
+            // ★S119 §F8⒝ — the snapshot is a resume point too; asking only about the numbered
+            // grid would let a snapshot-only workspace through the very guard that exists to
+            // stop a「quiet fake resume」.
+            && vocoder_progress_step(&run).is_some()
+        {
+            return Err(UtaiError::Training("WORKSPACE_MANIFEST_MISSING".into()));
+        }
+        // the diff「重训」only clears diffusion/ when a live main model shares
+        // the workspace — everything else is a full wipe
+        let diff_partial_wipe =
+            req.fresh && req.backend == "sovits_diff" && workspace.exists()
+                && old_manifest.is_some() && has_main;
+
+        // Artifact identity — `hps.name`, `weights/<slug>*.pth`, `audition/<slug>_*`.
+        // ⚠ §F2⒝ ④d dropped `config.spk` and `<pool>/dataset_44k/<slug>/` from this list for a
+        // SOLE speaker on an identity-v2 slot: those two are POOL products and are now the
+        // constant `tpool::SOLE_SPEAKER_DIR`. Co-trained speakers keep their slugs there.
+        // ★§F2⒝ batch 2 step ④b: FROZEN per run, no longer re-derived from the display name on
+        // every start. Still resolved BEFORE any deletion — the answer is a fact that lives in the
+        // PRE-wipe `run.json` — but now BELOW the `diff_partial_wipe` binding, because that is the
+        // one branch where a `fresh` start destroys nothing and the identity must therefore hold.
+        // ⛔ Reading `req.fresh` alone here (its first form) let 「重训(仅扩散)」 of a RENAMED run
+        // mint a new slug against a run whose products all still exist — see the function's doc.
+        //
+        // ★§F2⒝ ④e 笔 1 — the same question python has to be told the answer to
+        // (`trun::FRESH_RUN_KEY`), so it is ONE binding rather than the expression written twice.
+        // ⛔ Not `req.fresh`: on the `diff_partial_wipe` branch that flag is true while the run
+        // keeps its main `G_*.pth`/`D_*.pth`, so a python guard fed `req.fresh` would refuse
+        // 「重训(仅扩散)」 outright — and refuse it INVISIBLY today, because the diffusion chain
+        // does not go through `plan_load` and no current criterion drives that branch.
+        let mints_fresh_run = req.fresh && !diff_partial_wipe;
+        let slug = effective_artifact_slug(&run, &req, mints_fresh_run);
+
+        // ---- resume-parameter guard ----
+        // The rule itself lives in `resume_lock` — ONE table plus ONE enforcement, driven
+        // against each other by a unit test, because three other places (the run step's
+        // pre-start dialog, the project page's form restore, the parameters page's read-only
+        // rendering) have to agree with it and used to do so from memory.
+        let lock_facts = resume_lock_facts(&run)?;
+        if let Some(code) = resume_lock::check_resume_locks(
+            &req,
+            &lock_facts.state(old_manifest.as_ref()),
+            !req.fresh || diff_partial_wipe,
+        ) {
+            return Err(UtaiError::Training(code));
+        }
+
+        // fail-closed wipe consent: a 重训 that would destroy real work (checkpoints of any
+        // family, diffusion progress, or an imported dataset pool that cost the user a
+        // multi-minute import) may only proceed when the frontend states the user actually
+        // answered the destructive dialog. An empty leftover directory (a prior start that
+        // died after create_dir_all) holds nothing and stays freely wipeable.
+        // ★★§F2⒝ ④e — narrowed to the one branch that still DESTROYS something.
+        //
+        // 「重训」 no longer erases the slot, so demanding wipe consent for it would be a dialog in
+        // front of a door that no longer exists. What survives is 「重训(仅扩散)」: that branch
+        // still deletes `<run>/diffusion/`, and the diffusion progress it removes is exactly the
+        // kind of work this gate was written to protect (hours of it, and the only resume point).
+        //
+        // ⛔ Deleting the gate outright was the tempting edit and it is wrong: `diff_partial_wipe`
+        // is reached with `req.fresh == true`, so the branch that still destroys work is the one
+        // that would have lost its guard.
+        if diff_partial_wipe && !req.wipe_confirmed && diffusion_progress_step(&run).unwrap_or(0) > 0
+        {
+            tracing::error!(
+                "refusing unconfirmed diffusion wipe of {} — the caller sent fresh=true without \
+                 wipe_confirmed; a UI probe most likely failed silently",
+                run.display()
+            );
+            return Err(UtaiError::Training("TRAINING_WIPE_NOT_CONFIRMED".into()));
+        }
+
+        if req.fresh && workspace.exists() {
+            if diff_partial_wipe {
+                // diffusion retrain inside a live main-model workspace: clear
+                // ONLY the diffusion progress — the main checkpoints and the
+                // shared preprocessing caches survive
+                let diff_dir = run.join("diffusion");
+                if diff_dir.exists() {
+                    // ⛔★★S133 §F2⒝ ④e —— 与这些字节一起过期的还有**它们的试听缓存**,而
+                    // S132 的 flip 恰好把清理它的那条路关上了。
+                    //
+                    // 链:`start_training` 的缓存清理被收窄成 `if !request_was_fresh`,而这条臂
+                    // **正是带着 `fresh == true` 进来的**(`diff_partial_wipe = req.fresh && …`)
+                    // 且 `mints_fresh_run` 为假 ⇒ 训练落在**同一个 run** 里。于是那条臂从
+                    // 「每次都清」变成了「永不清」。扩散产物里 `model_best.pt` 是**固定名**,
+                    // 缓存键就是 ckpt 的 stem,而命中判据只看 `<dir>/model.json` 在不在 ⇒
+                    // 重训完点「试听」,放的是**上一次**扩散 run 的转换图与音频,界面上没有任何区别。
+                    //
+                    // ⚠ 不能在命令层整棵删 `<run>/audition/`:主模型那几行的转换 .onnx 与
+                    // **实测音域**(`model.json`,没有任何东西会重测)也在里面,而主模型这一次
+                    // 根本没变。所以清理必须**逐 ckpt**,而唯一知道「哪几个 ckpt 正在消失」的
+                    // 地方就是这里 —— 删除的旁边。
+                    let evicted = evict_audition_of(&run, &diff_dir);
+                    if evicted > 0 {
+                        tracing::info!(
+                            "diffusion retrain: dropped {evicted} stale audition cache entr(ies) in {}",
+                            run.display()
+                        );
+                    }
+                    // ★S118 §F8-res⒌ — `remove_dir_all_robust`, like the full-wipe branch below.
+                    // This one used plain `remove_dir_all`, and the difference is not cosmetic: a
+                    // READONLY attribute (backup / 网盘 restores carry them) fails the delete
+                    // AFTER it has already emptied part of the directory, so the start errors out
+                    // with a half-erased diffusion dir — and "the newest checkpoint is gone but
+                    // model_best.pt is still there" is exactly the shape that used to make the
+                    // next resume silently restart from the base model.
+                    crate::util::remove_dir_all_robust(&diff_dir).map_err(|e| {
+                        UtaiError::Training(format!("DIFF_WIPE_FAILED: {}", e))
+                    })?;
+                }
+            }
+        }
+        // ★★§F2⒝ ④e — 「重训」 no longer erases anything. It MINTS a new run beside the old ones.
+        //
+        // What used to be here: `remove_dir_all_robust(&workspace)` — the whole slot, checkpoints,
+        // pools and all. That is the behaviour 拍板 replaced with 「新建 run + 旧 run 可管理/删除」.
+        //
+        // ⛔ The fold below is a PRECONDITION, not housekeeping. `tpool::slot_facts` refuses a slot
+        // that holds two `run_manifest.json` (and one that holds none), which makes the 3→4 pool
+        // identity migration refuse it FOREVER — `migrate_layouts` only runs at boot, so a slot
+        // that grows its second run while still at layout 3 can never be folded again, and its
+        // pools stay on identity v1 for good. Growing that second run is what the next line does.
+        // ⇒ fold first, and refuse the start if the slot cannot be folded. Loudly failing to start
+        // a retrain is recoverable; silently retiring a slot's pool identity is not.
+        //
+        // ⚠ Guarded by `slot_holds_work` so a FIRST training is untouched: an empty slot has no
+        // second run to grow, and `migrate_one_slot` on it would be a no-op with a cost.
+        if mints_fresh_run && slot_holds_work(&workspace) {
+            migrate_one_slot(&data_dir, &project.id, &family)?;
+        }
+        std::fs::create_dir_all(&workspace)?;
+        // ★§F2⒝ batch 2 step ③ — RE-RESOLVE. Everything from here on WRITES: the manifest,
+        // `run.json`, `stop.flag`, the checkpoints. The `run` resolved before the guards is
+        // deliberately the run the guards judged — and on a mint it is the run being left BEHIND,
+        // so writing to it is exactly the failure ④e exists to remove.
+        //
+        // ⚠ The pre-④e reason for re-resolving was different and is now dead: the wipe used to
+        // take the run directory with it, so the pre-wipe `run` pointed at something that no longer
+        // existed. Nothing is deleted any more; what changed is WHICH run a start writes into.
+        //
+        // `run_dir_for_start` also CREATES the directory: `create_dir_all(&workspace)` above only
+        // makes the slot, and python cannot cover for it — `run.json` is written before the sidecar
+        // is spawned at all. And python covering for it is exactly the failure mode to avoid: every
+        // pipeline opens with `os.makedirs(run_dir)`, so a wrong path there is not an error, it is a
+        // brand-new directory with a full training run inside it that nothing ever scans.
+        let run = trun::run_dir_for_start(&workspace, &family, req_run, mints_fresh_run)?;
+        // ★§F2⒝-B2-⑤ / §E2E-M25 — named HERE, off the binding the snapshot's `workspace` is taken
+        // from, and not one line later. `try_start` holds TWO `run` bindings 250 lines apart (the
+        // pre-guard `resolve_run_dir` one above, and this one), and both are `RunDir` — so the
+        // newtype cannot catch picking the wrong one. Adjacency is what makes 「the id and the path
+        // name the same run」 true by construction rather than by review; a ratchet below pins it.
+        let run_id = trun::run_id_of(&workspace, &family, &run);
+        let manifest_path = run.join("run_manifest.json");
+        // ★★§F2⒝ ④e — a minted run inherits NOTHING.
+        //
+        // This used to live inside the wipe branch (`old_manifest = None;` right after
+        // `remove_dir_all_robust`), which is why deleting that branch without moving this line is a
+        // silent data bug rather than a compile error. The manifest write below is a MERGE
+        // (read-modify-write, by design — a diff run must not drop the main run's fields), and the
+        // keys that are written CONDITIONALLY would survive the merge into a run that never had
+        // them: `speakers`/`n_speakers`/`speaker_names` are only written for `req.speakers.len() >
+        // 1`, `aug_copies` only for non-diff, `vol_embedding`/`loudnorm` only for sovits,
+        // `diff_k_step_max` only for diff.
+        //
+        // ⛔ The one that costs data: `frozen_speakers_of_run` reads the manifest FIRST and lets it
+        // win over `run.json`, so a single-speaker run minted after a 3-way co-training would
+        // report a frozen speaker set it never had — and its next 续训 would refuse itself with
+        // `RESUME_SPEAKER_COUNT_MISMATCH`. Born unresumable, with nothing red at mint time.
+        // ⚠ `version`/`sample_rate`/`backend` are NOT evidence of this working: they are
+        // overwritten unconditionally a few lines below, so a criterion pinned on them stays green
+        // with this line deleted.
+        if mints_fresh_run {
+            old_manifest = None;
+        }
+
+        // resume dead-end guard: a resume whose target步数 is already reached
+        // would "complete" instantly without training a step (S37 的续训 config
+        // 校验同族坑) — refuse loudly so the user fixes 总步数 first
+        if req.backend == "sovits_diff" && !req.fresh {
+            // ★S118 §F8⒜ — against the step this run will actually START from, NOT the highest
+            // file on disk. 「从最佳存档继续」 rewinds BELOW the newest checkpoint on purpose, so
+            // comparing the newest one would refuse a resume that still has thousands of steps to
+            // train. ⚠ python's `diff_pipeline.load_start_state` is the authority on the choice;
+            // this mirrors it only so the refusal lands before the user waits for a run that would
+            // do nothing (python raises its own 「没有执行任何训练步」 if this ever guesses wrong).
+            let start_step = if req.resume_from.trim() == "best" {
+                diff_snapshot_step(&run, "resume_best")
+                    .or_else(|| diffusion_progress_step(&run))
+            } else {
+                diffusion_progress_step(&run)
+            };
+            if let Some(max_step) = start_step {
+                if max_step > 0 && max_step >= req.total_steps as u64 {
+                    return Err(UtaiError::Training(format!(
+                        "RESUME_TARGET_REACHED_DIFF: {} >= {}",
+                        max_step, req.total_steps
+                    )));
+                }
+            }
+        }
+        // vocoder twin of the guard — ckpt numbers are GLOBAL (2× real), the
+        // //2 here is exactly the ×2-class bug the design flagged (红队 A8)
+        if req.backend == "vocoder" && !req.fresh {
+            // ★S119 §F8⒝ — same correction the diffusion twin got in S118: compare against the
+            // step this run will actually START from. 「从最佳存档继续」 rewinds BELOW the newest
+            // checkpoint on purpose, so judging by the newest one would refuse a resume that
+            // still has thousands of steps to train — a visible button that always fails.
+            let real = if req.resume_from.trim() == "best" {
+                voc_best_resume_step(&run)
+                    .or_else(|| vocoder_progress_step(&run).map(|g| g / 2))
+            } else {
+                vocoder_progress_step(&run).map(|g| g / 2)
+            };
+            if let Some(real) = real {
+                if real > 0 && real >= req.total_steps as u64 {
+                    return Err(UtaiError::Training(format!(
+                        "RESUME_TARGET_REACHED_VOCODER: {} >= {}",
+                        real, req.total_steps
+                    )));
+                }
+            }
+        }
+
+        // merge-write: a diff run must not drop the main run's fields (the
+        // vol_embedding guard above dies silently if its key vanishes) and
+        // vice versa — read-modify-write, never rebuild from scratch
+        let mut manifest = match old_manifest {
+            Some(m @ serde_json::Value::Object(_)) => m,
+            _ => serde_json::json!({}),
+        };
+        manifest["backend"] = serde_json::json!(family);
+        manifest["version"] = serde_json::json!(req.version);
+        manifest["sample_rate"] = serde_json::json!(req.sample_rate);
+        if req.backend == "sovits" {
+            manifest["vol_embedding"] = serde_json::json!(req.vol_embedding);
+            // recorded so a later diff run inherits it (a loudnorm flip would
+            // wipe the shared caches AND desync the diffusion training domain
+            // from the main model's)
+            manifest["loudnorm"] = serde_json::json!(req.loudnorm);
+        }
+        // ①c: freeze the speaker count + ordered slug set (resume-immutable, guarded above)
+        // for SoVITS (α), RVC (α′) and SoVITS 4.0-v2 (S68). Only written for a genuine
+        // co-training (>1) so a single-speaker manifest stays byte-identical to pre-①c.
+        if matches!(req.backend.as_str(), "sovits" | "rvc" | "sovits_v2") && req.speakers.len() > 1 {
+            // the EFFECTIVE list — a resume re-freezes exactly the slugs it inherited
+            let slugs: Vec<String> = eff_speakers.iter().map(|(_, s)| s.clone()).collect();
+            let names: Vec<String> = eff_speakers.iter().map(|(n, _)| n.clone()).collect();
+            manifest["n_speakers"] = serde_json::json!(slugs.len());
+            manifest["speakers"] = serde_json::json!(slugs);
+            // ①c: display NAMES too. The manifest is merge-preserved across a later sovits_diff run
+            // (which reuses this workspace and OVERWRITES run.json WITHOUT a speakers key) — so the
+            // resume config-diff must read names from HERE, not run.json, or it would falsely report
+            // a speaker mismatch after any diffusion run and block a valid multi-speaker resume.
+            manifest["speaker_names"] = serde_json::json!(names);
+        }
+        if req.backend != "sovits_diff" {
+            // S41: recorded for every non-diff backend; the sovits value is
+            // the diff inheritance source (shared dataset_44k slice pool),
+            // rvc/vocoder entries are informational
+            manifest["aug_copies"] = serde_json::json!(req.aug_copies);
+        }
+        if req.backend == "sovits_diff" {
+            manifest["diff_k_step_max"] = serde_json::json!(req.k_step_max);
+        }
+
+        // diff runs inherit the dataset-affecting switches from the manifest —
+        // their own request never carries them
+        let eff_vol_embedding = if req.backend == "sovits_diff" {
+            manifest["vol_embedding"].as_bool().unwrap_or(false)
+        } else {
+            req.vol_embedding
+        };
+        let eff_loudnorm = if req.backend == "sovits_diff" {
+            match manifest["loudnorm"].as_bool() {
+                Some(v) => v,
+                None => {
+                    // S38-era manifests predate the loudnorm field. Recover the
+                    // value the caches were actually built with from the stored
+                    // fingerprint text ("<hash>|enc=..|loudnorm=N") — guessing
+                    // false would wipe the shared caches AND train the companion
+                    // on a different loudness domain than the main model
+                    // (review F1); backfilled into the manifest so the next
+                    // main resume doesn't re-wipe either.
+                    // ★§F2⒝ — a slot can hold several pools now, so ask the one that can
+                    // ANSWER: `sole_pool_fingerprint` refuses to guess with more than one.
+                    // Every workspace old enough to reach this backfill was migrated from a
+                    // single flat slot and therefore has exactly one; the second arm is that
+                    // same flat slot before the migration has run.
+                    // ★§F2⒝ 批 2 ④d(R4)—— the reader is a tokeniser now, not a substring
+                    // probe: ④d appends new tokens to this very text, and `contains` cannot tell
+                    // "the text says off" from "the text does not say". Same answer as before on
+                    // every string the four formulas can emit (see the unit tests).
+                    let v = tpool::sole_pool_fingerprint(&workspace)
+                        .or_else(|| {
+                            std::fs::read_to_string(workspace.join(tpool::FINGERPRINT)).ok()
+                        })
+                        .and_then(|s| loudnorm_from_fingerprint(&s))
+                        .unwrap_or(false);
+                    manifest["loudnorm"] = serde_json::json!(v);
+                    v
+                }
+            }
+        } else {
+            req.loudnorm
+        };
+        // pure inheritance, NO rejection branch (loudnorm posture; a missing
+        // key = pre-S41 or diff-first workspace = 0). The diff pipeline runs
+        // the same augment stage with this value so a cache-wipe rebuild
+        // regenerates the aug slices the manifest promises.
+        // A diffusion run trains on the SoVITS slot's own slice pool (`dataset_44k` under this
+        // very workspace — that shared cache is the entire reason shallow diffusion lives in the
+        // sovits family), and it re-fingerprints that pool. So choosing its own augmentation
+        // count would rebuild the shared slices to a different recipe and silently change the
+        // data the MAIN model resumes on ⇒ it inherits instead.
+        //
+        // S78: unless there is no main model in the slot (diff-first). Then nothing is sharing
+        // the pool and the run's own value stands — otherwise a diff-first project could only
+        // ever train at aug=0, for the sake of a main model that does not exist.
+        let eff_aug_copies = if req.backend == "sovits_diff" && has_main {
+            manifest["aug_copies"].as_u64().unwrap_or(0) as u32
+        } else {
+            req.aug_copies
+        };
+        // …and record it, so the NEXT diff run inherits what this one actually preprocessed with
+        // rather than re-fingerprinting the pool back to 0. (A later main run overwrites it with
+        // its own value, which is correct: from then on the main model owns the pool.)
+        if req.backend == "sovits_diff" && !has_main {
+            manifest["aug_copies"] = serde_json::json!(eff_aug_copies);
+        }
+        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+        // milestone cadence normalized onto the save grid (see field docs)
+        let interval_val = req.save_every_steps.max(1);
+        let interval_force_save =
+            ((req.interval_force_save.max(1) + interval_val - 1) / interval_val) * interval_val;
+
+        let stop_file = run.join("stop.flag");
+        let _ = std::fs::remove_file(&stop_file); // stale flag would insta-stop the run
+
+        // ---- reset run state ----
+        {
+            let mut s = self.inner.snapshot.lock();
+            *s = TrainingSnapshot {
+                state: "starting".into(),
+                backend: req.backend.clone(),
+                model_name: req.model_name.clone(),
+                model_slug: slug.clone(),
+                project_id: project.id.clone(),
+                workspace: run.to_string_lossy().into_owned(),
+                run_id: run_id.clone(),
+                total_epochs: req.total_epoch,
+                // ①c: freeze the run's speaker names (id order) for the audition picker; empty
+                // for a single-speaker run (len ≤ 1) so nothing changes there.
+                speakers: if req.speakers.len() > 1 {
+                    req.speakers.iter().map(|sp| sp.name.clone()).collect()
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
+            };
+        }
+        self.inner.history.lock().clear();
+        self.inner.stderr_ring.lock().clear();
+        *self.inner.stop_file.lock() = Some(stop_file.clone());
+        *self.inner.started_at.lock() = Some(Instant::now());
+        *self.inner.last_progress_at.lock() = None;
+
+        let ctx = RunCtx {
+            ffmpeg,
+            contentvec,
+            rmvpe_pt,
+            pretrain_g,
+            pretrain_d,
+            nsf_hifigan_model,
+            diffusion_pretrain,
+            vocoder_pretrain,
+            vol_embedding: eff_vol_embedding,
+            loudnorm: eff_loudnorm,
+            interval_force_save,
+            aug_copies: eff_aug_copies,
+            mints_fresh_run,
+            python,
+            device_backend,
+            runtime_variant,
+            gpu_mask,
+            gpu_gfx_target,
+            gpu_label,
+            project_id: project.id.clone(),
+            speakers: eff_speakers,
+        };
+        let inner = Arc::clone(&self.inner);
+        let app_dir = self.app_dir.clone();
+        std::thread::Builder::new()
+            .name("training-run".into())
+            .spawn(move || {
+                let outcome = run_worker(
+                    &inner, &app, &app_dir, &data_dir, &workspace, &run, &stop_file, &req, &ctx,
+                    &slug,
+                );
+                if let Err(e) = outcome {
+                    finalize_elapsed(&inner);
+                    let tail = stderr_tail(&inner);
+                    let mut s = inner.snapshot.lock();
+                    s.state = "error".into();
+                    s.error = Some(e.to_string());
+                    s.stderr_tail = tail;
+                    drop(s);
+                    tracing::error!("training run failed: {}", e);
+                    emit_done(&inner, &app);
+                }
+                finalize_elapsed(&inner); // idempotent — freezes elapsed on every exit path
+                let _ = std::fs::remove_file(&stop_file);
+                *inner.child.lock() = None;
+                inner.running.store(false, Ordering::SeqCst);
+            })
+            .map_err(|e| UtaiError::Training(format!("TRAINING_THREAD_SPAWN_FAILED: {}", e)))?;
+        Ok(())
+    }
+}
+
+/// Freeze the final elapsed time into the snapshot and stop the live clock.
+/// Idempotent (take()) — safe to call from every exit path.
+fn finalize_elapsed(inner: &Inner) {
+    if let Some(t) = inner.started_at.lock().take() {
+        inner.snapshot.lock().elapsed_secs = t.elapsed().as_secs();
+    }
+}
+
+/// Pre-spawn abort exit: the run never (or barely) reached python; report a clean
+/// "stopped" so the frontend leaves the running state.
+fn abort_finish(inner: &Arc<Inner>, app: &tauri::AppHandle) -> Result<()> {
+    finalize_elapsed(inner);
+    inner.snapshot.lock().state = "stopped".into();
+    emit_done(inner, app);
+    tracing::warn!("training aborted before/at sidecar spawn");
+    Ok(())
+}
+
+fn stderr_tail(inner: &Inner) -> Vec<String> {
+    inner
+        .stderr_ring
+        .lock()
+        .iter()
+        .rev()
+        .take(30)
+        .rev()
+        .cloned()
+        .collect()
+}
+
+fn emit_done(inner: &Inner, app: &tauri::AppHandle) {
+    let snap = inner.snapshot.lock().clone();
+    let _ = app.emit("training-done", &snap);
+}
+
+/// S115: what a force-stop leaves behind. Split out of the branch so it can be pinned — the
+/// defect it fixes was an ABSENCE (the branch set the state and nothing else), and an absence
+/// is exactly what no test notices.
+///
+/// ⛔ It must NOT clear `warnings`: those are the app's own record that it had already noticed
+/// something wrong, and they are the trigger the UI uses to decide this stop is worth
+/// explaining. Clearing them here would silently restore the old behaviour.
+fn mark_force_stopped(snap: &mut TrainingSnapshot, tail: Vec<String>) {
+    snap.state = "stopped".into();
+    snap.stderr_tail = tail;
+}
+
+/// Everything try_start resolves for the sidecar run: asset paths plus the
+/// values a diff run inherits from the workspace manifest.
+struct RunCtx {
+    ffmpeg: PathBuf,
+    contentvec: PathBuf,
+    rmvpe_pt: PathBuf,
+    /// empty for sovits_diff (no G/D pair — the diffusion base seeds instead)
+    pretrain_g: PathBuf,
+    pretrain_d: PathBuf,
+    /// sovits_diff only: the torch NSF-HiFiGAN ckpt (the diffusion mel recipe)
+    nsf_hifigan_model: PathBuf,
+    /// sovits_diff only; empty = train from scratch (no vec256 base exists)
+    diffusion_pretrain: PathBuf,
+    /// vocoder only: the classic NSF-HiFiGAN finetune base (lightning ckpt, G+D)
+    vocoder_pretrain: PathBuf,
+    /// effective values (manifest-inherited for sovits_diff)
+    vol_embedding: bool,
+    loudnorm: bool,
+    /// normalized to a multiple of save_every_steps
+    interval_force_save: u32,
+    /// S41 effective augmentation copies (manifest-inherited for sovits_diff)
+    aug_copies: u32,
+    /// ★§F2⒝ ④e 笔 1 — does this start write into a run that nobody has trained yet?
+    /// Handed to python as `trun::FRESH_RUN_KEY`.
+    ///
+    /// ⛔ Decided in `try_start` and CARRIED, like every other effective value here, and for a
+    /// harder reason than usual: the answer is `req.fresh && !diff_partial_wipe`, and
+    /// `diff_partial_wipe` is a local of `try_start` that depends on the PRE-wipe disk. `req` is
+    /// in scope down in `run_worker`, so re-deriving it there would compile, read naturally, and
+    /// be wrong on exactly the one branch (「重训(仅扩散)」) whose run keeps all of its products.
+    mints_fresh_run: bool,
+    /// S75: device resolution, decided at PREFLIGHT and carried here. It is NOT re-derived in
+    /// run_worker — that placement is exactly what the S68b review moved out (a refusal on a
+    /// fully-decidable condition must not cost a wiped workspace plus a multi-minute import).
+    python: PathBuf,
+    device_backend: String,
+    /// S115: the PACK variant behind `python` ("nv-cu130"/"amd"/"xpu"/"cpu"), `None` when the
+    /// interpreter is not a pack (dev venv / manual slot / bare python).
+    ///
+    /// ⛔ It is NOT a duplicate of `device_backend`: that one collapses **amd → "cuda"**
+    /// (torch-hip owns the `torch.cuda.*` namespace), so it cannot tell an NVIDIA run from a
+    /// ROCm one — and the two builds do not even read the same diagnostic env var (measured
+    /// S115: the amd pack's `c10_hip.dll` contains `AMD_SERIALIZE_KERNEL` and ZERO occurrences
+    /// of `CUDA_LAUNCH_BLOCKING`; the nv pack is the mirror image). Resolved once at PREFLIGHT
+    /// and carried, like `python`/`device_backend` above — never re-derived here.
+    runtime_variant: Option<String>,
+    /// run.json "gpu": the accelerator-native mask (UUID / vendor index), "-1" for forced CPU,
+    /// "" when no device was chosen. Resolved from the picked entry's `value` — NOT from the
+    /// request, whose `gpu` field carries the UI id.
+    gpu_mask: String,
+    /// S169, AMD lane only (None elsewhere → key omitted from run.json → device.py behaves
+    /// byte-identically to pre-0.12.2): the picked adapter's gfx arch ("gfx1102").
+    /// device.py::apply_amd_arch_mask re-keys the visibility mask from `gpu_mask` (a DXGI
+    /// vendor-relative index — HIP's ordinal space is NOT DXGI's) to the HIP ordinal that
+    /// actually carries this arch. Resolved at PREFLIGHT from the picked entry (auto lane:
+    /// from the first selectable AMD adapter), carried like everything else here.
+    gpu_gfx_target: Option<String>,
+    /// S169: the picked adapter's display name — a tiebreaker for device.py when several
+    /// HIP devices share the target arch, and log context. Never a selection key on its own.
+    gpu_label: Option<String>,
+    /// S76: the resolved project. The dataset lives at the PROJECT level now, so the worker
+    /// needs an identity the family slot path cannot give it. Decided in try_start (one
+    /// resolution per run) — never re-derived here.
+    project_id: String,
+    /// ①c/S78: `(display name, slug)` per co-trained speaker, in emb_g row order. Empty for a
+    /// single-speaker run.
+    ///
+    /// Resolved ONCE in try_start and carried, for the same reason the device is: the worker used
+    /// to call `assign_speaker_slugs` again and the two agreed only because the function was a
+    /// pure function of the request. It no longer is — a RESUME reuses the slugs frozen in the
+    /// manifest instead of re-deriving them from the names — so a second derivation here would be
+    /// a second answer.
+    speakers: Vec<(String, String)>,
+}
+
+/// Content identity of one dataset file: byte size plus a digest of its first and last 64 KiB.
+///
+/// Deliberately the SAME shape as `utai_train/cache.py`'s `dataset_fingerprint` — the python
+/// side decides whether the extraction caches are still valid by exactly this measure, so
+/// judging by anything weaker here would let Rust say「没变」about a change python would (or
+/// would not) notice. Reading 128 KiB per file is nothing next to the copy it may skip.
+fn file_probe(path: &Path) -> (u64, String) {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return (0, String::new());
+    };
+    let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut h = Sha256::new();
+    h.update(size.to_le_bytes());
+    let mut head = vec![0u8; 65536.min(size as usize)];
+    if f.read_exact(&mut head).is_ok() {
+        h.update(&head);
+    }
+    if size > 131072 {
+        let mut tail = vec![0u8; 65536];
+        if f.seek(SeekFrom::End(-65536)).is_ok() && f.read_exact(&mut tail).is_ok() {
+            h.update(&tail);
+        }
+    }
+    (size, format!("{:x}", h.finalize()))
+}
+
+/// One file of a dataset, keyed by where it lands and what it contains.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DatasetItem {
+    /// Where it lands under `dataset/`: `{:03}.<lowercased ext>`, prefixed by the speaker slug
+    /// for a co-trained run.
+    rel: String,
+    size: u64,
+    digest: String,
+}
+
+/// THE naming rule for a dataset copy: `<slug>/`-prefixed when co-training, then the file's
+/// position in the sorted selection and the source's lowercased extension.
+///
+/// Single source on purpose — `dataset_plan` PREDICTS these names, the import loops WRITE them,
+/// `dataset_matches` compares the two, and the annotation keys on them. Four readings of one
+/// rule; if any of them ever spelled it differently the reuse path would silently turn into a
+/// full replace (and the original file names would attach to nothing).
+pub(crate) fn dataset_rel(slug: Option<&str>, i: usize, src: &str) -> String {
+    let ext = Path::new(src)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("wav")
+        .to_ascii_lowercase();
+    match slug {
+        Some(s) => format!("{}/{:03}.{}", s, i, ext),
+        None => format!("{:03}.{}", i, ext),
+    }
+}
+
+/// Exactly what this request will import, in the order the import loops write it.
+///
+/// `slugs` must be the run's EFFECTIVE `(name, slug)` list (see `RunCtx::speakers`) — passing a
+/// freshly derived one would predict directory names a resume is not going to use.
+fn dataset_plan(req: &StartTrainingRequest, slugs: &[(String, String)]) -> Vec<DatasetItem> {
+    let mut out = Vec::new();
+    let mut push = |src: &str, rel: String| {
+        let (size, digest) = file_probe(Path::new(src));
+        out.push(DatasetItem { rel, size, digest });
+    };
+    if req.speakers.len() > 1 {
+        for (gi, (_name, slug)) in slugs.iter().enumerate() {
+            let mut files = req.speakers[gi].files.clone();
+            files.sort();
+            for (i, f) in files.iter().enumerate() {
+                push(f, dataset_rel(Some(slug), i, f));
+            }
+        }
+    } else {
+        let mut files = req.dataset_files.clone();
+        files.sort();
+        for (i, f) in files.iter().enumerate() {
+            push(f, dataset_rel(None, i, f));
+        }
+    }
+    out.sort_by(|a, b| a.rel.cmp(&b.rel));
+    out
+}
+
+/// Is the project's shared `dataset/` ALREADY, byte for byte, what this plan would produce?
+///
+/// Judged by CONTENT, not by `(名字, 字节数)`: loudness normalisation and denoising rewrite a
+/// wav in place without changing its length, and the first version of this compared only name
+/// and size — so an edited dataset compared equal, the import was skipped, and python's
+/// fingerprint (reading those same untouched copies) matched too, reusing every stale feature
+/// cache. The run trained on the pre-edit audio and reported success.
+///
+/// Being exact here is what lets ONE judgement answer both questions safely:
+/// * false ⇒ this start really is replacing the project's shared dataset, so the sibling-slot
+///   guard must fire;
+/// * true ⇒ nothing to copy and nothing to protect.
+///
+/// It must therefore work with no bookkeeping of any kind — a migrated project carries no
+/// record of which sources produced its dataset, and a ledger-based judgement would have told
+/// every existing user that their data was "changing" and blocked the entire point of the
+/// refactor (一份数据喂多个架构) forever.
+fn dataset_matches(dataset_dir: &Path, plan: &[DatasetItem]) -> bool {
+    !plan.is_empty() && current_dataset_listing(dataset_dir) == plan
+}
+
+/// The same shape, read off disk (flat files plus one level of speaker subdirectories — the
+/// only two shapes the import ever writes).
+fn current_dataset_listing(dataset_dir: &Path) -> Vec<DatasetItem> {
+    let mut out = Vec::new();
+    let mut probe = |rel: String, p: &Path| {
+        let (size, digest) = file_probe(p);
+        out.push(DatasetItem { rel, size, digest });
+    };
+    let Ok(rd) = std::fs::read_dir(dataset_dir) else {
+        return out;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        // a `.part` is append_files' stage-then-rename crash remnant, not a dataset file — skip it
+        // so a leftover never makes dataset_matches judge a ready dataset "changed" (审查 S78).
+        if name.ends_with(".part") {
+            continue;
+        }
+        match e.metadata() {
+            Ok(md) if md.is_file() => probe(name, &e.path()),
+            Ok(md) if md.is_dir() => {
+                if let Ok(sub) = std::fs::read_dir(e.path()) {
+                    for se in sub.flatten() {
+                        let sname = se.file_name().to_string_lossy().into_owned();
+                        if !sname.ends_with(".part")
+                            && se.metadata().map(|m| m.is_file()).unwrap_or(false)
+                        {
+                            probe(format!("{}/{}", name, sname), &se.path());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out.sort_by(|a, b| a.rel.cmp(&b.rel));
+    out
+}
+
+/// Replaces the project's shared dataset without ever losing it.
+///
+/// The old dataset is moved aside by a same-volume rename (atomic), the caller fills a fresh
+/// one, and `commit()` drops the aside copy. Anything else — an early `return` on 强制停止
+/// mid-import, a `?` on a failed copy, a panic — runs `Drop`, which puts the old dataset
+/// back. Without that, force-stopping during the import of a REPLACEMENT dataset would leave
+/// the project with an empty `dataset/` and an orphaned `.dataset.old_<pid>` that nothing
+/// reclaims (it is inside the project dir, so it would also be counted in the project's size
+/// forever). The pre-S76 code simply `remove_dir_all`'d first, which had no recovery at all.
+struct DatasetSwap {
+    dataset: PathBuf,
+    aside: Option<PathBuf>,
+    /// There was nothing to replace — this import is creating `dataset/` for the first time.
+    /// An abandoned FIRST import must leave no dataset at all, or the half-copied prefix would
+    /// pass `tproject::has_dataset` and a later run could quietly train on it.
+    created_fresh: bool,
+    committed: bool,
+}
+
+impl DatasetSwap {
+    /// No-op when there is nothing to replace (first import into a fresh project).
+    fn begin(dataset_dir: &Path) -> Result<Self> {
+        let mut swap = DatasetSwap {
+            dataset: dataset_dir.to_path_buf(),
+            aside: None,
+            created_fresh: !dataset_dir.exists(),
+            committed: false,
+        };
+        if !dataset_dir.exists() {
+            return Ok(swap);
+        }
+        let aside = dataset_dir.with_file_name(format!(".dataset.old_{}", std::process::id()));
+        let _ = crate::util::remove_dir_all_robust(&aside);
+        crate::util::rename_with_retry(dataset_dir, &aside, "TRAINING_DATASET_SWAP")
+            .map_err(UtaiError::Training)?;
+        swap.aside = Some(aside);
+        Ok(swap)
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for DatasetSwap {
+    fn drop(&mut self) {
+        let Some(aside) = self.aside.take() else {
+            if !self.committed && self.created_fresh {
+                tracing::warn!(
+                    "first dataset import did not complete — removing the partial {}",
+                    self.dataset.display()
+                );
+                let _ = crate::util::remove_dir_all_robust(&self.dataset);
+            }
+            return;
+        };
+        if self.committed {
+            let _ = crate::util::remove_dir_all_robust(&aside);
+            return;
+        }
+        tracing::warn!(
+            "dataset import did not complete — restoring the previous dataset from {}",
+            aside.display()
+        );
+        let _ = crate::util::remove_dir_all_robust(&self.dataset);
+        if let Err(e) = crate::util::rename_with_retry(&aside, &self.dataset, "TRAINING_DATASET_RESTORE") {
+            // Loud: the data is still on disk under `.dataset.old_*`, but the project now
+            // looks empty and only a human can tell which is which.
+            tracing::error!("could not restore the previous dataset ({e}) — it is kept at {}", aside.display());
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_worker(
+    inner: &Arc<Inner>,
+    app: &tauri::AppHandle,
+    app_dir: &Path,
+    data_dir: &Path,
+    // ⛔ `workspace` is the SLOT, and it is what python is handed as its `workspace` key:
+    // `utai_train.pool.open_pool` resolves the preprocessing pool relative to it
+    // (`<slot>/pools/<id>/`, or the slot root itself for an unmigrated slot). Pointing it at a run
+    // directory would make every migrated slot mint an EMPTY pool inside the run and re-preprocess
+    // for hours, announced by one log line. The batch that turns the layout migration on has to
+    // add a separate `run_dir` key rather than re-point this one.
+    // `run` is the RUN, resolved by the caller before any wipe — where `run.json` and the
+    // checkpoints go.
+    workspace: &Path,
+    run: &trun::RunDir,
+    stop_file: &Path,
+    req: &StartTrainingRequest,
+    ctx: &RunCtx,
+    slug: &str,
+) -> Result<()> {
+    // ---- stage: import the dataset into the PROJECT (shared by every family slot) ----
+    let dataset_dir = tproject::dataset_dir(data_dir, &ctx.project_id);
+    // The import used to be `remove_dir_all(dataset) + copy everything`, which was safe only
+    // while a dataset belonged to exactly one workspace. It is now the project's shared layer,
+    // so that shape would mean「训 RVC 顺手删掉 SoVITS 赖以续训的数据」 — and worse, once the
+    // data page can list the project's own files as sources, it would delete its own copy
+    // sources and then fail the copy. So: predict the exact resulting listing, and if the
+    // dataset on disk already IS that listing, touch nothing at all.
+    let plan = dataset_plan(req, &ctx.speakers);
+    let dataset_unchanged = dataset_matches(&dataset_dir, &plan);
+    // ★ An EMPTY plan means this run imports nothing — either the flat reuse path, or (S78) a
+    // multi-speaker run that declares its structure and consumes the data already on disk.
+    // `dataset_matches` returns false for an empty plan (by design: "nothing" must never compare
+    // equal to a real dataset), so keying the swap on `dataset_unchanged` alone would move the
+    // whole dataset aside, copy nothing into the fresh one, and commit — deleting the very data
+    // the run was going to train on.
+    let importing = !plan.is_empty();
+    if dataset_unchanged {
+        tracing::info!(
+            "dataset import skipped: {} already holds exactly this selection",
+            dataset_dir.display()
+        );
+    }
+    // ①c: >1 speaker group = per-speaker subdir import; else the pre-①c flat
+    // (or shared-pool) path, verbatim. run_speakers is filled only for multi
+    // and becomes run.json "speakers" so the sovits/rvc pipeline co-trains them.
+    let is_multi = req.speakers.len() > 1;
+    let mut run_speakers: Vec<serde_json::Value> = Vec::new();
+    // What this import puts on disk, for `<project>/dataset.json` — the only carrier of the
+    // ORIGINAL file names and of the speaker display names once the copies are renamed to
+    // `000.wav`. Collected in the copy loops so it describes what actually landed, and written
+    // (best effort) after the swap commits; see `dsmanifest`.
+    let mut ds_files: Vec<dsmanifest::DsFile> = Vec::new();
+    let mut ds_speakers: Vec<dsmanifest::DsSpeaker> = Vec::new();
+    if is_multi {
+        // import EACH speaker's files into dataset/<slug>/ (000..N per speaker,
+        // sorted — same deterministic-order + fingerprint rationale as the flat
+        // path). The pipeline slices each subdir into dataset_44k/<slug> and the
+        // loader derives the emb_g id from the dir name, so these slugs MUST
+        // match the manifest — assign_speaker_slugs is deterministic on the
+        // same request.
+        let mut swap = if dataset_unchanged || !importing {
+            None
+        } else {
+            Some(DatasetSwap::begin(&dataset_dir)?)
+        };
+        std::fs::create_dir_all(&dataset_dir)?;
+        let assigned = ctx.speakers.clone();
+        let total: usize = req.speakers.iter().map(|s| s.files.len()).sum();
+        let mut done = 0usize;
+        for (gi, (name, slug)) in assigned.iter().enumerate() {
+            let sub = dataset_dir.join(slug);
+            std::fs::create_dir_all(&sub)?;
+            let mut files = req.speakers[gi].files.clone();
+            files.sort();
+            for (i, f) in files.iter().enumerate() {
+                if inner.abort.load(Ordering::SeqCst) {
+                    return abort_finish(inner, app);
+                }
+                let src = Path::new(f);
+                let rel = dataset_rel(Some(slug), i, f);
+                // `rel` already carries the slug — join on the DATASET root, not on `sub`
+                let dst = dataset_dir.join(&rel);
+                // dataset_unchanged ⇒ dst already holds this exact file; the loop still runs
+                // because run_speakers (→ run.json) is built from it.
+                if !dataset_unchanged {
+                    std::fs::copy(src, &dst).map_err(|e| {
+                        UtaiError::Training(format!(
+                            "TRAINING_IMPORT_COPY_FAILED: {}: {}",
+                            src.display(),
+                            e
+                        ))
+                    })?;
+                }
+                ds_files.push(dsmanifest::DsFile {
+                    rel: rel.clone(),
+                    name: src
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    bytes: std::fs::metadata(&dst).map(|m| m.len()).unwrap_or(0),
+                    duration_ms: None,
+                });
+                done += 1;
+                let stage = StageInfo {
+                    stage: "import".into(),
+                    done: Some(done as u64),
+                    total: Some(total as u64),
+                    progress: Some(done as f32 / total.max(1) as f32),
+                    message: src.file_name().map(|n| n.to_string_lossy().into_owned()),
+                };
+                inner.snapshot.lock().stage = Some(stage.clone());
+                let _ = app.emit("training-stage", &stage);
+            }
+            run_speakers.push(serde_json::json!({
+                "name": name,
+                "slug": slug,
+                "dataset_dir": sub,
+            }));
+            // list order = emb_g row id, same as `assign_speaker_slugs` promises
+            ds_speakers.push(dsmanifest::DsSpeaker {
+                slug: slug.clone(),
+                name: name.clone(),
+            });
+        }
+        if let Some(s) = swap.as_mut() {
+            s.commit();
+        }
+    } else {
+        let mut swap: Option<DatasetSwap> = None;
+        if req.dataset_files.is_empty() {
+            // shared-pool reuse (only sovits_diff reaches here — start() validated
+            // the pool): dataset/ and dataset.fingerprint stay UNTOUCHED, so the
+            // python side reads an unchanged dataset and takes the cache-reuse
+            // path — wiping here would destroy the very pool being shared
+            let stage = StageInfo {
+                stage: "import".into(),
+                done: Some(1),
+                total: Some(1),
+                progress: Some(1.0),
+                message: Some("SHARED_POOL_REUSED".into()),
+            };
+            inner.snapshot.lock().stage = Some(stage.clone());
+            let _ = app.emit("training-stage", &stage);
+        } else if !dataset_unchanged {
+            swap = Some(DatasetSwap::begin(&dataset_dir)?);
+            std::fs::create_dir_all(&dataset_dir)?;
+        }
+        // deterministic import order: the workspace copies are named 000..N in
+        // list order and the extraction-cache fingerprint hashes name+content, so
+        // the same SELECTION re-picked in a different dialog order must not read
+        // as "dataset changed" (which would silently re-extract everything —
+        // exactly the cache-reuse promise the diffusion card is built on)
+        let mut dataset_files = req.dataset_files.clone();
+        dataset_files.sort();
+        let total = dataset_files.len();
+        for (i, f) in dataset_files.iter().enumerate() {
+            if inner.abort.load(Ordering::SeqCst) {
+                return abort_finish(inner, app);
+            }
+            let src = Path::new(f);
+            let rel = dataset_rel(None, i, f);
+            let dst = dataset_dir.join(&rel);
+            if !dataset_unchanged {
+                std::fs::copy(src, &dst).map_err(|e| {
+                    UtaiError::Training(format!(
+                        "TRAINING_IMPORT_COPY_FAILED: {}: {}",
+                        src.display(),
+                        e
+                    ))
+                })?;
+            }
+            ds_files.push(dsmanifest::DsFile {
+                rel,
+                name: src
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                bytes: std::fs::metadata(&dst).map(|m| m.len()).unwrap_or(0),
+                duration_ms: None,
+            });
+            let stage = StageInfo {
+                stage: "import".into(),
+                done: Some((i + 1) as u64),
+                total: Some(total as u64),
+                progress: Some((i + 1) as f32 / total as f32),
+                message: src.file_name().map(|n| n.to_string_lossy().into_owned()),
+            };
+            inner.snapshot.lock().stage = Some(stage.clone());
+            let _ = app.emit("training-stage", &stage);
+        }
+        if let Some(s) = swap.as_mut() {
+            s.commit();
+        }
+    }
+
+    // ---- annotate what was just imported (original names + speaker order) ----
+    // Guarded by「这次 run 自带选择」: on the reuse path the plan is empty and we know nothing
+    // about the source names, so writing here would REPLACE a good annotation with unknowns.
+    // An aborted import never reaches this line — `DatasetSwap`'s Drop has put the previous
+    // dataset back by then, and its previous annotation still describes it exactly.
+    //
+    // Also skip when dataset_unchanged (审查 S78): the disk is byte-identical to what the
+    // annotation already describes, and ds_files here carry duration_ms:None (run_worker never
+    // probes), so rewriting would only wipe the durations a data-page import recorded. `unchanged`
+    // implies a prior import already wrote the annotation, so nothing is lost by leaving it.
+    if !plan.is_empty() && !dataset_unchanged {
+        dsmanifest::record_import(data_dir, &ctx.project_id, ds_speakers, ds_files);
+    }
+
+    // Device resolution happened at PREFLIGHT (S75) — interpreter, backend and the run.json mask
+    // all ride in on ctx. Nothing device-related is decided here, on purpose: this point is past
+    // the workspace wipe and the dataset import.
+    let (python, device_backend, gpu_mask) =
+        (&ctx.python, ctx.device_backend.as_str(), ctx.gpu_mask.as_str());
+
+    // ---- run config for the sidecar ----
+    // ★★§F2⒝ ④e — RUN-level, and it used to be slot-level (`run_dirs(..).any(..)`).
+    //
+    // python's two gates (the multi-speaker refusal and the encoder-agreement check) hang off
+    // THIS run's `config.json`, so the question they need answered is 「本该有东西可查吗」 —
+    // a question about this run, not about the slot. While a slot held exactly one run the two
+    // readings were byte-identical; once ④e mints a second one they diverge, and the slot-level
+    // answer turns a legitimate diff-first run in a slot that HAS a main model elsewhere into a
+    // hard `DIFF_MAIN_CONFIG_MISSING`.
+    // ⛔ Renamed rather than silently re-pointed: `slot_has_main_model` would have become a
+    // name that lies, and the python side reads it by name.
+    let run_has_main_model = has_main_progress(run);
+    let mut run_config = serde_json::json!({
+        "backend": req.backend,
+        "workspace": workspace,
+        // ★§F2⒝ batch 2 step ③ — the SLOT above, THIS RUN here. python splits the same way:
+        // `open_pool` keeps taking the slot (it resolves `<slot>/pools/<id>/`), everything else —
+        // weights, `config.json`, `filelists/`, the seeded base checkpoints, `train.log`, the
+        // diffusion expdir — hangs off this one. `.path()` because `RunDir` is deliberately not
+        // `Serialize`: the only way to obtain one is through a resolver.
+        "run_dir": run.path(),
+        // Whether the SLOT holds a main model AT ALL — a fact only this side can establish, since
+        // python sees one directory and cannot enumerate the slot's other runs. The shallow
+        // diffusion chain needs it because both of its gates (multi-speaker refusal, encoder
+        // agreement with the main model) hang off `<run>/config.json` EXISTING, and their absent
+        // branch quietly writes a placeholder. Without this key「there is genuinely no main model」
+        // (diff-first, which is a supported shape) and「this run was pointed at the wrong place」
+        // are the same observation, and a wiring slip would disguise itself as diff-first with both
+        // gates silently disabled and not one log line.
+        // ⛔ `false` here is precisely 「there is genuinely no main model」, i.e. it turns BOTH of
+        // the diffusion chain's gates off — the failure this key was added to make impossible.
+        "run_has_main_model": run_has_main_model,
+        "dataset_dir": dataset_dir,
+        "model_slug": slug,
+        // ⛔ S141 —— **不是** `req.model_name`。一次 start 不许改掉一个已经有名字的 run 的名字;
+        // 改名有它自己的命令与自己的三道闸。全部机理在 `name_to_persist` 的头注。
+        "model_name": name_to_persist(tproject::run_model_name(&run).as_deref(), &req.model_name),
+        "sample_rate": req.sample_rate,
+        "version": req.version,
+        "total_epoch": req.total_epoch,
+        "batch_size": req.batch_size,
+        "save_every_epoch": req.save_every_epoch,
+        "save_every_weights": req.save_every_weights,
+        "keep_only_latest": req.keep_only_latest,
+        "cache_gpu": req.cache_gpu,
+        // sovits_v2 is pure fp32 (upstream VISinger2 has no amp) — the switch
+        // is hidden in the UI and normalized off here, belt and suspenders
+        "fp16": if req.backend == "sovits_v2" { false } else { req.fp16 },
+        "spk_id": req.spk_id,
+        // sovits-only knobs (the rvc pipeline ignores them); vol_embedding /
+        // loudnorm are the EFFECTIVE values (manifest-inherited for diff runs)
+        "vol_embedding": ctx.vol_embedding,
+        "loudnorm": ctx.loudnorm,
+        // S41 augmentation copies — the EFFECTIVE value (manifest-inherited
+        // for diff runs); every pipeline reads it uniformly
+        "aug_copies": ctx.aug_copies,
+        "kmeans": req.kmeans,
+        "save_every_steps": req.save_every_steps,
+        "keep_ckpts": req.keep_ckpts,
+        // ★S117 §F2⒜ — WHICH archive a 续训 continues from. Absent / "latest" is exactly the
+        // historical behaviour, so an old front-end and every non-resume path are unaffected.
+        // The trainers fall back to the latest LOUDLY when "best" is asked for and no complete
+        // snapshot exists (utai_train/resume_state.choose_pair).
+        "resume_from": if req.resume_from.trim().is_empty() { "latest" } else { req.resume_from.trim() },
+        "all_in_mem": req.all_in_mem,
+        // sovits_diff-only knobs (ignored by the other pipelines)
+        "total_steps": req.total_steps,
+        "k_step_max": req.k_step_max,
+        "interval_force_save": ctx.interval_force_save,
+        "cache_all_data": req.cache_all_data,
+        // vocoder-only knobs (ignored by the other pipelines)
+        "crop_mel_frames": req.crop_mel_frames,
+        "freeze_mpd": req.freeze_mpd,
+        "seed": SEED,
+        // Windows cannot hold an EMPTY env var (empty = deleted = all GPUs
+        // visible) — CPU mode must be the explicit sentinel "-1". Otherwise the
+        // The accelerator-native MASK (NVIDIA UUID / vendor-relative index), "-1" = forced CPU,
+        // "" = auto (setup_visibility leaves it unset). S75: resolved at preflight from the
+        // picked entry's `value` — NEVER `req.gpu`, which now carries the UI id (`vendor:n`).
+        // Feeding an id to CUDA_VISIBLE_DEVICES would mask every device.
+        "gpu": gpu_mask,
+        // device.py's shim reads this BEFORE torch import (visibility) and to pick
+        // autocast/scaler. Sourced from the resolved interpreter: dev venv → the box's
+        // GPU (cuda) or force_cpu; installed pack → its variant (nv-cu130/amd->cuda,
+        // xpu->xpu, cpu->cpu). Absent field => shim defaults to cuda-with-availability-
+        // fallback, so a pre-Phase-B run.json stays valid.
+        "device_backend": device_backend,
+        "stop_file": stop_file,
+        "pretrain_g": ctx.pretrain_g,
+        "pretrain_d": ctx.pretrain_d,
+        "assets": {
+            "ffmpeg": ctx.ffmpeg,
+            "rmvpe_pt": ctx.rmvpe_pt,
+            "contentvec_onnx": ctx.contentvec,
+            // family, not backend: sovits_diff shares the sovits templates
+            "configs_dir": app_dir.join("training").join("assets").join("configs").join(backend_family(&req.backend)),
+            "mute_dir": app_dir.join("training").join("assets").join("mute"),
+            "nsf_hifigan_model": ctx.nsf_hifigan_model,
+            "diffusion_pretrain": ctx.diffusion_pretrain,
+            "vocoder_pretrain": ctx.vocoder_pretrain,
+        },
+    });
+    // ★§F2⒝ ④d — WHICH pool-identity formula this slot's products are stamped with. The third
+    // fact in this file that only this side can establish (beside `run_dir` and
+    // `slot_has_main_model`): python has no layout concept at all — `utai_train/pool.py`'s
+    // `open_pool` never opens `slot.json`, and nothing under `utai_train/` does — so before this
+    // key a Rust-side decision NOT to migrate a slot was invisible to it, and python would have
+    // gone on computing the NEW identity text against a disk still holding the old one: a sibling
+    // pool and hours of preprocessing, under a single `logger.info`.
+    // (Assigned rather than written into the `json!` block above so the key is one named
+    // constant on both sides of the language boundary — see `tpool::IDENTITY_VERSION_KEY`.)
+    run_config[tpool::IDENTITY_VERSION_KEY] = serde_json::json!(tpool::identity_version(&workspace));
+    // ★§F2⒝ ④e 笔 1 — the FOURTH fact only this side can establish: 「this run directory is
+    // supposed to be untouched」. python cannot derive it (`fresh` never crosses the boundary, an
+    // empty `resume_from` is normalised to "latest" one screen up, and `plan_load` judges purely
+    // by which files exist), and after ④e flips the mint it is the only thing standing between
+    // 「a new run」 and 「someone else's run, continued and overwritten」.
+    // ⛔ `ctx.mints_fresh_run`, never `req.fresh` — see the field's doc: the two differ exactly on
+    // 「重训(仅扩散)」, whose run legitimately keeps its main checkpoints.
+    // (Assigned outside the `json!` block above so the key is one named constant on each side of
+    // the language boundary, same as the line above it.)
+    run_config[trun::FRESH_RUN_KEY] = serde_json::json!(ctx.mints_fresh_run);
+    // ①c: the sovits pipeline's resolve_speakers reads this array for co-training;
+    // single-speaker omits the key entirely -> pipeline falls back to
+    // dataset_dir/model_slug = byte-identical run.json / behavior.
+    if is_multi {
+        run_config["speakers"] = serde_json::json!(run_speakers);
+    }
+    // S169, AMD lane only: the picked adapter's gfx arch + name. device.py's
+    // apply_amd_arch_mask re-keys "gpu" (a DXGI vendor-relative index) to the HIP ordinal
+    // carrying this arch — the two orders differ on Windows and there is no LUID bridge on
+    // the AMD lane. Key OMITTED elsewhere (same absent-field convention as device_backend):
+    // NVIDIA/Intel/CPU runs and pre-0.12.2 run.json read byte-identically.
+    if let Some(t) = &ctx.gpu_gfx_target {
+        run_config["gpu_gfx_target"] = serde_json::json!(t);
+        if let Some(l) = &ctx.gpu_label {
+            run_config["gpu_label"] = serde_json::json!(l);
+        }
+    }
+    let run_json = run.join("run.json");
+    // D7.2-007 fix: atomic write via tmp + same-dir rename. A torn run.json from a mid-write
+    // crash would otherwise surface as an incomprehensible JSON parse failure in python's
+    // `runner.py` (which does not know about our write protocol) — python just reports
+    // "No such file or directory" or a JSON decode error. With rename, a torn write leaves
+    // either the old run.json untouched OR both files exist (tmp visible, old run.json is
+    // what python reads), so python either sees the new config cleanly or the previous one.
+    let run_json_tmp = run.join("run.json.tmp");
+    std::fs::write(&run_json_tmp, serde_json::to_vec_pretty(&run_config)?)?;
+    crate::util::rename_with_retry(&run_json_tmp, &run_json, "TRAINING_RUN_JSON_WRITE")
+        .map_err(UtaiError::Training)?;
+
+    // ---- spawn the sidecar ----
+    if inner.abort.load(Ordering::SeqCst) {
+        return abort_finish(inner, app);
+    }
+    let training_dir = app_dir.join("training");
+    // `python` was resolved above by training_interpreter (dev venv / installed pack)
+    tracing::info!(
+        "spawning training sidecar: {} -m utai_train.runner --config {}",
+        python.display(),
+        run_json.display()
+    );
+    let mut cmd = crate::util::python_command(&python);
+    cmd.current_dir(&training_dir)
+        .arg("-m")
+        .arg("utai_train.runner")
+        .arg("--config")
+        .arg(&run_json)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // S115 §F5-2: diagnostic mode. Call-site env, NOT `util::python_command` — that helper is
+    // shared with the converter / MSST-export / envtest spawns, and these variables serialize
+    // every kernel launch. Keyed on the pack VARIANT (see `RunCtx::runtime_variant`), because
+    // `device_backend` says "cuda" for ROCm too and the two builds read different names.
+    if diagnostics::enabled() {
+        let vars = diagnostics::apply(&mut cmd, ctx.runtime_variant.as_deref(), &ctx.device_backend);
+        // The banner names every variable it set + the app version: a diagnostic log mailed to
+        // us months from now has to say what its diagnostic mode contained. Emitted even when
+        // the set is EMPTY — "we turned it on and this runtime has no knob" is also an answer,
+        // and the user who ticked the box deserves to see it rather than wonder.
+        tracing::info!(
+            "{}",
+            diagnostics::banner(&vars, ctx.runtime_variant.as_deref(), &ctx.device_backend)
+        );
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| {
+            UtaiError::Training(format!(
+                "TRAINING_PYTHON_SPAWN_FAILED: {}: {}",
+                python.display(),
+                e
+            ))
+        })?;
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    {
+        // slot-or-die: force_stop sets abort THEN drains the slot, so under any
+        // interleaving either we see abort here and kill the fresh child, or the
+        // slotted child is visible to force_stop's kill
+        let mut slot = inner.child.lock();
+        if inner.abort.load(Ordering::SeqCst) {
+            drop(slot);
+            let _ = child.kill();
+            let _ = child.wait();
+            return abort_finish(inner, app);
+        }
+        *slot = Some(child);
+    }
+    {
+        let mut s = inner.snapshot.lock();
+        s.state = "running".into();
+    }
+    let _ = app.emit("training-state", "running");
+
+    // stderr → ring buffer (surfaced on abnormal exit) + debug tracing
+    if let Some(stderr) = stderr {
+        let ring_inner = Arc::clone(inner);
+        let warn_app = app.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(|l| l.ok()) {
+                tracing::debug!(target: "muno", "[train-py] {}", line);
+                // S114 §F5-1: this stream is the ONLY place the commit-limit failure
+                // is ever visible. torch raises it inside multiprocessing's daemon
+                // feeder thread, which prints the traceback and keeps looping, so it
+                // never reaches the runner's except block and never becomes a
+                // protocol `error`. Reading it here is not a shortcut — it is the
+                // only evidence that exists.
+                if line.contains("Couldn't open shared file mapping")
+                    || line.contains("error code: <1455>")
+                {
+                    raise_warning(&ring_inner, &warn_app, warn_code::HOST_MEMORY);
+                }
+                let mut ring = ring_inner.stderr_ring.lock();
+                if ring.len() >= STDERR_RING_CAP {
+                    ring.pop_front();
+                }
+                ring.push_back(line);
+            }
+        });
+    }
+
+    // S114 §F5-1 stall watchdog. It only INFORMS — see STALL_WARN_SECS for why it
+    // must never abort. It exits with the run (`running` is cleared in every exit
+    // path, including force-kill), so it cannot outlive it.
+    {
+        let wd_inner = Arc::clone(inner);
+        let wd_app = app.clone();
+        std::thread::spawn(move || {
+            while wd_inner.running.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_secs(20));
+                if !wd_inner.running.load(Ordering::SeqCst) {
+                    break;
+                }
+                // armed only after the first protocol message: a preprocessing stage
+                // that takes longer than the threshold must not trip it
+                let Some(last) = *wd_inner.last_progress_at.lock() else { continue };
+                if last.elapsed().as_secs() >= STALL_WARN_SECS
+                    && raise_warning(&wd_inner, &wd_app, warn_code::NO_PROGRESS)
+                {
+                    tracing::error!(
+                        "training has produced no protocol output for {}s — the sidecar may be \
+                         hung (see TRAINING_HOST_MEMORY_EXHAUSTED for the known cause)",
+                        last.elapsed().as_secs()
+                    );
+                }
+            }
+        });
+    }
+
+    // stdout protocol loop (this thread)
+    let mut got_done = false;
+    let mut got_error: Option<String> = None;
+    if let Some(stdout) = stdout {
+        for line in BufReader::new(stdout).lines().map_while(|l| l.ok()) {
+            let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else {
+                tracing::debug!(target: "muno", "[train-proto?] {}", line);
+                continue;
+            };
+            // S114 §F5-1: ANY well-formed protocol message counts as progress, not
+            // just `step`. Stages report during preprocessing, and arming the
+            // watchdog on steps alone would make every long f0-extraction look hung.
+            *inner.last_progress_at.lock() = Some(Instant::now());
+            match msg.get("type").and_then(|t| t.as_str()) {
+                Some("stage") => {
+                    let stage = StageInfo {
+                        stage: msg["stage"].as_str().unwrap_or("").to_string(),
+                        done: msg["done"].as_u64(),
+                        total: msg["total"].as_u64(),
+                        progress: msg["progress"].as_f64().map(|p| p as f32),
+                        message: msg["message"].as_str().map(str::to_string),
+                    };
+                    inner.snapshot.lock().stage = Some(stage.clone());
+                    let _ = app.emit("training-stage", &stage);
+                }
+                Some("step") => {
+                    let losses: HashMap<String, f64> = msg["losses"]
+                        .as_object()
+                        .map(|o| {
+                            o.iter()
+                                .filter_map(|(k, v)| v.as_f64().map(|f| (k.clone(), f)))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let step = StepInfo {
+                        step: msg["step"].as_u64().unwrap_or(0),
+                        total_steps: msg["total_steps"].as_u64().unwrap_or(0),
+                        epoch: msg["epoch"].as_u64().unwrap_or(0) as u32,
+                        total_epochs: msg["total_epochs"].as_u64().unwrap_or(0) as u32,
+                        lr: msg["lr"].as_f64().unwrap_or(0.0),
+                        losses: losses.clone(),
+                        eta_secs: msg["eta_secs"].as_u64(),
+                    };
+                    {
+                        let mut hist = inner.history.lock();
+                        if hist.len() >= HISTORY_CAP {
+                            // thin to half; the curve keeps its shape, memory stays bounded
+                            let thinned: Vec<StepPoint> =
+                                hist.iter().step_by(2).cloned().collect();
+                            *hist = thinned;
+                        }
+                        hist.push(StepPoint {
+                            step: step.step,
+                            lr: step.lr,
+                            losses,
+                        });
+                    }
+                    inner.snapshot.lock().step = Some(step.clone());
+                    let _ = app.emit("training-step", &step);
+                }
+                Some("ckpt") => {
+                    let ckpt = CkptInfo {
+                        kind: msg["kind"].as_str().unwrap_or("").to_string(),
+                        path: msg["path"].as_str().unwrap_or("").to_string(),
+                        step: msg["step"].as_u64().unwrap_or(0),
+                        epoch: msg["epoch"].as_u64().unwrap_or(0) as u32,
+                        metric: msg["metric"].as_f64(),
+                    };
+                    {
+                        let mut s = inner.snapshot.lock();
+                        // best/final overwrite their previous entry; periodics accumulate
+                        if ckpt.kind == "best" || ckpt.kind == "final" {
+                            s.ckpts.retain(|c| c.kind != ckpt.kind);
+                        }
+                        s.ckpts.push(ckpt.clone());
+                    }
+                    let _ = app.emit("training-ckpt", &ckpt);
+                }
+                Some("done") => {
+                    got_done = true;
+                    let reason = msg["reason"].as_str().unwrap_or("completed");
+                    let mut s = inner.snapshot.lock();
+                    s.state = if reason == "stopped" { "stopped" } else { "completed" }.into();
+                    s.summary = Some(msg["summary"].clone());
+                }
+                // ★S117: the sidecar's own warning channel. Until now the app could only raise a
+                // warning from OUTSIDE the trainer — the stderr scan for err 1455, and the stall
+                // watchdog — so anything the trainer itself noticed had to either fail the run or
+                // disappear into a log line. `raise_warning` dedupes, so a repeat is free.
+                Some("warn") => {
+                    let code = msg["code"].as_str().unwrap_or("").trim().to_string();
+                    // An empty or absurd code would land in the UI as a raw string; drop it and
+                    // leave the evidence in the log rather than render nonsense at the user.
+                    if !code.is_empty() && code.len() <= 64 {
+                        raise_warning(inner, app, &code);
+                    } else {
+                        tracing::debug!(target: "muno", "[train-proto?] unusable warn code {:?}", code);
+                    }
+                }
+                Some("error") => {
+                    got_error = Some(
+                        msg["message"]
+                            .as_str()
+                            .unwrap_or("TRAINING_UNKNOWN_ERROR")
+                            .to_string(),
+                    );
+                }
+                _ => tracing::debug!(target: "muno", "[train-proto?] {}", line),
+            }
+        }
+    }
+
+    // ---- child exit ----
+    // take the child OUT before waiting — wait() must not hold the lock (force_stop
+    // and the quit flow would otherwise block on it during the exit window)
+    let mut child_opt = inner.child.lock().take();
+    let status = match child_opt.as_mut() {
+        Some(child) => child.wait().ok(),
+        None => None, // force-killed (slot drained by force_stop)
+    };
+    let code = status.and_then(|s| s.code());
+
+    if got_done {
+        finalize_elapsed(inner);
+        emit_done(inner, app);
+        tracing::info!("training run finished ({:?})", inner.snapshot.lock().state);
+        return Ok(());
+    }
+    if let Some(err) = got_error {
+        return Err(UtaiError::Training(err));
+    }
+    // no protocol verdict at all — crashed / killed externally. BE LOUD.
+    if status.is_none() {
+        finalize_elapsed(inner);
+        // ★S115: KEEP THE EVIDENCE. This branch used to set only the state, and "hung run →
+        // user presses stop" is the S114 §F5-1 signature — so the one path that most needs
+        // forensics was the one that threw them away: the error card renders on
+        // `state === "error"` only, and the next start wipes the whole snapshot AND the
+        // stderr ring. The raw lines do survive in `utai.log.<date>` (the `[train-py]`
+        // forward is `tracing::debug!` with target "muno", and the FILE filter is
+        // `warn,utai=debug`) — but a user who sees a blank "stopped" has no reason to
+        // suspect there is anything worth sending. Carrying the tail here is what turns
+        // "it just stopped" into "here is what it said before it stopped".
+        // ⚠ Take the tail BEFORE locking the snapshot: `stderr_tail` locks the ring, and the
+        // error path above (`:1755`) establishes that order.
+        let tail = stderr_tail(inner);
+        let mut s = inner.snapshot.lock();
+        mark_force_stopped(&mut s, tail);
+        drop(s);
+        emit_done(inner, app);
+        tracing::warn!("training force-stopped by user");
+        return Ok(());
+    }
+    Err(UtaiError::Training(format!(
+        "TRAINING_PROCESS_CRASHED: exit code {:?}",
+        code
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// S114 §F5-3: the numerical-divergence guard is python, so `cargo test` cannot
+    /// exercise its behaviour — that is `converter/verify/training/gate_numerics_guard.py`
+    /// (38 checks, 10 mutation probes). What CAN rot without anyone noticing is the
+    /// cross-language contract, and that is what this pins, in the same
+    /// `include_str!` style as `s113_alias_hint_wire_matches_the_ts_union` and
+    /// `shipped_dictionaries_match_the_committed_manifest`.
+    ///
+    /// The failure this prevents is concrete: the trainer raises
+    /// `RuntimeError("TRAINING_NUMERICS_DIVERGED: ...")`, `runner.py` turns it into a
+    /// protocol error, and the frontend maps the CODE to i18n. Rename the CODE on the
+    /// python side, or ship a language whose json never got the key, and the user sees
+    /// a raw English CODE at the exact moment their training just died — the S67
+    /// `TRAINING_GPU_UNAVAILABLE` chain has the identical shape.
+    ///
+    /// ⚠ It pins TEXT, not behaviour. If you rename the constant, this test tells you
+    /// the four other places that have to move with it; that IS the point.
+    /// ★S116 §F5-③ⓒ — the same cross-language contract for the two RESUME refusals.
+    ///
+    /// Behaviour lives in `converter/verify/training/gate_ckpt_guard.py` (15 checks); what rots
+    /// silently is the wiring. These two CODEs fire at the worst possible moment — the user asked
+    /// to continue a run they have already paid hours for — so a raw English CODE on the screen
+    /// there is exactly the S67 `TRAINING_GPU_UNAVAILABLE` failure again.
+    /// ⚠ Both CODEs are parsed OUT of ckpt_guard.py, never retyped here.
+    #[test]
+    fn s116_resume_guard_codes_are_wired_across_python_rust_and_all_three_locales() {
+        static CKPT_GUARD_PY: &str = include_str!("../../../training/utai_train/ckpt_guard.py");
+        static BACKEND_ERR_TS: &str = include_str!("../../../src/lib/backendError.ts");
+
+        let parse = |name: &str| -> String {
+            CKPT_GUARD_PY
+                .lines()
+                .find_map(|l| l.trim().strip_prefix(&format!("{name} = ")))
+                .map(|v| v.trim().trim_matches('"').to_string())
+                .unwrap_or_else(|| {
+                    panic!("ckpt_guard.py must keep `{name} = \"...\"` as a plain top-level literal — this gate parses it as the single source")
+                })
+        };
+        let codes = [parse("CODE"), parse("FAILED_CODE")];
+        assert_ne!(codes[0], codes[1], "the two refusals must stay distinguishable to the user");
+
+        for code in &codes {
+            assert!(
+                code.starts_with("TRAINING_") && code.chars().all(|c| c.is_ascii_uppercase() || c == '_'),
+                "the CODE crosses a process boundary and lands in json keys: {code:?}"
+            );
+            assert!(
+                BACKEND_ERR_TS.contains(&format!("{code}: {{ key: \"backend.{code}\"")),
+                "src/lib/backendError.ts has no mapping for {code} — the user would see the raw CODE"
+            );
+            for (lang, raw) in [
+                ("zh", include_str!("../../../src/i18n/zh.json")),
+                ("en", include_str!("../../../src/i18n/en.json")),
+                ("ja", include_str!("../../../src/i18n/ja.json")),
+            ] {
+                let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+                let msg = v
+                    .pointer(&format!("/backend/{code}"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or_else(|| panic!("src/i18n/{lang}.json is missing backend.{code}"));
+                assert!(
+                    msg.chars().count() >= 30,
+                    "backend.{code} in {lang}.json is {} chars — too short to be the real message: {msg:?}",
+                    msg.chars().count()
+                );
+            }
+        }
+
+        // ★The half a text gate CAN check about behaviour: every trainer must re-raise the
+        // refusal BEFORE its catch-all, or the guard is swallowed and a corrupt resume silently
+        // becomes "restart from the base model at step 0" — a WORSE silent failure than the one
+        // it replaces. That interaction is the whole reason ResumeRefused is its own type.
+        for (name, src) in [
+            ("rvc", include_str!("../../../training/utai_train/rvc/train.py")),
+            ("sovits", include_str!("../../../training/utai_train/sovits/train.py")),
+            ("sovits_v2", include_str!("../../../training/utai_train/sovits_v2/train.py")),
+        ] {
+            assert!(
+                src.contains("ckpt_guard.plan_load("),
+                "{name}/train.py stopped deciding up front what to load — that decision has ONE \
+                 home (`ckpt_guard.plan_load`) precisely because S117 found it had grown two"
+            );
+            let re_raise = src
+                .find("except ckpt_guard.ResumeRefused:")
+                .unwrap_or_else(|| panic!("{name}/train.py must re-raise ResumeRefused"));
+            // ⚠ Compare against the catch-all OF THE SAME BLOCK, identified by its unique body —
+            // the first draft asked "does `except Exception` appear anywhere after this?", which
+            // every one of these files satisfies from an unrelated later try, so swapping the two
+            // arms left it green. A mutation caught that (S116); do not weaken it back.
+            let catch_all = src
+                .find("raise ckpt_guard.refuse_unreadable(")
+                .unwrap_or_else(|| panic!("{name}/train.py lost its loud unreadable-checkpoint arm"));
+            assert!(
+                re_raise < catch_all,
+                "{name}/train.py: the catch-all is ordered BEFORE the ResumeRefused arm, so python \
+                 matches it first and the refusal is swallowed — a corrupt resume would silently \
+                 restart from the base model at step 0"
+            );
+        }
+
+        // ★S117 — the other half of the same wiring, and the one that actually shipped broken.
+        // The two so-vits trainers have NO separate pretrain branch: their base model IS the
+        // `G_0.pth`/`D_0.pth` pair in the workspace. `c44dec6` gated their only load site on a
+        // predicate that filters those out, so every FRESH run trained from random init with the
+        // base unread on disk — silently, for two sessions. Behaviour is pinned by
+        // `gate_ckpt_guard.py`'s B block (it drives `load_start_state` and asserts the weights
+        // moved); what THIS gate can add is that the branch has not simply been deleted again.
+        for (name, src) in [
+            ("sovits", include_str!("../../../training/utai_train/sovits/train.py")),
+            ("sovits_v2", include_str!("../../../training/utai_train/sovits_v2/train.py")),
+        ] {
+            assert!(
+                src.contains("ckpt_guard.LOAD_SEEDED_BASE"),
+                "{name}/train.py no longer handles LOAD_SEEDED_BASE — a fresh run would leave its \
+                 base model unread on disk and train from random init, silently (S117)"
+            );
+            assert!(
+                src.contains("def load_start_state("),
+                "{name}/train.py must keep the startup load in a module-level function — inside \
+                 train() no test can drive it, which is exactly how the S117 regression shipped"
+            );
+        }
+    }
+
+    /// ★S169 — the same cross-language contract for the AMD arch-keyed device pick's two
+    /// refusals. They fire at start-up on exactly the community machines the lane was widened
+    /// for (mixed-arch AMD laptops), so a raw English CODE there is the S67
+    /// `TRAINING_GPU_UNAVAILABLE` failure again. Two DISTINCT codes on purpose (the closed-gate
+    /// iron rule): "the enum probe could not run" and "it ran and no device carries the arch"
+    /// demand different next steps, and a shared red would get shrugged past the second time.
+    /// ⚠ Both CODEs are parsed OUT of the python sources, never retyped here.
+    #[test]
+    fn s169_amd_device_pick_codes_are_wired_across_python_rust_and_all_three_locales() {
+        static HIPENUM_PY: &str = include_str!("../../../training/utai_train/hipenum.py");
+        static DEVICE_PY: &str = include_str!("../../../training/utai_train/device.py");
+        static ENVTEST_PY: &str = include_str!("../../../training/utai_train/envtest.py");
+        static BACKEND_ERR_TS: &str = include_str!("../../../src/lib/backendError.ts");
+
+        let parse = |src: &str, file: &str, name: &str| -> String {
+            src.lines()
+                .find_map(|l| l.trim().strip_prefix(&format!("{name} = ")))
+                .map(|v| v.trim().trim_matches('"').to_string())
+                .unwrap_or_else(|| {
+                    panic!("{file} must keep `{name} = \"...\"` as a plain top-level literal — this gate parses it as the single source")
+                })
+        };
+        let codes = [
+            parse(HIPENUM_PY, "hipenum.py", "ENUM_FAILED_CODE"),
+            parse(DEVICE_PY, "device.py", "AMD_GPU_NOT_FOUND_CODE"),
+            // The envtest-side third red (the S169 adversarial review caught it shipping
+            // unmapped: the self-test panel would have shown raw English to zh/ja users).
+            parse(ENVTEST_PY, "envtest.py", "NO_COVERED_GPU_CODE"),
+        ];
+        for (i, a) in codes.iter().enumerate() {
+            for b in codes.iter().skip(i + 1) {
+                assert_ne!(a, b, "the refusals must stay distinguishable to the user");
+            }
+        }
+
+        for code in &codes {
+            assert!(
+                (code.starts_with("TRAINING_") || code.starts_with("ENVTEST_"))
+                    && code.chars().all(|c| c.is_ascii_uppercase() || c == '_'),
+                "the CODE crosses a process boundary and lands in json keys: {code:?}"
+            );
+            assert!(
+                BACKEND_ERR_TS.contains(&format!("{code}: {{ key: \"backend.{code}\"")),
+                "src/lib/backendError.ts has no mapping for {code} — the user would see the raw CODE"
+            );
+            for (lang, raw) in [
+                ("zh", include_str!("../../../src/i18n/zh.json")),
+                ("en", include_str!("../../../src/i18n/en.json")),
+                ("ja", include_str!("../../../src/i18n/ja.json")),
+            ] {
+                let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+                let msg = v
+                    .pointer(&format!("/backend/{code}"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or_else(|| panic!("src/i18n/{lang}.json is missing backend.{code}"));
+                assert!(
+                    msg.chars().count() >= 30,
+                    "backend.{code} in {lang}.json is {} chars — too short to be the real message: {msg:?}",
+                    msg.chars().count()
+                );
+            }
+        }
+
+        // ★The wiring half a text gate CAN check, on COMMENT-STRIPPED sources (S169 review:
+        // a needle that also matches commented-out code lets the mechanism be disabled by
+        // commenting while the test stays green — the ipcParity "挖空注释" rule). Needles
+        // split with concat! so this test's own source can never satisfy them (S127).
+        let strip_py = |src: &str| -> String {
+            // Good enough for these needles: none of them can appear inside a string literal.
+            src.lines()
+                .map(|l| l.split('#').next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let runner = strip_py(include_str!("../../../training/utai_train/runner.py"));
+        // Order is LOAD-BEARING twice over (both pinned): setup_visibility seeds the legacy
+        // mask that apply_amd_arch_mask then re-keys — reversed, setup would overwrite the
+        // arch-keyed mask with the DXGI ordinal and silently reintroduce the S169 field bug;
+        // and the mask must precede require_wanted_accelerator, which probes visibility.
+        let setup_call = runner
+            .find(concat!("setup_visibility", "(cfg)"))
+            .expect("runner.py no longer calls setup_visibility");
+        let mask_call = runner
+            .find(concat!("apply_amd_arch_mask", "(cfg)"))
+            .expect("runner.py no longer applies the AMD arch mask");
+        let guard_call = runner
+            .find(concat!("require_wanted_accelerator", "(cfg)"))
+            .expect("runner.py lost the loud-degradation guard");
+        assert!(
+            setup_call < mask_call,
+            "runner.py: setup_visibility must run BEFORE apply_amd_arch_mask — reversed, the \
+             legacy DXGI-ordinal mask overwrites the arch-keyed one and the S169 wrong-silicon \
+             bug returns with every gate still green"
+        );
+        assert!(
+            mask_call < guard_call,
+            "runner.py: the arch mask must run before require_wanted_accelerator, or the guard \
+             passes/fails on the WRONG device's visibility"
+        );
+        // The emitting side: run_worker writes the trigger key run.json-side (this file),
+        // in CODE, not in a comment.
+        let me: String = include_str!("mod.rs")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            me.contains(concat!("run_config[\"gpu_gfx", "_target\"]")),
+            "run_worker no longer emits gpu_gfx_target — device.py's AMD lane would never trigger \
+             and every mixed-arch AMD laptop silently regresses to the DXGI-ordinal mask"
+        );
+    }
+
+    /// ★S117 §F2⒜ — the「从最佳存档继续」button is gated on a COMPLETE snapshot.
+    ///
+    /// Python writes G → D → `state.json`, so the marker is written last. If this side accepted
+    /// anything less, a kill mid-write would put a button on the screen that continues from the
+    /// latest checkpoint instead — silently doing something other than what it says, which is
+    /// the exact defect §F2⒜ exists to remove (the best point used to be an inference-only
+    /// export, i.e. a dead end that nothing said was a dead end).
+    #[test]
+    fn s117_the_best_resume_option_needs_all_three_files() {
+        // ⛔ a RUN directory: `best_resume_step` reads a run product, and the newtype is what
+        // stops a family slot being handed to it once the two stop being the same directory.
+        let root = trun::RunDir::for_test(
+            std::env::temp_dir().join(format!("utai_s117_best_{}", std::process::id())),
+        );
+        let d = root.join("resume_best");
+        std::fs::create_dir_all(&d).unwrap();
+        assert_eq!(best_resume_step(&root), None, "empty directory is not a snapshot");
+
+        std::fs::write(d.join("G.pth"), b"g").unwrap();
+        assert_eq!(best_resume_step(&root), None, "G alone is not a resumable pair");
+        std::fs::write(d.join("D.pth"), b"d").unwrap();
+        assert_eq!(
+            best_resume_step(&root),
+            None,
+            "the pair without the completion marker may be half-written — must not be offered"
+        );
+        std::fs::write(d.join("state.json"), br#"{"schema":1,"global_step":1400}"#).unwrap();
+        assert_eq!(best_resume_step(&root), Some(1400));
+
+        // A marker we cannot parse is not a licence to guess a step.
+        std::fs::write(d.join("state.json"), b"{ not json").unwrap();
+        assert_eq!(best_resume_step(&root), None);
+        // …and one that parses but has no step is not "step 0".
+        std::fs::write(d.join("state.json"), br#"{"schema":1}"#).unwrap();
+        assert_eq!(best_resume_step(&root), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ★S117 §F2⒜ — the resume-state sidecar's wiring, across four languages.
+    ///
+    /// Behaviour is `converter/verify/training/gate_resume_state.py`; what rots silently is the
+    /// wiring, and this one has an extra hop nothing else has: python now raises WARNINGS on the
+    /// protocol (`Reporter.warn`), which the loop above turns into `TrainingSnapshot.warnings`.
+    /// Before S117 the only warning raisers were Rust-side (the err-1455 stderr scan and the
+    /// stall watchdog), so a trainer that noticed something could only fail the run or say it to
+    /// a log nobody reads.
+    ///
+    /// ⚠ The CODE is parsed OUT of resume_state.py, never retyped here.
+    #[test]
+    fn s117_resume_state_sidecar_and_the_warn_channel_are_wired_end_to_end() {
+        static RESUME_STATE_PY: &str =
+            include_str!("../../../training/utai_train/resume_state.py");
+        static PROTOCOL_PY: &str = include_str!("../../../training/utai_train/protocol.py");
+        static BACKEND_ERR_TS: &str = include_str!("../../../src/lib/backendError.ts");
+
+        let code = RESUME_STATE_PY
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("CODE_DATASET_CHANGED = "))
+            .map(|v| v.trim().trim_matches('"').to_string())
+            .expect("resume_state.py must keep CODE_DATASET_CHANGED as a plain top-level literal");
+        assert!(
+            code.starts_with("TRAINING_") && code.chars().all(|c| c.is_ascii_uppercase() || c == '_'),
+            "the CODE crosses a process boundary and lands in json keys: {code:?}"
+        );
+        assert!(
+            BACKEND_ERR_TS.contains(&format!("{code}: {{ key: \"backend.{code}\"")),
+            "src/lib/backendError.ts has no mapping for {code} — the user would see the raw CODE"
+        );
+        // ⚠ NOT `modal` on purpose: the run is still going. A modal here would cover the live
+        // training screen for something that is explicitly not a failure.
+        assert!(
+            !BACKEND_ERR_TS.contains(&format!("{code}: {{ key: \"backend.{code}\", modal")),
+            "{code} is a warning, not a failure — a modal would cover a run that is still training"
+        );
+        for (lang, raw) in [
+            ("zh", include_str!("../../../src/i18n/zh.json")),
+            ("en", include_str!("../../../src/i18n/en.json")),
+            ("ja", include_str!("../../../src/i18n/ja.json")),
+        ] {
+            let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+            let msg = v
+                .pointer(&format!("/backend/{code}"))
+                .and_then(|m| m.as_str())
+                .unwrap_or_else(|| panic!("src/i18n/{lang}.json is missing backend.{code}"));
+            assert!(
+                msg.chars().count() >= 30,
+                "backend.{code} in {lang}.json is {} chars — too short to be the real message",
+                msg.chars().count()
+            );
+        }
+
+        assert!(
+            PROTOCOL_PY.contains("def warn(self, code):")
+                && PROTOCOL_PY.contains("\"type\": \"warn\""),
+            "utai_train/protocol.py lost Reporter.warn — the trainer would have no way to raise a \
+             warning without failing the run"
+        );
+
+        // ★The ordering that makes the sidecar trustworthy: it is written AFTER both halves of
+        // the pair, so its presence means the pair beside it is complete. Writing it first would
+        // make a kill between the writes restore a scale/RNG belonging to a checkpoint that was
+        // never finished.
+        for (name, src) in [
+            ("rvc", include_str!("../../../training/utai_train/rvc/train.py")),
+            ("sovits", include_str!("../../../training/utai_train/sovits/train.py")),
+            ("sovits_v2", include_str!("../../../training/utai_train/sovits_v2/train.py")),
+        ] {
+            let last_save = src
+                .rfind("utils.save_checkpoint(net_d")
+                .unwrap_or_else(|| panic!("{name}/train.py lost its D-side save"));
+            let sidecar = src
+                .find("resume_state.write(")
+                .unwrap_or_else(|| panic!("{name}/train.py never writes the resume-state sidecar"));
+            assert!(
+                last_save < sidecar,
+                "{name}/train.py writes the resume-state sidecar BEFORE the pair it describes"
+            );
+            assert!(
+                src.contains("resume_state.restore("),
+                "{name}/train.py writes the sidecar but never restores from it"
+            );
+            // ★S117 §4 — the 200-step blind spot that made community issue #2 unanswerable.
+            assert!(
+                src.contains("diag.log_interval(hps.train.log_interval)"),
+                "{name}/train.py stopped routing log_interval through diag — diagnostic mode \
+                 would still sample every 200 steps, which is the gap that report died in"
+            );
+        }
+
+        // The diagnostic flag's NAME is a cross-language contract: Rust sets it, python reads it.
+        static DIAG_PY: &str = include_str!("../../../training/utai_train/diag.py");
+        static DIAG_RS: &str = include_str!("diagnostics.rs");
+        let env = DIAG_PY
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("ENV = "))
+            .map(|v| v.trim().trim_matches('"').to_string())
+            .expect("utai_train/diag.py must keep ENV as a plain top-level literal");
+        assert!(
+            DIAG_RS.contains(&format!("name: \"{env}\"")),
+            "training/diagnostics.rs never sets {env}, so nothing in diag.py can ever turn on"
+        );
+    }
+
+    /// ★S118 §F8⒜ — the shallow-diffusion half of the resume-snapshot contract.
+    ///
+    /// Behaviour is `converter/verify/training/gate_resume_state.py` (groups D1-D17). What rots
+    /// silently is the WIRING, and this one crosses four languages with a twist the GAN side does
+    /// not have: **Rust joins the directory and file names itself**, so python's constants and
+    /// Rust's literals are a contract with no compiler behind it. A rename on either side would
+    /// leave a 600 MB resume point that the archive list cannot see and the resume dialog cannot
+    /// offer — silently, because every individual test would still pass.
+    #[test]
+    fn s118_diffusion_resume_snapshots_are_wired_across_python_rust_and_all_three_locales() {
+        static RESUME_STATE_PY: &str =
+            include_str!("../../../training/utai_train/resume_state.py");
+        static DIFF_PIPELINE_PY: &str =
+            include_str!("../../../training/utai_train/sovits/diff_pipeline.py");
+        static SOLVER_PY: &str =
+            include_str!("../../../training/utai_train/sovits/diffusion/solver.py");
+        static BACKEND_ERR_TS: &str = include_str!("../../../src/lib/backendError.ts");
+        static TPROJECT_RS: &str = include_str!("tproject.rs");
+        static THIS_RS: &str = include_str!("mod.rs");
+
+        // ── the names, parsed out of python and never retyped ────────────────────────────
+        let py_str = |name: &str| -> String {
+            RESUME_STATE_PY
+                .lines()
+                .find_map(|l| l.trim().strip_prefix(&format!("{name} = ")))
+                .map(|v| v.trim().trim_matches('"').to_string())
+                .unwrap_or_else(|| {
+                    panic!("resume_state.py must keep `{name} = \"...\"` as a plain top-level literal")
+                })
+        };
+        let (best_dir, latest_dir) = (py_str("BEST_DIR"), py_str("LATEST_DIR"));
+        let (best_model, best_state) = (py_str("BEST_MODEL"), py_str("BEST_STATE"));
+        let min_len: usize = RESUME_STATE_PY
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("SNAPSHOT_DIR_MIN_LEN = "))
+            .and_then(|v| v.trim().parse().ok())
+            .expect("resume_state.py must keep SNAPSHOT_DIR_MIN_LEN as a plain int literal");
+
+        // ⛔ NOT cosmetic. `logger/utils.load_model` scans RECURSIVELY and slices each path at
+        // `len(expdir + "/model_")` before asking isdigit(); a name shorter than this lets the
+        // path separator fall into the discarded prefix and exposes the FILENAME's tail, after
+        // which the scan rebuilds a flat `model_<that number>.pt` that does not exist and the
+        // resume dies inside torch.load. Measured — `logs/` (4 chars, created by Saver) does it.
+        for d in [&best_dir, &latest_dir] {
+            assert!(
+                d.chars().count() >= min_len,
+                "snapshot directory {d:?} is shorter than SNAPSHOT_DIR_MIN_LEN={min_len} — it \
+                 would hijack the diffusion resume scan"
+            );
+        }
+        // ★§F2⒝ — the OTHER half of the same rule, and the reason `diffusion/` has to stay one
+        // level BELOW a run root rather than becoming it. The loop above only says python's own
+        // snapshot names are long enough; it knows nothing about depth, so both `diffusion` (9) and
+        // a minted run id (13) sail through it, and `trun`'s doc once cited it as this rule's guard.
+        //
+        // ⚠ Batch 3 measured the replacement written here in batch 2 and found it WEAK in two ways.
+        // It asserted that `eval` and `logs` fall below the minimum — true, but:
+        //   * `logs` does not DISCRIMINATE: it is `<expdir>/logs` under the correct layout too, so
+        //     it is inside the scan's scope either way and cannot tell the two choices apart;
+        //   * the hazard it describes is DORMANT — it needs a `.pt` inside one of those directories
+        //     and `traverse_dir` filters on `.pt` while both are written only by TensorBoard.
+        // Both halves stay (they are the arithmetic, and `eval` really is run-root-only), but the
+        // load-bearing statement is the one below, which needs no `.pt` anywhere unusual:
+        assert!("eval".chars().count() < min_len, "`eval/` is the run-root-only short name");
+        assert!(
+            "logs".chars().count() < min_len,
+            "`logs/` no longer falls below SNAPSHOT_DIR_MIN_LEN={min_len} — the arithmetic changed"
+        );
+        // ⛔ THE reason, and it fires on the ordinary layout rather than on an unusual file. The
+        // scan slices every checkpoint path at `len(expdir) + len("/model_")` and asks isdigit().
+        // With the expdir one level above the checkpoints — which is what a run root would be —
+        // what survives the slice is not the step number but the tail of the directory name:
+        // `<run>/diffusion/model_24.pt` becomes `ion/model_24`. Not a number, so the ENTIRE
+        // numbered grid reads as empty and a resume restarts from step 0 — silently, on a run that
+        // really does hold checkpoints.
+        // python: `steps = [s[len(os.path.join(expdir, "model_")):] for s in <*.pt, recursive>]`,
+        // so past `<expdir>/` it discards exactly `len("model_")` more characters. Both directions
+        // are asserted, because only the PAIR discriminates — one of them alone is a fact about
+        // arithmetic, not about which directory may be the expdir.
+        let after_slice = |tail_under_expdir: &str| -> String {
+            tail_under_expdir.chars().skip("model_".len()).collect()
+        };
+        assert_eq!(
+            after_slice("model_24"),
+            "24",
+            "with `diffusion/` AS the expdir the step number survives the slice — if this fails the \
+             resume scan can no longer read its own checkpoints"
+        );
+        let hijacked = after_slice("diffusion/model_24");
+        assert!(
+            !hijacked.chars().all(|c| c.is_ascii_digit()) && hijacked.contains('/'),
+            "the run root would now be a usable expdir ({hijacked:?} parses as a step) — re-read \
+             why `diffusion/` sits one level below it, because that reason just changed"
+        );
+        // Rust joins these names by hand in two files; a python rename must break a test here
+        // rather than the user's resume.
+        for (file, src) in [("mod.rs", THIS_RS), ("tproject.rs", TPROJECT_RS)] {
+            for name in [&best_dir, &latest_dir, &best_model, &best_state] {
+                assert!(
+                    src.contains(&format!("\"{name}\"")),
+                    "{file} no longer mentions {name:?} — python and Rust have drifted apart \
+                     about where the resume snapshots live"
+                );
+            }
+        }
+
+        // ── the payload is written BEFORE the marker ─────────────────────────────────────
+        let payload = RESUME_STATE_PY
+            .find("names = list(write_payload(d))")
+            .expect("resume_state.save_snapshot lost its payload call");
+        let marker = RESUME_STATE_PY
+            .find("write(state_path, out)")
+            .expect("resume_state.save_snapshot lost its marker write");
+        assert!(
+            payload < marker,
+            "save_snapshot writes the completion marker BEFORE the payload it describes — a kill \
+             in between would then offer a half-written checkpoint as a resume point"
+        );
+
+        // ── the diffusion trainer actually uses all of it ────────────────────────────────
+        for needle in [
+            "def load_start_state(",            // module level ⇒ a test can drive it (S117)
+            "cfg.get(\"resume_from\")",         // 「从最佳存档继续」 reaches python at all
+            "resume_state.read_snapshot(",      // …and is answered from the snapshot
+            "resumed=start.blob",               // the scale/RNG/dataset identity travels on
+            "superseded_step=(start.step if",   // the sweep is told whether this is a REWIND
+            "CODE_OPTIMIZER_NOT_RESTORED",      // an optimizer-less resume is not silent
+        ] {
+            assert!(
+                DIFF_PIPELINE_PY.contains(needle),
+                "sovits/diff_pipeline.py no longer contains {needle:?} — §F8a's wiring is broken"
+            );
+        }
+        for needle in [
+            "resume_state.restore(",
+            "resume_state.report_drift(",
+            "resume_state.save_solo_snapshot(",
+            "numerics.best_save_is_safe(",
+            "numerics.optimizer_state_is_safe(",
+            "diag.log_interval(args.train.interval_log)",
+        ] {
+            assert!(
+                SOLVER_PY.contains(needle),
+                "diffusion/solver.py no longer contains {needle:?} — §F8a's wiring is broken"
+            );
+        }
+        // The rolling resume point must be refreshed at every save that IS a resume point:
+        // validation, graceful stop, completion. Two of three is the shape where a killed run
+        // silently loses the optimizer again.
+        assert_eq!(
+            SOLVER_PY.matches("refresh_resume_point(epoch)").count()
+                - SOLVER_PY.matches("def refresh_resume_point(epoch)").count(),
+            3,
+            "diffusion/solver.py must refresh the rolling resume point at all three save points"
+        );
+
+        // ── ★S118 §F8f: poison must neither be published as a resume point nor resumed from ──
+        for needle in [
+            "numerics.resume_point_is_safe(",          // the rolling snapshot is never published dead
+            "divergence.observe(saver.global_step",    // the INF hole upstream's isnan cannot see
+            "numerics.CODE_DIVERGED, saver.global_step",  // …and the nan abort is localizable now
+            "if torch.isnan(loss):",                   // ⛔ upstream's CONDITION stays verbatim
+        ] {
+            assert!(
+                SOLVER_PY.contains(needle),
+                "diffusion/solver.py no longer contains {needle:?} — §F8f's wiring is broken"
+            );
+        }
+        assert!(
+            DIFF_PIPELINE_PY.contains("numerics.first_nonfinite_tensor(model.state_dict().items())")
+                && DIFF_PIPELINE_PY.contains("optimizer.state.clear()"),
+            "sovits/diff_pipeline.py stopped scanning a loaded archive for nan/inf (or stopped \
+             clearing the poisoned moments before trying the next candidate) — a resume would go \
+             back to training from nan"
+        );
+
+        // ── the new CODEs, across four languages ────────────────────────────────────────
+        for name in ["CODE_OPTIMIZER_NOT_RESTORED", "CODE_ARCHIVE_POISONED"] {
+            let code = py_str(name);
+            assert!(
+                code.starts_with("TRAINING_")
+                    && code.chars().all(|c| c.is_ascii_uppercase() || c == '_'),
+                "the CODE crosses a process boundary and lands in json keys: {code:?}"
+            );
+            assert!(
+                BACKEND_ERR_TS.contains(&format!("{code}: {{ key: \"backend.{code}\"")),
+                "src/lib/backendError.ts has no mapping for {code} — the user would see the raw CODE"
+            );
+            // ⚠ NOT modal. `CODE_ARCHIVE_POISONED` is used BOTH ways (a warning when an older
+            // healthy archive rescued the run, the run's error when nothing healthy was left), and
+            // in the rescued case the run is still training — a modal would cover it.
+            assert!(
+                !BACKEND_ERR_TS.contains(&format!("{code}: {{ key: \"backend.{code}\", modal")),
+                "{code} can arrive while the run is still training — a modal would cover it"
+            );
+            for (lang, raw) in [
+                ("zh", include_str!("../../../src/i18n/zh.json")),
+                ("en", include_str!("../../../src/i18n/en.json")),
+                ("ja", include_str!("../../../src/i18n/ja.json")),
+            ] {
+                let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+                let msg = v
+                    .pointer(&format!("/backend/{code}"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or_else(|| panic!("src/i18n/{lang}.json is missing backend.{code}"));
+                assert!(
+                    msg.chars().count() >= 30,
+                    "backend.{code} in {lang}.json is {} chars — too short to be the real message",
+                    msg.chars().count()
+                );
+            }
+        }
+    }
+
+    /// ★S118 §F8⒜ — the diffusion best snapshot needs its OWN reader, and every file it names.
+    #[test]
+    fn s118_the_diffusion_best_resume_option_needs_a_complete_snapshot() {
+        let root = trun::RunDir::for_test(
+            std::env::temp_dir().join(format!("utai_s118_diff_{}", std::process::id())),
+        );
+        let d = root.join("diffusion").join("resume_best");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&d).unwrap();
+        assert_eq!(diff_snapshot_step(&root, "resume_best"), None, "empty directory");
+
+        std::fs::write(d.join("model.pt"), b"m").unwrap();
+        assert_eq!(
+            diff_snapshot_step(&root, "resume_best"),
+            None,
+            "the payload without the completion marker may be half-written"
+        );
+        std::fs::write(
+            d.join("state.json"),
+            br#"{"schema":1,"global_step":1400,"files":["model.pt"]}"#,
+        )
+        .unwrap();
+        assert_eq!(diff_snapshot_step(&root, "resume_best"), Some(1400));
+
+        // ★The marker lists WHAT the payload was; a marker naming a file that is not there is not
+        // a snapshot, however well-formed it looks.
+        std::fs::write(
+            d.join("state.json"),
+            br#"{"schema":1,"global_step":1400,"files":["model.pt","nope.pt"]}"#,
+        )
+        .unwrap();
+        assert_eq!(diff_snapshot_step(&root, "resume_best"), None);
+
+        std::fs::write(
+            d.join("state.json"),
+            br#"{"schema":1,"global_step":1400,"files":["model.pt"]}"#,
+        )
+        .unwrap();
+        // ⛔ It must not be confused with the GAN pair's reader: that snapshot lives in the SLOT
+        // root and holds G.pth + D.pth, so a diffusion one must not satisfy it.
+        assert_eq!(
+            best_resume_step(&root),
+            None,
+            "the GAN reader must not accept a diffusion snapshot as its own"
+        );
+        // …and the progress reader HAS to count it, or the wipe-consent dialog goes missing for a
+        // slot whose only resume point is the snapshot.
+        assert_eq!(diffusion_progress_step(&root), Some(1400));
+        assert!(
+            slot_holds_work(&root),
+            "a slot holding only a diffusion snapshot still holds work"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ★S119 §F8⒝ — the VOCODER's resumable best snapshot: units, reachability, and the two
+    /// guards a rewind breaks if nobody teaches them about it.
+    #[test]
+    fn s119_the_vocoder_best_resume_snapshot_is_read_in_real_steps() {
+        let root = trun::RunDir::for_test(
+            std::env::temp_dir().join(format!("utai_s119_voc_{}", std::process::id())),
+        );
+        let d = root.join("resume_best");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&d).unwrap();
+        assert_eq!(voc_best_resume_step(&root), None, "empty directory");
+
+        std::fs::write(d.join("model.ckpt"), b"m").unwrap();
+        assert_eq!(
+            voc_best_resume_step(&root),
+            None,
+            "the payload without the completion marker may be half-written"
+        );
+        std::fs::write(
+            d.join("state.json"),
+            br#"{"schema":1,"global_step":3644,"files":["model.ckpt"]}"#,
+        )
+        .unwrap();
+        // ★THE UNITS. 3644 is what python records (trainer.global_step); 1822 is the number the
+        // user sees on every other row of the same slot. Getting this wrong is 设计红队 A8's
+        // ×2 class, and it would show up as a button offering to continue from a step that does
+        // not exist.
+        assert_eq!(voc_snapshot_step(&root, "resume_best"), Some(3644));
+        assert_eq!(voc_best_resume_step(&root), Some(1822));
+
+        // ★And the halving has to survive the trip through `slot_info`, because THAT is what the
+        // resume dialog reads (`info.best_resume_step` → 「从最佳存档继续（第 N 步）」). Build a
+        // real project layout so the family branch is genuinely exercised, and pin the GAN arm
+        // beside it so a future "simplification" that drops the branch goes red.
+        let data = std::env::temp_dir().join(format!("utai_s119_data_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data);
+        for (family, payload) in [
+            ("vocoder", &["model.ckpt"][..]),
+            ("sovits", &["G.pth", "D.pth"][..]),
+        ] {
+            let bd = tproject::family_dir(&data, "p1", family).join("resume_best");
+            std::fs::create_dir_all(&bd).unwrap();
+            std::fs::write(
+                bd.join("state.json"),
+                format!(
+                    r#"{{"schema":1,"global_step":3644,"files":[{}]}}"#,
+                    payload
+                        .iter()
+                        .map(|n| format!("\"{n}\""))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+            )
+            .unwrap();
+            for n in payload {
+                std::fs::write(bd.join(n), b"x").unwrap();
+            }
+        }
+        assert_eq!(
+            slot_info(&data, "p1", "vocoder", None).unwrap().best_resume_step,
+            Some(1822),
+            "the vocoder's resume button must offer the REAL step"
+        );
+        assert_eq!(
+            slot_info(&data, "p1", "sovits", None).unwrap().best_resume_step,
+            Some(3644),
+            "the GAN arm is NOT halved — its checkpoints count real steps already"
+        );
+        let _ = std::fs::remove_dir_all(&data);
+
+        // …and the progress reader HAS to count it: `_prune_workspace_ckpts` and a user freeing
+        // disk space both delete the big numbered files first, so a slot whose only resume point
+        // is the snapshot must still read as「有活」.
+        assert_eq!(vocoder_progress_step(&root), Some(3644));
+        assert!(
+            slot_holds_work(&root),
+            "a slot holding only a vocoder snapshot still holds work"
+        );
+        // ⚠ The two readers are NOT told apart by the payload's name, and that is deliberate:
+        // S118 made `snapshot_step` take the payload list out of the marker itself, so the GAN
+        // reader answers 3644 for this same directory. The ONLY difference between them is the
+        // units — which is precisely why `slot_info` has to branch on the family instead of
+        // relying on one reader failing to see the other's snapshot.
+        // (This assertion started life as "the GAN reader must not accept it", which was MY
+        // expectation and was wrong; the behaviour is by construction and it is fine.)
+        assert_eq!(
+            best_resume_step(&root),
+            Some(3644),
+            "payload-agnostic by construction — the family branch in slot_info is what separates \
+             the two, not the file name"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ★S119 §F8⒝ — python and Rust must keep agreeing about the vocoder snapshot's layout, and
+    /// the python wiring that makes it exist at all must stay wired.
+    #[test]
+    fn s119_vocoder_resume_snapshot_is_wired_across_python_and_rust() {
+        static RESUME_STATE_PY: &str =
+            include_str!("../../../training/utai_train/resume_state.py");
+        static VOC_PIPELINE_PY: &str =
+            include_str!("../../../training/utai_train/vocoder/pipeline.py");
+        static VOC_HARNESS_PY: &str =
+            include_str!("../../../training/utai_train/vocoder/harness.py");
+        static TPROJECT_RS: &str = include_str!("tproject.rs");
+        static THIS_RS: &str = include_str!("mod.rs");
+
+        let best_ckpt = RESUME_STATE_PY
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("BEST_CKPT = "))
+            .map(|v| v.trim().trim_matches('"').to_string())
+            .expect("resume_state.py must keep `BEST_CKPT = \"...\"` as a plain top-level literal");
+        for (file, src) in [("mod.rs", THIS_RS), ("tproject.rs", TPROJECT_RS)] {
+            assert!(
+                src.contains(&format!("\"{best_ckpt}\"")),
+                "{file} no longer mentions {best_ckpt:?} — python and Rust have drifted apart \
+                 about what the vocoder resume snapshot is called, and the archive list would \
+                 silently stop showing a gigabyte-scale resume point"
+            );
+        }
+
+        for needle in [
+            "def choose_start_ckpt(",           // module level ⇒ a test can drive it (S117)
+            "cfg.get(\"resume_from\")",         // 「从最佳存档继续」 reaches this backend at all
+            "resume_state.read_pointer(",       // the live branch's tip, not max(step)
+            "resume_state.read_snapshot(",      // …and the best archive is read the shared way
+            // ⚠ The exact INDENTED line, not the bare substring: a commented-out
+            // `# enable_version_counter=False,` still contains the substring, so the loose form
+            // could not tell live code from a corpse (caught by the mutation probe, S119).
+            "\n                enable_version_counter=False,\n",
+            "on_saved=protocol_cb.note_saved",  // the pointer is refreshed by whoever writes
+            "tip_step=protocol_cb.tip_step",    // the prune judges by the LIVE branch's tip
+            "resume_state.report_drift(",       // the dataset-identity warning
+            "resumed=start.blob",               // the RNG + dataset identity travel on
+        ] {
+            assert!(
+                VOC_PIPELINE_PY.contains(needle),
+                "vocoder/pipeline.py no longer contains {needle:?} — §F8b's wiring is broken"
+            );
+        }
+        for needle in [
+            "def on_fit_start(self, trainer, pl_module):",  // the ONLY hook early enough for RNG
+            "resume_state.restore(self.resumed, None, logger)",
+            "resume_state.save_solo_snapshot(",
+            "payload_name=resume_state.BEST_CKPT",
+            "numerics.resume_point_is_safe(",   // never publish a dead resume point
+            "numerics.DivergenceGuard(",        // this backend had no divergence guard at all
+        ] {
+            assert!(
+                VOC_HARNESS_PY.contains(needle),
+                "vocoder/harness.py no longer contains {needle:?} — §F8b's wiring is broken"
+            );
+        }
+        // ⛔ The RNG restore has to happen at on_fit_start and NOT at on_train_start: the train
+        // DataLoader's `_base_seed` — from which every worker's python/numpy/torch seed derives,
+        // and therefore the mel-crop offsets — is drawn in `_FitLoop.setup_data()`, which runs
+        // BETWEEN the two. Restoring afterwards is a silent no-op.
+        let fit = VOC_HARNESS_PY.find("def on_fit_start(").unwrap();
+        let restore = VOC_HARNESS_PY.find("resume_state.restore(self.resumed").unwrap();
+        let train_start = VOC_HARNESS_PY.find("def on_train_start(").unwrap();
+        assert!(
+            fit < restore && restore < train_start,
+            "the RNG restore moved out of on_fit_start — after the dataloader iterator exists it \
+             cannot change a single worker's stream"
+        );
+    }
+
+    #[test]
+    fn s114_divergence_code_is_wired_across_python_rust_and_all_three_locales() {
+        static NUMERICS_PY: &str = include_str!("../../../training/utai_train/numerics.py");
+        static BACKEND_ERR_TS: &str = include_str!("../../../src/lib/backendError.ts");
+
+        // The CODE's single source is the python constant — parse it, never retype it.
+        let code = NUMERICS_PY
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("CODE_DIVERGED = "))
+            .map(|v| v.trim().trim_matches('"').to_string())
+            .expect(
+                "numerics.py must keep `CODE_DIVERGED = \"...\"` as a plain top-level literal — \
+                 this gate parses it as the single source for the i18n key",
+            );
+        assert!(
+            code.starts_with("TRAINING_") && code.chars().all(|c| c.is_ascii_uppercase() || c == '_'),
+            "the CODE crosses a process boundary and lands in json keys: keep it SCREAMING_SNAKE ascii, got {code:?}"
+        );
+
+        assert!(
+            BACKEND_ERR_TS.contains(&format!("{code}: {{ key: \"backend.{code}\" }}")),
+            "src/lib/backendError.ts has no mapping for {code} — the user would see the raw CODE"
+        );
+
+        for (lang, raw) in [
+            ("zh", include_str!("../../../src/i18n/zh.json")),
+            ("en", include_str!("../../../src/i18n/en.json")),
+            ("ja", include_str!("../../../src/i18n/ja.json")),
+        ] {
+            let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+            let msg = v.pointer(&format!("/backend/{code}")).and_then(|m| m.as_str());
+            let msg = msg.unwrap_or_else(|| {
+                panic!("src/i18n/{lang}.json is missing backend.{code} (docs are trilingual and so is this)")
+            });
+            // A stub like "TODO" would satisfy a mere presence check; this text is what a
+            // user reads while their run is dying, so require it to actually say something.
+            assert!(
+                msg.chars().count() >= 30,
+                "backend.{code} in {lang}.json is {} chars — too short to be the real message: {msg:?}",
+                msg.chars().count()
+            );
+        }
+
+        // And the guard must still be CALLED. A guard nobody calls passes review and
+        // protects nothing (S109 §G14: `sync_bundled_dictionaries` had exactly one
+        // production call site and nothing pinned it).
+        for (name, src) in [
+            ("rvc", include_str!("../../../training/utai_train/rvc/train.py")),
+            ("sovits", include_str!("../../../training/utai_train/sovits/train.py")),
+            ("sovits_v2", include_str!("../../../training/utai_train/sovits_v2/train.py")),
+        ] {
+            assert!(
+                src.contains("divergence.observe("),
+                "{name}/train.py no longer calls divergence.observe() — a run that goes nan would \
+                 again burn hours in silence"
+            );
+            assert!(
+                src.contains("numerics.best_save_is_safe("),
+                "{name}/train.py no longer consults numerics.best_save_is_safe() — save_best would \
+                 again be free to overwrite a good checkpoint with nan weights"
+            );
+        }
+
+        // S114 §F5-1, same reasoning, different guard: the DataLoader commit budget.
+        // Behaviour lives in converter/verify/training/gate_loader_budget.py (37 checks,
+        // 8 mutation probes); what rots silently is a loader quietly losing its call.
+        // sovits_v2 builds its loaders in data_utils.py, not train.py.
+        for (name, src) in [
+            ("rvc/train", include_str!("../../../training/utai_train/rvc/train.py")),
+            ("sovits/train", include_str!("../../../training/utai_train/sovits/train.py")),
+            (
+                "sovits_v2/data_utils",
+                include_str!("../../../training/utai_train/sovits_v2/data_utils.py"),
+            ),
+        ] {
+            assert!(
+                src.contains("loader_budget.plan_loader(")
+                    && src.contains("loader_budget.probe_batch_bytes("),
+                "{name}.py no longer budgets its DataLoader — the 'training froze' report \
+                 (Windows error 1455: worker shared mappings exhausted the commit limit) is \
+                 unguarded again"
+            );
+        }
+    }
+
+    /// S114 §F5-1: the live-diagnostic codes must reach i18n too, and the warning
+    /// list must not grow without bound. Both raisers fire repeatedly by nature —
+    /// the 1455 traceback is printed once PER WORKER (five of them in the field
+    /// report) and the watchdog re-checks on a timer — so a list that appended
+    /// every time would push the FIRST, most informative occurrence off screen.
+    #[test]
+    fn s114_live_warning_codes_are_wired_and_raised_at_most_once() {
+        static BACKEND_ERR_TS: &str = include_str!("../../../src/lib/backendError.ts");
+        static TRAINING_TS: &str = include_str!("../../../src/store/training.ts");
+        static TRAINING_PAGE_TSX: &str =
+            include_str!("../../../src/components/training/TrainingPage.tsx");
+
+        for code in [warn_code::HOST_MEMORY, warn_code::NO_PROGRESS] {
+            assert!(
+                BACKEND_ERR_TS.contains(&format!("{code}: {{ key: \"backend.{code}\" }}")),
+                "backendError.ts has no mapping for {code}"
+            );
+            for (lang, raw) in [
+                ("zh", include_str!("../../../src/i18n/zh.json")),
+                ("en", include_str!("../../../src/i18n/en.json")),
+                ("ja", include_str!("../../../src/i18n/ja.json")),
+            ] {
+                let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+                let msg = v
+                    .pointer(&format!("/backend/{code}"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or_else(|| panic!("{lang}.json is missing backend.{code}"));
+                assert!(
+                    msg.chars().count() >= 30,
+                    "backend.{code} in {lang}.json is too short to be the real message: {msg:?}"
+                );
+            }
+        }
+        // The frontend must actually carry the field, or the banner renders nothing.
+        assert!(
+            TRAINING_TS.contains("warnings?: string[]"),
+            "src/store/training.ts lost TrainingSnapshot.warnings — the UI banner would be dead"
+        );
+
+        let mut snap = TrainingSnapshot::default();
+        assert!(push_warning_code(&mut snap, warn_code::HOST_MEMORY), "first raise must take");
+        assert!(!push_warning_code(&mut snap, warn_code::HOST_MEMORY), "second must be a no-op");
+        assert!(push_warning_code(&mut snap, warn_code::NO_PROGRESS), "a DIFFERENT code must take");
+        assert!(!push_warning_code(&mut snap, warn_code::NO_PROGRESS));
+        assert_eq!(snap.warnings, vec![warn_code::HOST_MEMORY, warn_code::NO_PROGRESS]);
+
+        // A healthy run must stay byte-identical on the wire (skip_serializing_if).
+        let healthy = serde_json::to_value(TrainingSnapshot::default()).unwrap();
+        assert!(
+            healthy.get("warnings").is_none(),
+            "an empty warnings list must not appear on the wire at all"
+        );
+        assert!(serde_json::to_value(&snap).unwrap().get("warnings").is_some());
+
+        // ★S115: a force-stop must keep the evidence — see `mark_force_stopped`. The bug it
+        // fixes is an ABSENCE, so pin the presence: the tail lands in the snapshot AND the
+        // warnings that made this stop worth explaining are still there afterwards.
+        let mut stopped = TrainingSnapshot::default();
+        assert!(push_warning_code(&mut stopped, warn_code::HOST_MEMORY));
+        mark_force_stopped(&mut stopped, vec!["RuntimeError: boom".into(), "  at foo".into()]);
+        assert_eq!(stopped.state, "stopped");
+        assert_eq!(stopped.stderr_tail.len(), 2, "the tail must survive a force-stop");
+        assert_eq!(
+            stopped.warnings,
+            vec![warn_code::HOST_MEMORY],
+            "clearing warnings here would silently re-hide the hang this exists for"
+        );
+        // …and the UI must actually render that combination, or the data is dead weight.
+        assert!(
+            TRAINING_PAGE_TSX.contains("training.stoppedWithWarnings"),
+            "TrainingPage.tsx no longer explains a force-stop that followed a warning"
+        );
+
+        // The threshold has to clear the known-legitimate stall (gfx1103 MIOpen
+        // compiles its first conv for 6-8 minutes with no output whatsoever).
+        assert!(
+            STALL_WARN_SECS >= 10 * 60,
+            "STALL_WARN_SECS={STALL_WARN_SECS} would fire during a normal AMD iGPU first-conv \
+             compile and train users to ignore the warning"
+        );
+    }
+
+    fn tmp_ws(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("utai_ws_test_{}_{}", tag, uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The naming rule has FOUR readers (plan / import / match / annotation). This closes the
+    /// loop end to end without a training process: plan a selection, write it exactly where
+    /// `run_worker` writes it, annotate it exactly as `run_worker` annotates it, and require
+    /// that the dataset view then names every single file.
+    ///
+    /// A drift between any two of those readers is invisible at compile time and shows up as
+    /// either「导入完还说数据变了」(a silent full re-import) or a file list of bare `000.wav`.
+    #[test]
+    fn planned_names_imported_names_and_annotated_names_are_one_rule() {
+        let src = tmp_ws("rel_src");
+        let data = tmp_ws("rel_data");
+        let id = "proj_rel";
+        let b = src_file(&src, "b.WAV", 10);
+        let a = src_file(&src, "a.flac", 20);
+        assert_eq!(dataset_rel(None, 0, &a), "000.flac");
+        assert_eq!(dataset_rel(None, 7, "x/y.MP3"), "007.mp3");
+        assert_eq!(dataset_rel(Some("spk_1"), 2, "no_extension"), "spk_1/002.wav");
+
+        let req = req_from(serde_json::json!({
+            "model_name": "t", "backend": "sovits", "version": "4.1", "sample_rate": "44k",
+            "dataset_files": [],
+            "speakers": [
+                {"name": "歌姫", "files": [b.clone()]},
+                {"name": "second", "files": [a.clone(), b.clone()]},
+            ],
+            "total_epoch": 1, "batch_size": 1,
+        }));
+        let ds = tproject::dataset_dir(&data, id);
+        let _plan = dataset_plan(&req, &assign_speaker_slugs(&req.speakers));
+        let assigned = assign_speaker_slugs(&req.speakers);
+
+        // ---- import, byte for byte as run_worker does ----
+        let mut annotated: Vec<dsmanifest::DsFile> = Vec::new();
+        for (gi, (_n, slug)) in assigned.iter().enumerate() {
+            std::fs::create_dir_all(ds.join(slug)).unwrap();
+            let mut files = req.speakers[gi].files.clone();
+            files.sort();
+            for (i, f) in files.iter().enumerate() {
+                let rel = dataset_rel(Some(slug), i, f);
+                let dst = ds.join(&rel);
+                std::fs::copy(f, &dst).unwrap();
+                annotated.push(dsmanifest::DsFile {
+                    rel,
+                    name: Path::new(f).file_name().unwrap().to_string_lossy().into_owned(),
+                    bytes: std::fs::metadata(&dst).map(|m| m.len()).unwrap_or(0),
+                    duration_ms: None,
+                });
+            }
+        }
+        // what was written IS what was planned — the reuse path depends on this exact equality
+        assert!(
+            dataset_matches(&ds, &dataset_plan(&req, &assign_speaker_slugs(&req.speakers))),
+            "the import must land on the names the plan predicted"
+        );
+
+        dsmanifest::record_import(
+            &data,
+            id,
+            assigned
+                .iter()
+                .map(|(n, s)| dsmanifest::DsSpeaker { slug: s.clone(), name: n.clone() })
+                .collect(),
+            annotated,
+        );
+
+        // ---- and the view names every file, in emb_g order ----
+        let frozen: Vec<Vec<dsmanifest::DsSpeaker>> = Vec::new();
+        let facts = dsmanifest::read_facts(&data, id, &frozen);
+        assert_eq!(facts.files, 3);
+        assert!(
+            facts.entries.iter().all(|e| !e.name.is_empty()),
+            "every imported file must carry its original name: {:?}",
+            facts.entries
+        );
+        assert!(facts.order_known);
+        assert_eq!(
+            facts.groups.iter().map(|g| g.speaker.name.as_str()).collect::<Vec<_>>(),
+            vec!["歌姫", "second"],
+            "emb_g order is the REQUEST order, not the alphabetical slug order"
+        );
+        assert_eq!(facts.groups[0].files, 1);
+        assert_eq!(facts.groups[1].files, 2);
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// ★ The slug debt, closed: a RESUME must reuse the slugs the slot froze, never re-derive
+    /// them from the names.
+    ///
+    /// `slugify` hash-suffixes with `DefaultHasher`, which std does not promise to keep stable
+    /// across Rust releases — and that slug is `dataset/<slug>/`, `dataset_44k/<slug>/` and the
+    /// `config.spk` key. Re-deriving on every start means one toolchain bump renames every
+    /// co-trained speaker's data directory out from under a half-trained model. The test proves
+    /// reuse by freezing slugs that `slugify` would NEVER produce.
+    #[test]
+    fn a_resume_reuses_the_frozen_speaker_slugs_instead_of_re_deriving_them() {
+        let data = tmp_ws("effslug");
+        let id = "proj_s";
+        let ws = tproject::family_dir(&data, id, "rvc");
+        std::fs::create_dir_all(&ws).unwrap();
+        let req = |fresh: bool| {
+            req_from(serde_json::json!({
+                "model_name": "t", "backend": "rvc", "version": "v2", "sample_rate": "40k",
+                "dataset_files": [],
+                "speakers": [{"name": "sayo", "files": []}, {"name": "teto", "files": []}],
+                "fresh": fresh, "total_epoch": 1, "batch_size": 1,
+            }))
+        };
+
+        // no manifest yet ⇒ derive
+        let ws = trun::RunDir::for_test(ws);
+        let fresh_slugs = effective_speaker_slugs(&ws, &req(false)).unwrap();
+        assert_eq!(fresh_slugs, assign_speaker_slugs(&req(false).speakers));
+
+        // slugs a toolchain change (or an older build) could have produced — nothing `slugify`
+        // would output for these names today
+        std::fs::write(
+            ws.join("run_manifest.json"),
+            serde_json::to_string(&serde_json::json!({
+                "backend": "rvc",
+                "n_speakers": 2,
+                "speakers": ["sayo_deadbeef", "teto_cafebabe"],
+                "speaker_names": ["sayo", "teto"],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let resumed = effective_speaker_slugs(&ws, &req(false)).unwrap();
+        assert_eq!(
+            resumed,
+            vec![
+                ("sayo".to_string(), "sayo_deadbeef".to_string()),
+                ("teto".to_string(), "teto_cafebabe".to_string()),
+            ],
+            "a resume must keep training into the directories that already exist"
+        );
+        assert_ne!(resumed, fresh_slugs, "…which are NOT what slugify derives today");
+
+        // 重训 wipes the slot, so it is free to mint new ones
+        assert_eq!(
+            effective_speaker_slugs(&ws, &req(true)).unwrap(),
+            fresh_slugs
+        );
+
+        // a genuine structure change (count differs) falls through to freshly derived slugs —
+        // the resume guard is what refuses it, with a specific CODE
+        let three = req_from(serde_json::json!({
+            "model_name": "t", "backend": "rvc", "version": "v2", "sample_rate": "40k",
+            "dataset_files": [],
+            "speakers": [{"name": "a", "files": []}, {"name": "b", "files": []}, {"name": "c", "files": []}],
+            "total_epoch": 1, "batch_size": 1,
+        }));
+        assert_eq!(
+            effective_speaker_slugs(&ws, &three).unwrap(),
+            assign_speaker_slugs(&three.speakers)
+        );
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// ⛔★★S133 §F2⒝ ④e —— 「这个 run 没冻歌手」与「我读不动它的载体」必须是两个答案。
+    ///
+    /// 空是这条链上的**宽容**答案,所以把读不动折成空 = 恰好在文件系统已经出问题的时候
+    /// 把 `DATASET_SPEAKERS_FROZEN` 那道拒绝拿掉:数据页放行 ⇒ `delete_files` 连
+    /// `drop_empty_speaker_dirs` 一起走 ⇒ 歌手目录没了 ⇒ 那套 `G_*.pth` 永久
+    /// `RESUME_SPEAKER_*_MISMATCH`,全程零报错。
+    ///
+    /// ⚠ 每一条拒绝都配了**阴性对照**:载体真的不在、以及内容真的是空的,都必须仍然答「空」——
+    /// 否则「一律 Err」这种实现也会让上面那几条变绿,而它会把单歌手 run 全部判成冻结。
+    #[test]
+    fn an_unreadable_freeze_carrier_is_not_the_same_answer_as_an_unfrozen_run() {
+        let data = tmp_ws("frozenio");
+        let id = "proj_fz";
+        let slot = tproject::family_dir(&data, id, "rvc");
+        let run = trun::runs_root(&slot).join("r0123456789ab");
+        std::fs::create_dir_all(&run).unwrap();
+        let rd = trun::RunDir::for_test(run.clone());
+
+        // ── 阴性对照 1:两个载体都不在 = 一个单歌手 run。空,而且不是错误。
+        assert!(frozen_speakers_of_run(&rd).unwrap().is_empty());
+        assert!(frozen_speakers(&data, id, "rvc").unwrap().is_empty());
+
+        // ── 正例:manifest 冻了两位歌手
+        std::fs::write(
+            run.join("run_manifest.json"),
+            serde_json::json!({ "speakers": ["a_1", "b_2"], "speaker_names": ["A", "B"] })
+                .to_string(),
+        )
+        .unwrap();
+        assert_eq!(frozen_speakers_of_run(&rd).unwrap().len(), 2);
+        assert_eq!(frozen_speakers(&data, id, "rvc").unwrap().len(), 2);
+
+        // ── 拒绝 1:manifest 读得到但**不是 JSON**(半写 / 被截断)
+        std::fs::write(run.join("run_manifest.json"), b"{ not json").unwrap();
+        for err in [
+            frozen_speakers_of_run(&rd).unwrap_err(),
+            // ⭐ 槽级那一条必须**同样**红:它是那道拒绝真正挂着的地方,而它此前会把这个 run
+            //    整个跳过 ⇒ 它冻的歌手对整个项目隐形。
+            frozen_speakers(&data, id, "rvc").unwrap_err(),
+        ] {
+            assert!(err.to_string().contains("FROZEN_SPEAKERS_UNREADABLE"), "{err}");
+        }
+
+        // ── 阴性对照 2:manifest 是合法 JSON 但没有 speakers 键 = 单歌手,仍然是「空」
+        std::fs::write(run.join("run_manifest.json"), serde_json::json!({ "backend": "rvc" }).to_string())
+            .unwrap();
+        assert!(frozen_speakers_of_run(&rd).unwrap().is_empty());
+
+        // ── 拒绝 2:第二个载体 `run.json` 坏掉时同样要红(它是老工作区唯一带名字的地方)
+        std::fs::write(run.join("run.json"), b"\x00\x01 not json").unwrap();
+        assert!(frozen_speakers_of_run(&rd)
+            .unwrap_err()
+            .to_string()
+            .contains("FROZEN_SPEAKERS_UNREADABLE"));
+
+        // ── 拒绝 3:**io 层**(不是解析层)读不动。真实成因是 ACL / 杀软 / 网盘占用,测试里造不
+        //    出来;拿目录冒充文件是本仓已有的手法,它给的是一个**非 NotFound** 的 io 错误 ——
+        //    与那些成因走同一条臂。少了这一条,「解析错拒绝、io 错照旧吞掉」的实现会全绿。
+        std::fs::remove_file(run.join("run.json")).unwrap();
+        std::fs::create_dir(run.join("run.json")).unwrap();
+        assert!(frozen_speakers_of_run(&rd)
+            .unwrap_err()
+            .to_string()
+            .contains("FROZEN_SPEAKERS_UNREADABLE"));
+
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// ⛔⛔S141(实机第一次开窗口买回来的)—— **一次 start 不许改掉一个已经有名字的 run 的名字。**
+    ///
+    /// 复现过的那一条链:用户点「再训一个」→ 给新 run 起名 `run2-rvc` → 下一屏那个对话框
+    /// (**它才是决定 fresh 的地方**)改主意选了「从最佳存档继续」⇒ `fresh=false` ⇒ 不铸新 run
+    /// ⇒ 而 `req.model_name` 仍然被无条件写进了**旧 run** 的 `run.json`。
+    /// 结果:卡片显示 `run2-rvc`,`model_slug` 与 `weights/<slug>*` 却全是第一个 run 的
+    /// `test-rvc_ea3c92d9`。**屏幕与产物指着两个不同的 run,而没有任何东西说过一句话。**
+    ///
+    /// ⚠ 这一格分得开三种输入,而它们的正确答案不同 —— 少任何一条,`name_to_persist` 都可以被
+    /// 写成一个更简单、也更错的东西:
+    #[test]
+    fn a_start_never_renames_a_run_that_already_has_one() {
+        // ⑴ 已经有名字 ⇒ **保留**。这是实机撞到的那一格,也是唯一会毁数据的那一格。
+        assert_eq!(
+            name_to_persist(Some("test-rvc"), "run2-rvc"),
+            "test-rvc",
+            "一次 start 把已有 run 改了名 —— 那是 `rename_training_run` 的活,它有三道闸,这里没有"
+        );
+        // ⑵ 还没有名字 ⇒ 这时候写下去正是它该被命名的时刻(首次训练,或刚铸出的新 run:
+        //    那是一个全新目录,`run.json` 还不存在)。写反成「一律保留」会让新 run 永远无名。
+        assert_eq!(name_to_persist(None, "run2-rvc"), "run2-rvc");
+        // ⑶ 空 / 全空白**不算**有名字 —— 否则一个写坏成 `""` 的 `run.json` 会把那个 run
+        //    永久锁在无名状态,而它连改名入口都进不去(前端按名字判「起过名没有」)。
+        assert_eq!(name_to_persist(Some(""), "x"), "x");
+        assert_eq!(name_to_persist(Some("   "), "x"), "x");
+        // ⑷ 保留的是**原样**,连 trim 都不做:规则是「不改」,不是「顺手规范化一下」——
+        //    后者仍然是一次没人同意过的改名,而且它会让产物名与显示名开始各走各的。
+        assert_eq!(name_to_persist(Some("  歌姫  "), "x"), "  歌姫  ");
+    }
+
+    /// ⛔★★S141 §E2E-M23 —— **铸一个新 run 不许抹掉旧 run 的任何东西。**
+    ///
+    /// ④e 之前,`try_start` 的重训分支是一句 `remove_dir_all_robust(&workspace)` —— **整个槽**,
+    /// 存档、池、试听缓存一起没。拍板换成「铸新 run + 旧 run 可管理/删除」之后那一行删掉了,
+    /// 而**没有任何东西守着它不回来**:`try_start` 吃 `&self` 与一大堆状态,仓内驱不动它,
+    /// 所以旧 run 的 `audition/`(里面是转换好的 .onnx 和 `model.json` 里那份**没人会重测**的
+    /// 实测音域)今天只有源码在守。
+    ///
+    /// 这道闸钉两件事,而第二件是那句代码注释自己点名的:
+    /// ⑴ 那句整槽 `remove_dir_all_robust(&workspace)` 不许出现在 `try_start` 里;
+    /// ⑵ 「铸新 run」这个事实必须仍然由 `mints_fresh_run` 表达,而**不是**直接读 `req.fresh` ——
+    ///    `diff_partial_wipe` 那条臂正是带着 `fresh == true` 进来的却**不**铸新 run,
+    ///    两者混为一谈就是「再训一个 = 续训并覆盖旧 run」那条静默失败。
+    ///
+    /// ⚠ 诚实边界:这是**源码**闸。它证明那一行不在代码里,不证明别的路径不会删
+    /// (`delete_run` 会删,那是用户点的)。行为那一半要等 `try_start` 能被驱动,
+    /// 或者一条真工作区的腿。
+    ///
+    /// ⛔ 切生产区用的是本模块**已有的** `production_part`,不是自己再写一遍 `find("#[cfg…")`。
+    /// 第一版就是自己写的,而那两个字面串让这份文件的 cfg-test 计数从 1 变成 3 ⇒ 当场打红
+    /// **三条既有的源序棘轮**(它们的切割点被推到我的字符串上)。`production_part` 用
+    /// `concat!` 拼这个标记,正是为了不数到自己 —— 那条教训 S129 在 `trun.rs` 上付过一次账。
+    #[test]
+    fn minting_a_new_run_never_wipes_the_slot_the_old_runs_live_in() {
+        let code = production_part(include_str!("mod.rs"));
+        let fns = crate::wiring_gate::split_by_fn(&code);
+        assert!(
+            fns.len() >= 40,
+            "split_by_fn parsed only {} chunks out of training/mod.rs — the checks below would \
+             pass by not looking",
+            fns.len()
+        );
+        let (_, body) = fns
+            .iter()
+            .find(|(n, _)| n == "try_start")
+            .expect("`try_start` is gone from training/mod.rs — if the start path was renamed, \
+                     re-check that it still does not wipe the slot, then update this gate");
+
+        assert!(
+            !body.contains("remove_dir_all_robust(&workspace)"),
+            "`try_start` wipes the WHOLE SLOT again. That line is what ④e replaced with \
+             「铸新 run + 旧 run 可管理/删除」: it takes the other runs' weights, their audition \
+             caches (converted .onnx plus the measured vocal range nothing will re-measure) and \
+             the shared preprocessing pools with it.\n\
+             ⚠ Do NOT satisfy this by commenting it out — comments are stripped before this check."
+        );
+        // ⛔ 钉的是**那个调用点收到的实参**,不是「`mints_fresh_run` 这个词出现过」——
+        // 后者是 R3 那条已知的弱点(钉文本不钉值):实测把 `migrate_one_slot` 的守卫塌回
+        // `req.fresh` 之后,标识符仍然在别处出现,那条弱断言**照样绿**(探针 V5 第一版)。
+        // ⛔ S141 实机第一次开窗口就撞到的那一条:名字也是「旧 run 的东西」。
+        // ⚠ 它住在 `run_worker`(写 `run.json` 的那个),不是 `try_start` —— 第一版打在
+        // `try_start` 上,当场红。锚点找错会让一条闸**指着一个空的地方说话**。
+        let (_, worker) = fns
+            .iter()
+            .find(|(n, _)| n == "run_worker")
+            .expect("`run_worker` 不见了 —— 写 `run.json` 的那个函数被改名了,重新确认这条性质再改锚点");
+        assert!(
+            worker.contains("name_to_persist("),
+            "`run.json` 的 `model_name` 又直接取 `req.model_name` 了。一次 start 不许改掉一个\
+             **已经有名字**的 run 的名字 —— 改名有它自己的命令和它自己的三道闸(运行中 / 空名 / \
+             双开)。实机复现过一次:走「再训一个」起了新名字、下一屏改主意选了续训 ⇒ 没铸新 run,\
+             而新名字盖到了旧 run 头上,`model_slug` 与 `weights/<slug>*` 仍是旧的 ⇒ \
+             屏幕与产物指着两个不同的 run,全程无声。"
+        );
+        assert!(
+            body.contains("run_dir_for_start(&workspace, &family, req_run, mints_fresh_run)"),
+            "`run_dir_for_start` 不再收 `mints_fresh_run`。**这个实参决定这次 start 往哪个目录写**:\
+             `diff_partial_wipe` 那条臂正是带着 `fresh == true` 进来却**不**铸新 run 的,所以塌回裸 \
+             `req.fresh` 就是「再训一个 = 续训并覆盖旧 run」那条静默失败;而反过来传 false,\
+             「再训一个」会写进旧 run。\n\
+             ⚠ 换了形参名/换行格式也会红 —— 那时请**重新确认这条性质仍然成立**再改锚点,\
+             别只把这行字符串改到能过。"
+        );
+    }
+
+    /// ⛔★★S133 §F2⒝ ④e —— 「重训(仅扩散)」之后,试听不许再放上一次那个模型。
+    ///
+    /// S132 的 flip 把 `start_training` 的缓存清理收窄成 `if !request_was_fresh`,而
+    /// `diff_partial_wipe` 那条臂**正是带着 `fresh == true` 进来的**且不铸新 run ⇒ 那条臂从
+    /// 「每次都清」变成「永不清」。扩散产物是**固定名**(`model_best.pt`),缓存键就是 stem,
+    /// 命中只看 `model.json` 在不在 ⇒ 重训完点试听,放的是上一次的转换图与音频。
+    ///
+    /// ⚠ 一半的判据在「删掉了什么」,另一半在「**没有**删掉什么」:主模型那几行的转换 .onnx 与
+    /// **实测音域**也住在同一个 `audition/` 下,而这一次主模型根本没变、音域没有任何东西会重测。
+    /// 只断言前一半的话,「整棵删掉 audition/」这种实现也会绿。
+    #[test]
+    fn a_diffusion_retrain_drops_exactly_the_stale_audition_entries() {
+        let data = tmp_ws("evictaud");
+        let run = trun::RunDir::for_test(data.join("run"));
+        let diff = run.join("diffusion");
+        let cache = run.join("audition");
+        std::fs::create_dir_all(&diff).unwrap();
+        // 扩散产物:两个 ckpt + 一个快照子目录(它不是任何人能试听的候选)
+        for f in ["model_best.pt", "model_2000.pt"] {
+            std::fs::write(diff.join(f), b"w").unwrap();
+        }
+        std::fs::create_dir_all(diff.join("resume_best")).unwrap();
+        std::fs::write(diff.join("resume_best").join("state.json"), b"{}").unwrap();
+        // 缓存:两条扩散的 + 一条**主模型**的(带实测音域)
+        for stem in ["model_best", "model_2000", "myvoice_deadbeef_e1_s100"] {
+            std::fs::create_dir_all(cache.join(stem)).unwrap();
+            std::fs::write(cache.join(stem).join("model.json"), b"{\"low\":48,\"high\":72}").unwrap();
+        }
+        // 一条扩散侧没有对应缓存的 ckpt —— 不许计进返回值
+        std::fs::write(diff.join("model_4000.pt"), b"w").unwrap();
+
+        assert_eq!(evict_audition_of(&run, &diff), 2, "只有真的存在的那两条算数");
+        assert!(!cache.join("model_best").exists(), "固定名的那条正是必须消失的");
+        assert!(!cache.join("model_2000").exists());
+        assert!(
+            cache.join("resume_best").symlink_metadata().is_err(),
+            "快照子目录本来就不该有缓存,更不该被当成 key 造出来"
+        );
+        // ★ 另一半:主模型那条**必须原样在**,内容一字节不动
+        assert_eq!(
+            std::fs::read_to_string(cache.join("myvoice_deadbeef_e1_s100").join("model.json")).unwrap(),
+            "{\"low\":48,\"high\":72}",
+            "主模型这一次根本没变,而实测音域没有任何东西会重测"
+        );
+
+        // 阴性对照:没有 audition/ 的 run ⇒ 0,不 panic
+        let bare = trun::RunDir::for_test(data.join("bare"));
+        std::fs::create_dir_all(bare.join("diffusion")).unwrap();
+        assert_eq!(evict_audition_of(&bare, &bare.join("diffusion")), 0);
+
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// ★§F2⒝ 批 2 ④b —— **训练名从此只是标签:改变它永远不搬动任何字节。**
+    ///
+    /// ⚠ The test above looks like it already covers this and does NOT: `effective_speaker_slugs`
+    /// returns an empty vec for ≤1 speaker, so it drives a TWO-speaker request and `model_slug`
+    /// is not in its call graph at all. The single-speaker slug — which is the one that names
+    /// `<pool>/dataset_44k/<slug>/`, the directory two runs of one slot SHARE a pool for — came
+    /// from a completely different line (`slugify(&req.model_name)` in `try_start`).
+    ///
+    /// ⛔ Why the frozen value is a string `slugify` can never emit: every slug it produces ends
+    /// in `_` + 8 lowercase hex, so asserting against a REALISTIC frozen value (one that equals
+    /// `slugify(name)`) would return the same answer whether the adoption arm exists or not —
+    /// the decorative shape this project keeps re-inventing.
+    #[test]
+    fn the_artifact_slug_is_frozen_in_the_run_not_re_derived_from_the_display_name() {
+        let data = tmp_ws("artslug");
+        let ws = tproject::family_dir(&data, "proj_a", "rvc");
+        std::fs::create_dir_all(&ws).unwrap();
+        let run = trun::RunDir::for_test(ws);
+        let req = |name: &str, fresh: bool| {
+            req_from(serde_json::json!({
+                "model_name": name, "backend": "rvc", "version": "v2", "sample_rate": "40k",
+                "dataset_files": [], "fresh": fresh, "total_epoch": 1, "batch_size": 1,
+            }))
+        };
+        let write_run_json = |slug: &str| {
+            std::fs::write(
+                run.join("run.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "model_name": "初号机", "model_slug": slug,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        };
+
+        // ⑴ a run that never started carries no artifacts to keep an identity for ⇒ mint
+        assert_eq!(
+            effective_artifact_slug(&run, &req("初号机", false), false),
+            slugify("初号机"),
+            "with no run.json the slug is minted from the name, exactly as before ④b"
+        );
+
+        // ⑵ a run whose own run.json records a slug must ADOPT it
+        write_run_json("LEGACY-STEM");
+        let adopted = effective_artifact_slug(&run, &req("初号机", false), false);
+        assert_eq!(adopted, "LEGACY-STEM");
+        assert_ne!(
+            adopted,
+            slugify("初号机"),
+            "…and that is NOT what slugify derives today — which is the whole point"
+        );
+
+        // ⑶ ★ THE property of this batch: a RENAME must not move the artifact identity. Before
+        // ④b this returned `slugify("改了个名字")`, i.e. a different `weights/` prefix, a
+        // different `audition/` stem and a SECOND `dataset_44k/<slug>/` tree inside the pool the
+        // runs share — none of which anything ever reclaims.
+        assert_eq!(
+            effective_artifact_slug(&run, &req("改了个名字", false), false),
+            "LEGACY-STEM",
+            "renaming a run must not re-point its artifacts"
+        );
+
+        // ⑷ a full 重训 erases the slot, so there is nothing left to keep the old identity FOR, and
+        // picking a different name there is the button's purpose ⇒ mint from the NEW name.
+        assert_eq!(
+            effective_artifact_slug(&run, &req("改了个名字", true), true),
+            slugify("改了个名字")
+        );
+        assert_ne!(slugify("改了个名字"), slugify("初号机"), "…two distinct names");
+
+        // ⑷′ ★★ THE PAIR that ⑷ alone cannot be: `fresh` is ALSO true on the one branch that
+        // destroys nothing — 「重训(仅扩散)」 with a live main model deletes only `<run>/diffusion/`.
+        // The first form of this function read `req.fresh` directly and therefore minted here too,
+        // which after the ④b rename button meant: a second `<pool>/dataset_44k/<slug>/` tree in the
+        // SAME pool (they even share one flat `aug_meta` and delete each other's entries), plus the
+        // MAIN model's identity silently re-pointed by the `run.json` rewrite.
+        //
+        // ⚠ The two arms differ ONLY in the third argument and BOTH must be asserted: either one
+        // alone is satisfied by a constant, and a `req`-shaped fixture cannot express the
+        // difference at all (`diff_partial_wipe` demands `backend == "sovits_diff"`, so the rvc
+        // fixture above can never reach it — which is exactly why ⑷ looked complete and was not).
+        assert_eq!(
+            effective_artifact_slug(&run, &req("改了个名字", true), false),
+            "LEGACY-STEM",
+            "a start that destroys nothing must not re-mint the identity, even with fresh set"
+        );
+
+        // ⑸ an EMPTY key is not an identity. A run.json truncated mid-write (or written by a
+        // build that did not have the field) must fall through to minting, never adopt `""` —
+        // `""` would make `hps.name` empty and every `weights/` file start with `_e1_s3`.
+        write_run_json("");
+        assert_eq!(
+            effective_artifact_slug(&run, &req("初号机", false), false),
+            slugify("初号机")
+        );
+
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// The call site, because the unit test above cannot reach it: `try_start` has no unit-test
+    /// driver (that is why `RunDir` exists as a type), so「函数是对的」and「start 调的是这个函数」
+    /// are two separate claims and only one of them is provable by driving the function.
+    ///
+    /// It also pins the ORDER, and the order is load-bearing in TWO directions: the adoption reads
+    /// the PRE-wipe `run.json`, so it must sit before the wipe — and it must sit AFTER the
+    /// `diff_partial_wipe` binding, because that flag is the difference between「这次会毁掉本 run 的
+    /// 产物」and「这次只删 diffusion/」, and the first form of this call read `req.fresh` alone from
+    /// 112 lines above the binding, where the answer was structurally unreachable.
+    #[test]
+    fn start_takes_its_artifact_identity_from_the_run_not_from_the_request_name() {
+        let code = production_code();
+        let at = |needle: &str| at_in(&code, needle);
+        // ⛔ every needle is assembled from pieces: written as one literal, THIS test's own source
+        // satisfies it (`code` is mod.rs, and mod.rs contains this file's test module). The
+        // `contains` assertion below failed for exactly that reason on its first run.
+        let old_form = concat!("let slug = slug", "ify(&req.model_name)");
+        assert!(
+            !code.contains(old_form),
+            "④b flipped this: the artifact slug is frozen per run, not re-derived from the \
+             display name on every start. Reviving this line silently re-points every renamed \
+             run's weights/, audition/ and pool slice directory."
+        );
+        // ⛔ and the ④b-era form, which read `req.fresh` alone: it minted on the one branch that
+        // destroys nothing (`diff_partial_wipe`), so a renamed run's 「重训(仅扩散)」 grew a second
+        // slice tree in the shared pool and re-pointed the MAIN model's identity.
+        assert!(
+            !code.contains(concat!("effective_artifact_slug(&run, &req", ")")),
+            "the artifact slug is being decided without asking whether this start actually \
+             destroys this run's products — `req.fresh` alone is true on the diffusion partial \
+             wipe, which deletes only <run>/diffusion/"
+        );
+        // ★§F2⒝ ④e 笔 1 re-anchored this: the third argument is now a NAMED binding, because
+        // python needs the same answer (`trun::FRESH_RUN_KEY`) and writing the expression twice is
+        // how the two would drift. Re-anchoring a ratchet must preserve the PROPERTY it holds, not
+        // just make it green, so the binding's own right-hand side is pinned here too — plus the
+        // negative for the one-word edit that would break it.
+        assert!(
+            !code.contains(concat!("let mints_fresh_run = req.fresh;", "")),
+            "the fresh-run carrier is being computed from `req.fresh` alone. That is TRUE on \
+             「重训(仅扩散)」, whose run keeps its main G_*/D_* — so python's guard would refuse a \
+             perfectly good partial retrain, and refuse it invisibly (the diffusion chain has no \
+             `plan_load` call and no criterion drives that branch today)."
+        );
+        let resolve_run = at(concat!("let run = trun::resolve_run_dir(&workspace, ", "req_run)?;"));
+        let partial = at(concat!("let diff_partial_wipe =", "\n"));
+        let mints = at(concat!(
+            "let mints_fresh_run = req.fresh && ",
+            "!diff_partial_wipe;"
+        ));
+        let slug = at(concat!(
+            "let slug = effective_artifact_slug(&run, &req, ",
+            "mints_fresh_run);"
+        ));
+        // ★★§F2⒝ ④e RE-ANCHORED — the wipe this used to point at is gone; the mint took its place
+        // as「产物从这里开始换地方」. The property is unchanged: the slug must be ADOPTED from the
+        // run the request names, and that read has to happen before the start starts addressing a
+        // different directory.
+        let mint_site =
+            at("trun::run_dir_for_start(&workspace, &family, req_run, mints_fresh_run)?");
+        assert!(
+            partial < mints && mints < slug,
+            "the binding that answers「这次启动会不会毁掉本 run 的产物」 no longer sits between the \
+             flag it reads and the slug it feeds"
+        );
+        assert!(resolve_run < slug, "the slug is taken before its run is known");
+        assert!(
+            partial < slug,
+            "the slug is decided ABOVE the `diff_partial_wipe` binding, so it cannot know whether \
+             this start destroys anything — that is the exact shape of the ④b regression"
+        );
+        assert!(
+            slug < mint_site,
+            "the slug is adopted AFTER the mint, so it reads the `run.json` of a directory that was \
+             created EMPTY one line earlier — every 「再训一个」 would mint a fresh identity even \
+             for a run the user never renamed. (Before ④e the same assertion said 「after the \
+             wipe」, and the file it read had been deleted rather than not-yet-written.)"
+        );
+    }
+
+    /// ★ Why `run_worker` needs an `importing` flag separate from `dataset_unchanged`.
+    ///
+    /// A structure declaration (every group's files empty) plans NOTHING, and `dataset_matches`
+    /// answers false for an empty plan by design — "nothing" must never compare equal to a real
+    /// dataset. Keying the dataset swap on `dataset_unchanged` alone would therefore move the
+    /// whole dataset aside, copy nothing in, and commit: the data the run was about to train on,
+    /// deleted. This test states that shape so the flag cannot be "simplified" away.
+    #[test]
+    fn a_structure_declaration_plans_no_import_and_must_not_look_like_a_replacement() {
+        let proj = tmp_ws("decl");
+        let ds = proj.join("dataset");
+        std::fs::create_dir_all(ds.join("sayo_x")).unwrap();
+        std::fs::write(ds.join("sayo_x").join("000.wav"), b"x").unwrap();
+        let req = req_from(serde_json::json!({
+            "model_name": "t", "backend": "rvc", "version": "v2", "sample_rate": "40k",
+            "dataset_files": [],
+            "speakers": [{"name": "sayo", "files": []}, {"name": "teto", "files": []}],
+            "total_epoch": 1, "batch_size": 1,
+        }));
+        let plan = dataset_plan(&req, &assign_speaker_slugs(&req.speakers));
+        assert!(plan.is_empty(), "a declaration imports nothing");
+        assert!(
+            !dataset_matches(&ds, &plan),
+            "…and an empty plan never 'matches' — hence the separate importing flag"
+        );
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    /// ★★S132 §F2⒝ ④e —— 按需折叠**真的**把一个槽送到当前 layout,而不是「跑过了」。
+    ///
+    /// 源序棘轮(`trun::tests::the_boot_chain_folds_pools_before_runs`)钉的是**步骤与顺序**;
+    /// 它证明不了这条链跑完之后槽真的到了 layout 4 —— 而 ④e 的准入正是建立在那个**结果**上。
+    ///
+    /// ⚠ 夹具是 **layout 0 且已有产物**的槽,因为那不是边角:没有任何代码在**建槽**时写
+    /// `slot.json`(S130 M17/L7 实测),所以「同一次会话里新建的槽」整场都是 layout 0 ——
+    /// 而「建槽 → 训练 → 再训一个」正是 ④e 最常见的一条路。
+    #[test]
+    fn the_on_demand_fold_takes_one_slot_all_the_way_to_the_current_layout() {
+        let data = tmp_ws("s132_on_demand");
+        let id = "proj_ondemand";
+        // ⚠ sovits 而不是 rvc:rvc 的池身份要从 `0_gt_wavs` 的 **RIFF 头**读采样率,那要一份
+        //    真 wav。这条判据测的是**折叠链**,不是 wav 解析,所以用不需要它的那一家。
+        let slot = tproject::family_dir(&data, id, "sovits");
+        std::fs::create_dir_all(&slot).unwrap();
+        // 一个练过的老形状:预处理产物 + 权重都还在**槽根**上
+        std::fs::create_dir_all(slot.join("dataset_44k").join("someslug")).unwrap();
+        std::fs::write(slot.join("dataset_44k").join("someslug").join("0.wav"), b"x").unwrap();
+        std::fs::write(slot.join(tpool::FINGERPRINT), b"abc123").unwrap();
+        std::fs::write(slot.join("G_2333333.pth"), b"x").unwrap();
+        std::fs::write(
+            slot.join("run_manifest.json"),
+            br#"{"backend":"sovits","aug_copies":0,"n_speakers":1}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            tpool::read_slot_meta(&slot).map(|m| m.layout).unwrap_or(0),
+            0,
+            "夹具前提:这就是一个会话中途新建的槽的形状"
+        );
+
+        migrate_one_slot(&data, id, "sovits").expect("这个槽是可判定的,必须折得动");
+
+        assert_eq!(
+            tpool::read_slot_meta(&slot).map(|m| m.layout).unwrap_or(0),
+            tpool::SLOT_LAYOUT_POOL_ID,
+            "按需折叠必须把槽送到**当前** layout —— 停在 3 的槽正是 `slot_facts` 那两扇\
+             永久死胡同的入口,而 ④e 接下来就要在这个槽里铸第二个 run"
+        );
+        // …而且是真的折了,不是把 marker 一盖了事
+        assert!(!slot.join("G_2333333.pth").is_file(), "权重应该已经进 runs/<id>/");
+        assert!(!slot.join(tpool::FINGERPRINT).is_file(), "池产物应该已经进 pools/<id>/");
+        assert_eq!(trun::list_runs(&slot).unwrap().len(), 1, "折出来恰好一个 run");
+
+        // 幂等:再跑一次什么都不该变(准入会在每一次「再训一个」之前调它)
+        migrate_one_slot(&data, id, "sovits").expect("幂等");
+        assert_eq!(trun::list_runs(&slot).unwrap().len(), 1);
+
+        // ⛔ 不可判定 ⇒ **Err**,不是「Refused 但返回 Ok」。开机链把 Refused 当成一个真实的
+        // 答案(下次开机再看),而这里下一步就是铸第二个 run —— 那之后「下次开机」永远等不到。
+        // 摆成 layout 3 的形状,而池的指纹**读不动**(目录冒充文件)⇒ 3→4 只能 Refused
+        let slot2 = tproject::family_dir(&data, "proj_bad", "sovits");
+        let r2 = trun::runs_root(&slot2).join("r000000000000");
+        std::fs::create_dir_all(&r2).unwrap();
+        std::fs::write(
+            r2.join("run_manifest.json"),
+            br#"{"backend":"sovits","aug_copies":0,"n_speakers":1}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(tpool::pools_root(&slot2).join("p_x").join(tpool::FINGERPRINT))
+            .unwrap();
+        tpool::write_slot_meta(
+            &slot2,
+            &tpool::SlotMeta { layout: trun::SLOT_LAYOUT_RUNS, ..Default::default() },
+        )
+        .unwrap();
+        let e = migrate_one_slot(&data, "proj_bad", "sovits").unwrap_err().to_string();
+        assert!(
+            e.contains("SLOT_NOT_MIGRATABLE") || e.contains("POOL_"),
+            "一个判不了的槽必须响亮拒绝这次操作: {e}"
+        );
+    }
+
+    /// ★★S132 §F2⒝ ④e — what the SLOT-level readers answer when the runs cannot be enumerated.
+    ///
+    /// `trun::list_runs` used to swallow that into an empty list, and every reader below turns an
+    /// empty list into its PERMISSIVE answer. Each assertion here names the guard that would have
+    /// been removed, because 「it returns false」 is not the interesting part — 「the refusal in
+    /// front of a destructive action disappears」 is.
+    ///
+    /// ⚠ The pre-assertions are load-bearing: they prove the fixture is otherwise a slot that
+    /// HOLDS work, so a red below cannot be explained by「there was nothing there anyway」.
+    #[test]
+    fn slot_readers_refuse_rather_than_answer_permissively_when_the_runs_cannot_be_listed() {
+        let data = tmp_ws("s132_unlistable");
+        let id = "proj_unlistable";
+        let slot = tproject::family_dir(&data, id, "rvc");
+        std::fs::create_dir_all(trun::runs_root(&slot).join(trun::legacy_run_id("rvc"))).unwrap();
+        std::fs::write(
+            trun::runs_root(&slot).join(trun::legacy_run_id("rvc")).join("G_1.pth"),
+            b"x",
+        )
+        .unwrap();
+        // pre: with a readable container this slot holds work and freezes nothing
+        assert!(slot_holds_work(&slot), "fixture pre-condition: this slot DOES hold work");
+        assert!(frozen_speakers(&data, id, "rvc").unwrap().is_empty());
+
+        // now the container cannot be enumerated (a FILE where the directory should be — the
+        // portable stand-in for an ACL / open handle / 网盘 placeholder)
+        std::fs::remove_dir_all(trun::runs_root(&slot)).unwrap();
+        std::fs::write(trun::runs_root(&slot), b"not a directory").unwrap();
+
+        assert!(
+            slot_holds_work(&slot),
+            "an unreadable `runs/` must still answer 「holds work」 — `false` here is what removes \
+             TRAINING_WIPE_NOT_CONFIRMED and makes the sibling-slot PROJECT_DATASET_IN_USE \
+             pre-check fail open, both without changing anything on screen"
+        );
+        let e = frozen_speakers(&data, id, "rvc").unwrap_err().to_string();
+        assert!(
+            e.contains("RUNS_DIR_UNREADABLE"),
+            "EMPTY is the permissive answer for every consumer of this (it is what lets \
+             DATASET_SPEAKERS_FROZEN through), so it must not double as「我没看成」: {e}"
+        );
+    }
+
+    /// Both carriers of「第 i 号歌手是谁」, and the two semantics `slot_info` must keep.
+    ///
+    /// REGRESSION GUARD: `slot_info().speakers` used to fall back from the manifest to
+    /// `run.json` on its own. That logic now lives in `frozen_speakers` (shared with the
+    /// dataset view), and the one behaviour that must survive the move is the LAST case —
+    /// no name anywhere yields an EMPTY vec, not a vec of blanks. The resume dialog compares
+    /// that vec positionally against the form, so blanks would read as a speaker mismatch and
+    /// refuse a perfectly valid 续训.
+    #[test]
+    fn frozen_speakers_reads_both_carriers_and_stays_empty_when_no_name_survives() {
+        let data = tmp_ws("frozen");
+        let id = "proj_1";
+        let ws = tproject::family_dir(&data, id, "rvc");
+        std::fs::create_dir_all(&ws).unwrap();
+        let write = |name: &str, v: serde_json::Value| {
+            std::fs::write(ws.join(name), serde_json::to_string(&v).unwrap()).unwrap()
+        };
+
+        // 1. the durable pair
+        write(
+            "run_manifest.json",
+            serde_json::json!({
+                "backend": "rvc",
+                "n_speakers": 2,
+                "speakers": ["sayo_a", "teto_b"],
+                "speaker_names": ["sayo", "teto"],
+            }),
+        );
+        let f = frozen_speakers(&data, id, "rvc").unwrap();
+        assert_eq!(f.len(), 2);
+        assert_eq!((f[0].slug.as_str(), f[0].name.as_str()), ("sayo_a", "sayo"));
+        assert_eq!((f[1].slug.as_str(), f[1].name.as_str()), ("teto_b", "teto"));
+        assert_eq!(slot_info(&data, id, "rvc", None).unwrap().speakers, vec!["sayo", "teto"]);
+
+        // 2. pre-`speaker_names` workspace: names live only in run.json, matched BY SLUG —
+        //    and note run.json lists them in the OTHER order, which must not reorder anything
+        write(
+            "run_manifest.json",
+            serde_json::json!({
+                "backend": "rvc",
+                "n_speakers": 2,
+                "speakers": ["sayo_a", "teto_b"],
+            }),
+        );
+        write(
+            "run.json",
+            serde_json::json!({
+                "speakers": [
+                    {"slug": "teto_b", "name": "teto"},
+                    {"slug": "sayo_a", "name": "sayo"},
+                ]
+            }),
+        );
+        let f = frozen_speakers(&data, id, "rvc").unwrap();
+        assert_eq!(
+            f.iter().map(|s| s.slug.as_str()).collect::<Vec<_>>(),
+            vec!["sayo_a", "teto_b"],
+            "the MANIFEST owns the emb_g order; run.json only supplies names"
+        );
+        assert_eq!(f[0].name, "sayo");
+        assert_eq!(f[1].name, "teto");
+        assert_eq!(slot_info(&data, id, "rvc", None).unwrap().speakers, vec!["sayo", "teto"]);
+
+        // 3. a later sovits_diff run rewrote run.json without the key: order survives, names do
+        //    not — and `slot_info` must then report NOTHING rather than two blanks
+        write("run.json", serde_json::json!({"backend": "sovits_diff"}));
+        let f = frozen_speakers(&data, id, "rvc").unwrap();
+        assert_eq!(f.len(), 2, "the order is still recoverable");
+        assert!(f.iter().all(|s| s.name.is_empty()));
+        assert!(
+            slot_info(&data, id, "rvc", None).unwrap().speakers.is_empty(),
+            "all-blank must collapse to empty — a blank vec of the right length would read as \
+             a speaker mismatch in the resume dialog"
+        );
+
+        // 4. single-speaker: neither carrier has a speakers array
+        let ws2 = tproject::family_dir(&data, id, "sovits");
+        std::fs::create_dir_all(&ws2).unwrap();
+        std::fs::write(
+            ws2.join("run_manifest.json"),
+            serde_json::to_string(&serde_json::json!({"backend": "sovits", "version": "4.1"}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(frozen_speakers(&data, id, "sovits").unwrap().is_empty());
+        assert!(slot_info(&data, id, "sovits", None).unwrap().speakers.is_empty());
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// The wipe-consent guard's judgement, artifact class by artifact class. Each `true` case is
+    /// hours of work an unconfirmed `fresh` start would have deleted; the `false` case is the
+    /// leftover directory try_start itself creates, which must stay freely wipeable (else a
+    /// crashed first run would lock the user out of ever retrying that model name).
+    #[test]
+    fn slot_holds_work_covers_every_artifact_class() {
+        let empty = tmp_ws("empty");
+        assert!(!slot_holds_work(&empty), "empty leftover dir holds nothing");
+
+        let main = tmp_ws("main");
+        std::fs::write(main.join("G_2333333.pth"), b"x").unwrap();
+        assert!(slot_holds_work(&main), "rvc/sovits main checkpoint");
+
+        let voc = tmp_ws("voc");
+        std::fs::write(voc.join("model_ckpt_steps_4000.ckpt"), b"x").unwrap();
+        assert!(slot_holds_work(&voc), "vocoder lightning checkpoint");
+
+        let diff = tmp_ws("diff");
+        std::fs::create_dir_all(diff.join("diffusion")).unwrap();
+        std::fs::write(diff.join("diffusion").join("model_5000.pt"), b"x").unwrap();
+        assert!(slot_holds_work(&diff), "diffusion progress");
+
+        // model_0.pt = the seeded base only (step 0) — no user progress yet.
+        let base_only = tmp_ws("base");
+        std::fs::create_dir_all(base_only.join("diffusion")).unwrap();
+        std::fs::write(base_only.join("diffusion").join("model_0.pt"), b"x").unwrap();
+        assert!(!slot_holds_work(&base_only), "seeded diffusion base is not progress");
+
+        // preprocessing alone is HOURS of work — a slot with a fingerprint but no checkpoint
+        // yet is just「刚开始练」, and it is also what makes a sibling slot count as "using"
+        // the shared dataset.
+        let pre = tmp_ws("pre");
+        std::fs::write(pre.join("dataset.fingerprint"), b"abc").unwrap();
+        assert!(slot_holds_work(&pre), "preprocessing counts as work");
+        let _ = std::fs::remove_dir_all(pre);
+
+        // an imported dataset pool alone is worth protecting: re-importing costs minutes.
+        let pool = tmp_ws("pool");
+        std::fs::create_dir_all(pool.join("dataset")).unwrap();
+        std::fs::write(pool.join("dataset").join("000.wav"), b"x").unwrap();
+        std::fs::write(pool.join("dataset.fingerprint"), b"abc").unwrap();
+        assert!(slot_holds_work(&pool), "imported dataset pool");
+
+        for d in [empty, main, voc, diff, base_only, pool] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// Everything one training run leaves behind, written into `home`.
+    ///
+    /// `home` is a RUN directory — which under layout ≤ 2 IS the slot root and under layout 3 is
+    /// `<slot>/runs/<id>/`. That the same writer serves both is the point of the test below.
+    fn run_products(home: &Path, step: u64) {
+        std::fs::create_dir_all(home.join("weights")).unwrap();
+        std::fs::create_dir_all(home.join("resume_best")).unwrap();
+        std::fs::create_dir_all(home.join("diffusion")).unwrap();
+        std::fs::create_dir_all(home.join("audition").join("m_e14_s147")).unwrap();
+        let w = |rel: &str, body: &str| std::fs::write(home.join(rel), body).unwrap();
+        w(&format!("G_{step}.pth"), "g");
+        w(&format!("D_{step}.pth"), "d");
+        w("weights/m_e14_s147.pth", "w");
+        w("resume_best/G.pth", "g");
+        w("resume_best/D.pth", "d");
+        w(
+            "resume_best/state.json",
+            &serde_json::json!({"global_step": step, "files": ["G.pth", "D.pth"]}).to_string(),
+        );
+        w("diffusion/model_5000.pt", "m");
+        w("audition/m_e14_s147/model.json", "{}");
+        w("total_fea.npy", "f");
+        w(
+            "run_manifest.json",
+            &serde_json::json!({
+                "backend": "rvc", "version": "v2", "sample_rate": "40k",
+                "n_speakers": 2, "speakers": ["sayo_1", "teto_2"],
+                "speaker_names": ["sayo", "teto"], "aug_copies": 3,
+            })
+            .to_string(),
+        );
+        w("run.json", &serde_json::json!({"model_name": "歌姫"}).to_string());
+    }
+
+    /// ⛔ THE resume-lock test that did not exist: one built from a REAL DIRECTORY.
+    ///
+    /// Both existing suites hand-write their manifests and their `has_main` / `max_diffusion_step`
+    /// / `frozen_speakers` literals, so the four DISK READS that feed the guard were covered by
+    /// nothing at all. That is not a coverage number — it is the shape of a silent total failure:
+    /// `check_resume_locks` opens with `let old = st.manifest?`, so ONE read answering「什么都
+    /// 没有」 drops EVERY lock at once, and a 续训 with a mismatched version then streams 4.1
+    /// weights into a 4.0 graph and degrades to near-scratch while the UI says「继续训练」.
+    ///
+    /// ★ The slot root carries a DECOY manifest that would ALLOW the resume. So a read re-pointed
+    /// from the run to the slot — the exact mistake per-run invites — does not merely return less
+    /// information, it returns a PERMISSIVE answer, and this test is red for it.
+    #[test]
+    fn the_resume_guard_reads_this_runs_files_and_a_slot_shaped_read_is_permissive() {
+        let data = tmp_ws("lockdisk");
+        std::fs::create_dir_all(data.join("training")).unwrap();
+        let id = "plock_77778888";
+        tproject::write_meta(
+            &data,
+            &tproject::ProjectMeta { id: id.into(), name: "n".into(), ..Default::default() },
+        )
+        .unwrap();
+        let slot = tproject::family_dir(&data, id, "rvc");
+        std::fs::create_dir_all(&slot).unwrap();
+        std::fs::write(slot.join(tpool::SLOT_META), br#"{"layout":3}"#).unwrap();
+        let run = trun::runs_root(&slot).join("rd00dd00dd00d");
+        std::fs::create_dir_all(&run).unwrap();
+        run_products(&run, 700); // ← writes THIS run's manifest: v2 / 40k
+        // ★ the decoy: same shape, at the SLOT root, saying what the request wants to hear
+        std::fs::write(
+            slot.join("run_manifest.json"),
+            serde_json::json!({ "backend": "rvc", "version": "v1", "sample_rate": "48k" })
+                .to_string(),
+        )
+        .unwrap();
+
+        let req = |fresh: bool| {
+            req_from(serde_json::json!({
+                "model_name": "m", "backend": "rvc",
+                // both differ from what THIS run froze (v2 / 40k)
+                "version": "v1", "sample_rate": "48k",
+                "dataset_files": [], "fresh": fresh, "total_epoch": 1, "batch_size": 1,
+            }))
+        };
+        let dir = trun::resolve_run_dir(&slot, None).unwrap();
+        assert_eq!(dir.path(), run, "the run really is where the products are");
+        let facts = resume_lock_facts(&dir).unwrap();
+        let manifest = read_run_manifest(&dir);
+        assert!(manifest.is_some(), "the guard must have something to judge against");
+        assert!(facts.has_main, "G_700.pth is in this run");
+
+        let code = resume_lock::check_resume_locks(&req(false), &facts.state(manifest.as_ref()), true);
+        assert!(
+            code.as_deref().is_some_and(|c| c.starts_with("RESUME_PARAMS_MISMATCH")),
+            "a 续训 that changes version AND sample rate must be refused, got {code:?}"
+        );
+
+        // …and the decoy really is permissive, so the assertion above is load-bearing rather than
+        // trivially true: a read pointed at the SLOT allows the very same request.
+        let decoy = trun::RunDir::for_test(slot.clone());
+        assert!(
+            resume_lock::check_resume_locks(
+                &req(false),
+                &resume_lock_facts(&decoy).unwrap().state(read_run_manifest(&decoy).as_ref()),
+                true,
+            )
+            .is_none(),
+            "the decoy must ALLOW — otherwise this test would pass with every read broken"
+        );
+
+        // ★ the THIRD disk read — the frozen speaker set — and its failure direction is the
+        // opposite one: losing it does not open a lock, it invents a REFUSAL. A mutation probe
+        // found the assertions above could not reach it at all (they are single-speaker).
+        //
+        // The run froze names ["sayo","teto"]; a resume that asks for exactly those must be
+        // ALLOWED. It is allowed only because the names were read off disk: with an empty list
+        // the guard falls back to comparing recomputed SLUGS, and `slugify` hash-suffixes with
+        // `DefaultHasher` — so the fallback answers「换人了」for the very same two singers and
+        // the slot becomes permanently unresumable.
+        let multi = req_from(serde_json::json!({
+            "model_name": "m", "backend": "rvc", "version": "v2", "sample_rate": "40k",
+            "dataset_files": [],
+            "speakers": [{"name": "sayo", "files": []}, {"name": "teto", "files": []}],
+            "fresh": false, "total_epoch": 1, "batch_size": 1,
+        }));
+        assert_eq!(facts.frozen_speakers.len(), 2, "read off disk, not invented here");
+        assert!(
+            resume_lock::check_resume_locks(&multi, &facts.state(manifest.as_ref()), true).is_none(),
+            "the same two singers must still be resumable"
+        );
+        let blind = ResumeLockFacts { frozen_speakers: Vec::new(), ..facts };
+        assert_eq!(
+            resume_lock::check_resume_locks(&multi, &blind.state(manifest.as_ref()), true)
+                .as_deref(),
+            Some("RESUME_SPEAKER_SET_MISMATCH"),
+            "…and losing that read is a FALSE REFUSAL, which is why it needs its own assertion"
+        );
+
+        // the manifest going missing is the total-failure shape: every lock vanishes at once.
+        assert!(
+            resume_lock::check_resume_locks(&req(false), &facts.state(None), true).is_none(),
+            "pinned deliberately: `st.manifest?` is why ONE broken read silences the whole table"
+        );
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// ⛔ §F2⒝ batch 2 step ④ — THE test for THIS batch, for the same reason: it moves no bytes
+    /// either, so「套件全绿」carries no information about it. What ④ changes is that every
+    /// per-run question can now be ASKED of a named run — so the only assertion that means
+    /// anything is one where the two runs would give DIFFERENT answers, and each is asked its own.
+    ///
+    /// The slot below is built on disk on purpose rather than through the app: when this test was
+    /// written 「同槽两个 run」 could not be produced at all, because both minting paths reused
+    /// `legacy_run_id` (a pure function of the family). ⚠ **That sentence is stale twice over** —
+    /// ④e (S132) gave 「再训一个」 a real `minted_run_id`, and S144 gave the 0-run arm one too, so
+    /// today the app does produce this shape. Building it here anyway keeps the assertions
+    /// independent of every guard between the button and the directory.
+    #[test]
+    fn each_run_answers_for_itself_and_the_unnamed_question_refuses() {
+        let data = tmp_ws("tworuns");
+        std::fs::create_dir_all(data.join("training")).unwrap();
+        let id = "ptwo_55556666";
+        tproject::write_meta(
+            &data,
+            &tproject::ProjectMeta { id: id.into(), name: "n".into(), ..Default::default() },
+        )
+        .unwrap();
+        let slot = tproject::family_dir(&data, id, "rvc");
+        std::fs::create_dir_all(&slot).unwrap();
+        std::fs::write(slot.join(tpool::SLOT_META), br#"{"layout":3}"#).unwrap();
+        let (a, b) = ("raaaaaaaaaaaa", "rbbbbbbbbbbbb");
+        for (rid, step, name) in [(a, 1400u64, "歌姫A"), (b, 900u64, "歌姫B")] {
+            let home = trun::runs_root(&slot).join(rid);
+            std::fs::create_dir_all(&home).unwrap();
+            run_products(&home, step);
+            std::fs::write(
+                home.join("run.json"),
+                serde_json::json!({ "model_name": name }).to_string(),
+            )
+            .unwrap();
+        }
+
+        // ⛔ the UNNAMED question must refuse rather than pick one. This is the whole reason the
+        // shape had to change first: `slot_info(None)` is what the project page used to ask for
+        // every slot, through one `collect::<Result<_>>` — so this Err took the WHOLE page down.
+        assert!(slot_info(&data, id, "rvc", None).is_err(), "two runs cannot answer「哪个」");
+        assert!(trun::resolve_run_dir(&slot, None).is_err());
+        assert!(tproject::slot_model_name(&data, id, "rvc").is_none(), "…and it swallows to None");
+
+        // …while each NAMED run answers for itself, with numbers that differ.
+        assert_eq!(slot_info(&data, id, "rvc", Some(a)).unwrap().best_resume_step, Some(1400));
+        assert_eq!(slot_info(&data, id, "rvc", Some(b)).unwrap().best_resume_step, Some(900));
+        for (rid, want) in [(a, "歌姫A"), (b, "歌姫B")] {
+            let dir = trun::resolve_run_dir(&slot, Some(rid)).unwrap();
+            assert_eq!(tproject::run_model_name(&dir).as_deref(), Some(want), "{rid}");
+        }
+        // a name that is not there is an ERROR, never a fallback to「随便挑一个」
+        assert!(trun::resolve_run_dir(&slot, Some("rccccccccccccc")).is_err());
+
+        // the archive inventory attributes every row, and asking one run's rows gives that run's
+        // resume point — the number the run's row on the project page prints.
+        let recs = tproject::scan_project_ckpts(&data, id, Some("rvc"));
+        assert!(!recs.is_empty());
+        for r in &recs {
+            assert!(r.run_id == a || r.run_id == b, "unattributed row {}", r.rel);
+        }
+        // ⚠ The property is「它永不跨 run」, NOT a particular step number: the ordering these
+        // functions work over is mtime, and two runs built inside one test tick can tie. Asserting
+        // an invented step here would be my own expectation dressed as a fact — and a flaky one.
+        for rid in [a, b] {
+            let mine: Vec<&tproject::CkptRecord> =
+                recs.iter().filter(|r| r.run_id == rid).collect();
+            assert!(mine.len() < recs.len(), "{rid}: the filter must actually filter");
+            let picked = tproject::default_resume_record_of(&mine)
+                .unwrap_or_else(|| panic!("{rid}: a run with checkpoints has a resume point"));
+            assert_eq!(picked.run_id, rid, "{rid}: a run's row must never name another run's file");
+            assert!(
+                !picked.rel.contains("/resume_best/"),
+                "{rid}: the S118 rule must survive the per-run split — a default 续训 continues \
+                 from the latest, so naming the BEST snapshot is a step the button will not use"
+            );
+        }
+        // …and the SLOT-level answer cannot tell them apart: it names exactly one of the two runs,
+        // which is precisely why the row on the project page had to stop using it.
+        let slot_wide = tproject::default_resume_record(&recs).unwrap();
+        assert!(slot_wide.run_id == a || slot_wide.run_id == b);
+
+        // every run is still visible to the SLOT-level questions (bytes, wipe consent)
+        assert_eq!(trun::run_dirs(&slot).unwrap().len(), 2);
+        assert!(slot_holds_work(&slot));
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// ★§F2⒝ 批 2 ④d 笔 0 —— 「这个槽的预处理是带响度归一化建的吗」必须有**第三个**答案。
+    ///
+    /// 此前只有 `try_start` 内部一处读者问过这个问题,而它只能答 true/false:一个
+    /// `contains("|loudnorm=1")`,答不上来就算 `false`。而 `loudnorm` 折进 sovits 家的数据集
+    /// 指纹(`utai_train/sovits/pipeline.py` 的 `extract_cache_fp_text`)⇒ 它**命名了那个池**。
+    /// 答错一次的代价不是一次报错,是下一次运行落到**另一个**池上、把整份切片与特征重跑一遍,
+    /// 而唯一的痕迹是 python 那边一行 `logger.info`。参数页的表单还原要用它,所以「不知道」
+    /// 必须是一个能说出口的答案 —— 塌成 `false` 就等于替用户关掉一个他从没碰过的开关。
+    ///
+    /// 判据两半,缺任何一半另一半都会被一个常量满足:
+    /// ⒜ 纯读者在**四条公式能产出的每一种串**上与被它替换掉的子串探针**逐串同值**,并在那三类
+    ///    子串探针答错的串上**拒绝作答**;
+    /// ⒝ `slot_info` 的三态,而且三态各自有**方向**:manifest 的 `false` ≠ 没说 · 池答得上来时
+    ///    要采纳池 · 池不唯一时答 `None` 而不是挑一个。
+    /// ⛔★S142 §E2E-M10-⒜ —— **这个槽有没有预处理**这个事实,真的上了线。
+    ///
+    /// 在这条之前,把 `slot_info` 里那一行赋值硬编成 `false`,**cargo 全绿** —— 全仓没有一处
+    /// 测试读过 `slot_info(..).has_preprocessing`,而 TS 那道跨语言对拍按设计只比**字段名**,
+    /// 不比值。整条 ⒜ 的收益会全部押在一行没人验过的赋值上。
+    ///
+    /// ★ 它同时是「读错邻居字段」的唯一看守:`has_dataset` 就在同一个 struct 里隔几行,而
+    /// 全仓每一份前端夹具里这两个字段**取值恰好相同** ⇒ 把 `has_preprocessing` 写成
+    /// `has_dataset` 在那一侧一条判据都杀不掉。这里的夹具**故意**让两者相反。
+    #[test]
+    fn slot_info_reports_the_slots_own_preprocessing_not_the_projects_dataset() {
+        let data = tmp_ws("haspre");
+        std::fs::create_dir_all(data.join("training")).unwrap();
+        let id = "pre_11112222";
+        tproject::write_meta(
+            &data,
+            &tproject::ProjectMeta { id: id.into(), name: "n".into(), ..Default::default() },
+        )
+        .unwrap();
+        let slot = tproject::family_dir(&data, id, "rvc");
+        let run = trun::runs_root(&slot).join("r0123456789ab");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(slot.join(tpool::SLOT_META), br#"{"layout":3}"#).unwrap();
+        std::fs::write(run.join("run_manifest.json"), br#"{"version":"v2"}"#).unwrap();
+        let ask = || slot_info(&data, id, "rvc", None).unwrap();
+
+        // 先证明缺口是真的:没有任何池 ⇒ false。少了这一句,下面那条「有池 ⇒ true」会被一个
+        // 恒返回 true 的实现满足。
+        assert!(!ask().has_preprocessing, "没有池 ⇒ 这个槽还没付过那笔时间");
+
+        // ★ 一个**指纹丢了**的池 —— 产物在盘上,而且它是代价最大的一格(谁也匹配不上 ⇒
+        //   下一次运行必然铸兄弟池、整份重跑)。这一格同时是 `slot_has_pool` 第一条臂在
+        //   mod.rs 这一侧的**唯一**覆盖。
+        let pool = tpool::pools_root(&slot).join("p0000000000000");
+        std::fs::create_dir_all(pool.join("0_gt_wavs")).unwrap();
+        std::fs::write(pool.join("0_gt_wavs").join("000.wav"), b"x").unwrap();
+        assert!(ask().has_preprocessing, "池目录里有产物 ⇒ 改池级字段要再付一遍");
+
+        // ★★ 与邻居**反向**:这个项目从来没导入过音频 ⇒ `has_dataset` 必须是 false,
+        //    而 `has_preprocessing` 是 true。读错字段的实现在这一格上一定翻车。
+        assert!(!ask().has_dataset, "夹具前提:项目没有数据集,两个字段必须相反");
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[test]
+    fn the_loudnorm_a_pool_was_built_with_is_readable_and_may_answer_unknown() {
+        // ⒜ 与旧探针逐串对拍。这七条覆盖四条公式的全部形状:sovits(带/不带)· sovits_v2 的
+        //    条件尾巴 · rvc 单说话人(裸指纹,连一个 `|` 都没有)· rvc 多说话人(全是**无 `=`**
+        //    的 token,所以「跳过没有 `=` 的 token」是必需的而不是防御性的)· vocoder · 空。
+        //    ★§F2⒝ ④d —— 后四条是**新公式**能产出的形状(共享尾巴 `|sr=` / `|aug=` 接在最末)。
+        //    加 token 会不会让这个读者改口,是 R4 当初被写下来的**唯一**理由,所以新串必须进这张表。
+        for text in [
+            "d41d8c|enc=vec768l12|loudnorm=1",
+            "d41d8c|enc=vec768l12|loudnorm=0",
+            "d41d8c|enc=vec256l9|loudnorm=1|f0=dio",
+            "96d753dd248b7decf6832e950b9c044e",
+            "aaaa|bbbb|cccc",
+            "e0098e8d7d7be4b04eef47007e01729d|vocoder-v3",
+            "",
+            "d41d8c|enc=vec768l12|loudnorm=1|aug=2",
+            "d41d8c|enc=vec256l9|loudnorm=0|f0=dio|aug=3",
+            "96d753dd248b7decf6832e950b9c044e|sr=40000|aug=2",
+            "aaaa|bbbb|cccc|sr=48000",
+            "e0098e8d7d7be4b04eef47007e01729d|vocoder-v3|aug=1",
+        ] {
+            assert_eq!(
+                loudnorm_from_fingerprint(text).unwrap_or(false),
+                text.contains("|loudnorm=1"),
+                "{text}: 换一个读者不许改变任何一条【现有】输入的答案"
+            );
+        }
+        // …而 unwrap_or(false) 之下藏着的正是新读者多出来的那一档,所以单独钉一次:
+        assert_eq!(loudnorm_from_fingerprint("d41d8c|enc=vec768l12|loudnorm=0"), Some(false));
+        assert_eq!(loudnorm_from_fingerprint("aaaa|bbbb|cccc"), None, "没有这个 token = 没有答案");
+
+        // 这三类是旧探针答错的。它们今天产不出来 —— 钉住它们是因为 ④d 要往这个串上**加 token**,
+        // 而「加一个 token 会不会让这个读者改口」这件事必须有东西看着。
+        assert_eq!(loudnorm_from_fingerprint("x|loudnorm=10"), None, "旧探针在这条上答 true");
+        assert_eq!(loudnorm_from_fingerprint("x|loudnorm=1extra"), None, "旧探针在这条上答 true");
+        assert_eq!(loudnorm_from_fingerprint("x|loudnorm=1|loudnorm=0"), None, "自相矛盾不许挑一个");
+
+        // ⒝ 三态,用真目录驱动 `slot_info`。
+        let data = tmp_ws("loudnorm3");
+        std::fs::create_dir_all(data.join("training")).unwrap();
+        let id = "pln_11112222";
+        tproject::write_meta(
+            &data,
+            &tproject::ProjectMeta { id: id.into(), name: "n".into(), ..Default::default() },
+        )
+        .unwrap();
+        let slot = tproject::family_dir(&data, id, "sovits");
+        let run = trun::runs_root(&slot).join("r0123456789ab");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(slot.join(tpool::SLOT_META), br#"{"layout":3}"#).unwrap();
+        let manifest = |v: serde_json::Value| {
+            std::fs::write(run.join("run_manifest.json"), v.to_string()).unwrap()
+        };
+        let ask = || slot_info(&data, id, "sovits", None).unwrap().loudnorm;
+
+        // manifest 说了就听 manifest —— 而 `false` 与「没说」必须给出**不同**的答案,否则这个
+        // 字段还是两态,只是换了个类型。
+        manifest(serde_json::json!({ "version": "4.1", "loudnorm": true }));
+        assert_eq!(ask(), Some(true));
+        manifest(serde_json::json!({ "version": "4.1", "loudnorm": false }));
+        assert_eq!(ask(), Some(false));
+
+        // manifest 没这个键(S38 之前的形状)⇒ 读**池自己的指纹**。先证明它此刻确实答不上来,
+        // 否则下面那条「池答上来了」会被上一步的残留满足。
+        manifest(serde_json::json!({ "version": "4.1" }));
+        assert_eq!(ask(), None, "先证明缺口是真的");
+
+        let fp = "d41d8c|enc=vec768l12|loudnorm=1";
+        let pool = tpool::pools_root(&slot).join(tpool::pool_id_for(fp));
+        std::fs::create_dir_all(&pool).unwrap();
+        std::fs::write(pool.join(tpool::FINGERPRINT), fp).unwrap();
+        assert_eq!(ask(), Some(true), "盘上那棵切片树就是在这个值下建起来的");
+
+        // 方向性:池说 0 就必须是 Some(false)。少了这一条,「读池」可以由一个恒 true 实现。
+        std::fs::write(pool.join(tpool::FINGERPRINT), "d41d8c|enc=vec768l12|loudnorm=0").unwrap();
+        assert_eq!(ask(), Some(false));
+
+        // 两个池 ⇒ 盘上没有任何东西记着这个 run 属于哪一个(run↔pool 这条边今天不存在)
+        // ⇒ 诚实地答 None。塌成 false 会让参数页把复选框关掉,而那正是这个字段要防的那件事。
+        let fp2 = "9e9e9e|enc=vec768l12|loudnorm=1";
+        let pool2 = tpool::pools_root(&slot).join(tpool::pool_id_for(fp2));
+        std::fs::create_dir_all(&pool2).unwrap();
+        std::fs::write(pool2.join(tpool::FINGERPRINT), fp2).unwrap();
+        assert_eq!(ask(), None, "不唯一就不猜");
+
+        // …而 manifest 一旦说了话,池有几个都不再重要(顺序:manifest 是这次请求的记录,
+        // 池是产物的记录,只有前者缺席时才需要问后者)。
+        manifest(serde_json::json!({ "version": "4.1", "loudnorm": true }));
+        assert_eq!(ask(), Some(true));
+
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// ⛔ §F2⒝ batch 2 — THE test for the previous batch, because that batch moved no bytes.
+    ///
+    /// Every other test in this file still exercises the layout-≤2 arm, and every one of them
+    /// would stay green if not a single reader had been re-pointed at the run. So: build the same
+    /// slot twice — products at the slot root, and the identical products inside `runs/<id>/` —
+    /// and demand the SAME answers. A reader still joining names onto the slot answers「什么都
+    /// 没有」for the second one, which is how `has_main_progress` going false turns a
+    /// shallow-diffusion「重训」into `remove_dir_all` of the whole slot.
+    #[test]
+    fn every_run_reader_gives_the_same_answer_in_both_layouts() {
+        let data = tmp_ws("layouts");
+        std::fs::create_dir_all(data.join("training")).unwrap();
+        for (id, layout3) in [("pflat_11112222", false), ("pruns_33334444", true)] {
+            tproject::write_meta(
+                &data,
+                &tproject::ProjectMeta { id: id.into(), name: "n".into(), ..Default::default() },
+            )
+            .unwrap();
+            let slot = tproject::family_dir(&data, id, "rvc");
+            let home = if layout3 {
+                std::fs::write(
+                    { std::fs::create_dir_all(&slot).unwrap(); slot.join(tpool::SLOT_META) },
+                    br#"{"layout":3}"#,
+                )
+                .unwrap();
+                trun::runs_root(&slot).join("rfeedfacefeed")
+            } else {
+                slot.clone()
+            };
+            std::fs::create_dir_all(&home).unwrap();
+            run_products(&home, 1400);
+
+            let where_ = if layout3 { "layout 3" } else { "layout 2" };
+            assert!(slot_holds_work(&slot), "{where_}: a wipe here would destroy real work");
+                assert_eq!(trun::resolve_run_dir(&slot, None).unwrap().path(), home, "{where_}");
+
+            let info = slot_info(&data, id, "rvc", None).unwrap();
+            assert!(info.exists, "{where_}");
+            assert!(info.has_main_progress, "{where_}: G_*.pth is the diff-partial-wipe judge");
+            assert_eq!(info.version, "v2", "{where_}");
+            assert_eq!(info.sample_rate, "40k", "{where_}");
+            assert_eq!(info.aug_copies, 3, "{where_}: the diff run inherits this");
+            assert_eq!(info.n_speakers, 2, "{where_}");
+            assert_eq!(info.speakers, vec!["sayo", "teto"], "{where_}");
+            assert_eq!(info.best_resume_step, Some(1400), "{where_}");
+            assert_eq!(info.diff_steps, 5000, "{where_}");
+            assert_eq!(
+                frozen_speakers(&data, id, "rvc").unwrap().iter().map(|s| s.slug.clone()).collect::<Vec<_>>(),
+                vec!["sayo_1", "teto_2"],
+                "{where_}: the dataset page's frozen-structure gate reads this"
+            );
+            assert_eq!(
+                tproject::slot_model_name(&data, id, "rvc").as_deref(),
+                Some("歌姫"),
+                "{where_}"
+            );
+
+            // the archive inventory: same rows, and the paths really address the files
+            let recs = tproject::scan_project_ckpts(&data, id, Some("rvc"));
+            let mut names: Vec<String> = recs
+                .iter()
+                .map(|r| r.rel.rsplit('/').next().unwrap().to_string())
+                .collect();
+            names.sort();
+            names.dedup();
+            assert_eq!(
+                names,
+                vec!["G.pth", "G_1400.pth", "m_e14_s147.pth", "model_5000.pt"],
+                "{where_}: every archive class must still be listed"
+            );
+            for r in &recs {
+                assert!(Path::new(&r.path).is_file(), "{where_}: {} does not exist", r.path);
+                assert!(
+                    tproject::project_dir(&data, id).join(&r.rel).is_file(),
+                    "{where_}: the project-relative rel must address the file — the export ledger \
+                     and the「已导入」marker match on this string"
+                );
+                assert_eq!(r.rel.contains("/runs/"), layout3, "{where_}: {}", r.rel);
+            }
+        }
+
+        // ⛔ A DIRECTORY whose name looks like a checkpoint is not a checkpoint. These scanners
+        // read a directory listing, and until this batch none of them asked; the archive would
+        // then offer a directory as a resume point and hand it to the cleanup as a deletable
+        // file. (`runs/` itself is the first entry at a slot root that is a directory and not a
+        // product, which is what makes the omission worth closing now rather than later.)
+        {
+            let bogus = tmp_ws("dirnamed");
+            let bogus = trun::RunDir::for_test(bogus);
+            std::fs::create_dir_all(bogus.join("G_9999.pth")).unwrap();
+            std::fs::create_dir_all(bogus.join("model_ckpt_steps_9999.ckpt")).unwrap();
+            std::fs::create_dir_all(bogus.join("diffusion").join("model_9999.pt")).unwrap();
+            assert!(!has_main_progress(&bogus), "a directory is not a generator checkpoint");
+            assert_eq!(max_vocoder_ckpt_step(&bogus), None);
+            assert_eq!(max_diffusion_step(&bogus), None);
+            let _ = std::fs::remove_dir_all(bogus.path());
+        }
+
+        // …and with TWO runs the plural readers grow while the singular ones refuse to guess
+        let id = "pruns_33334444";
+        let slot = tproject::family_dir(&data, id, "rvc");
+        let second = trun::runs_root(&slot).join("rbeefbeefbeef");
+        run_products(&second, 2800);
+        assert_eq!(
+            tproject::scan_project_ckpts(&data, id, Some("rvc")).len(),
+            8,
+            "two runs, four archive rows each — anything less is gigabytes the UI cannot reclaim"
+        );
+        assert!(slot_holds_work(&slot));
+        assert!(
+            slot_info(&data, id, "rvc", None).is_err(),
+            "「这个 run 练到哪了」has no answer without being told which run"
+        );
+
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// ⛔ §F2⒝ batch 2 step ③ — the run a START writes into must be re-resolved AFTER the wipe.
+    ///
+    /// This is a SOURCE assertion because the thing it protects is unreachable from a test:
+    /// `try_start` needs a pyenv, a `State` and a live process, which is the same reason
+    /// `trun::RunDir` had to become a type rather than a convention. What it pins is an ORDER, and
+    /// getting it wrong is worse than loud: the pre-wipe `run` points inside the `runs/` container
+    /// the wipe just deleted, so `run_manifest.json` fails with a bare io NotFound — but only after
+    /// the slot has already been emptied, and the second press succeeds because there is no
+    /// container left. The user experiences one unreadable error and a button that then works,
+    /// while the checkpoints are gone and the slot has silently fallen back to layout 0.
+    #[test]
+    fn a_start_re_resolves_its_run_after_the_wipe() {
+        let code = production_code();
+        let at = |needle: &str| at_in(&code, needle);
+        // ★★§F2⒝ ④e RE-ANCHORED. The old anchor was `remove_dir_all_robust(&workspace)` and the
+        // flip deleted that line — so this ratchet panicked, loudly and with the right attribution
+        // (S131/S132 笔 0 are what make that true; before them `find` would have latched onto this
+        // test module's own copy of the literal and the order assertion would have gone green).
+        //
+        // ⛔ Re-anchoring must preserve the PROPERTY, not just restore green. What the wipe used to
+        // stand for was 「the point of no return」: everything above it judged the pre-wipe state,
+        // everything below it wrote. The mint is that point now — `run_dir_for_start` with
+        // `mints_fresh_run` picks a DIFFERENT directory, and from there on every write lands in the
+        // new run while every guard above was asked about the old one.
+        let fold = at("migrate_one_slot(&data_dir, &project.id, &family)?;");
+        let recreate = at("std::fs::create_dir_all(&workspace)?;");
+        let resolve = at("trun::run_dir_for_start(&workspace, &family, req_run, mints_fresh_run)?");
+        let manifest_write = at("std::fs::write(&manifest_path, serde_json::to_vec_pretty");
+        assert!(
+            fold < resolve,
+            "the on-demand layout fold runs AFTER the mint — a slot that grows its second run \
+             while still below layout 4 can never be folded again (`tpool::slot_facts` refuses two \
+             run manifests, and `migrate_layouts` only runs at boot), so its pools are stranded on \
+             identity v1 for good"
+        );
+        assert!(
+            recreate < resolve,
+            "the run is resolved BEFORE the slot directory is ensured — on a first training the \
+             slot root IS the answer, and it has to exist by then"
+        );
+        assert!(
+            resolve < manifest_write,
+            "`run_manifest.json` is written before the run that a START writes into is resolved — \
+             on a mint that puts the new run's manifest inside the OLD run"
+        );
+        // …and the PRE-mint resolution has to stay where it is: the guards judge the state of the
+        // run the request names, which on a 「再训一个」 is the one being left behind.
+        // ⚠ step ④ re-anchored this once already: the guards' run is the one the REQUEST names, so
+        // the needle is the resolver call, not the literal `None` it used to pass. The anchor was
+        // deliberately NOT loosened to just `resolve_run_dir` — that substring also matches the two
+        // calls inside the dataset pre-check above, and this assertion is about THIS one.
+        // ★★§F2⒝-B2-⑤ / §E2E-M25 — the snapshot's `run_id` must be named off the SAME `run` the
+        // snapshot's `workspace` is taken from.
+        //
+        // ⛔ Why this needs a ratchet at all, when `RunDir` is a newtype precisely so that「which of
+        // two identical-looking paths did I pass」stops being a review question: BOTH bindings here
+        // are `RunDir`. The pre-guard `resolve_run_dir` one (above) and the post-mint
+        // `run_dir_for_start` one (below) are 250 lines apart, same name, same type — so the
+        // compiler cannot tell them apart, and on a 「再训一个」 they point at DIFFERENT runs.
+        // Naming the id off the wrong one gives a snapshot whose path says「the new run」and whose
+        // id says「the old run」, and the frontend's four consumers (fold / badge / disable / sort)
+        // would then all point at the row the user is training AWAY from — silently, and looking
+        // exactly like a correct answer.
+        //
+        // ⇒ The property pinned is ADJACENCY: the naming sits between the mint and any further
+        // `run` rebinding. That is checkable, and「read the two lines and see they agree」is not.
+        let name_run = at("let run_id = trun::run_id_of(&workspace, &family, &run);");
+        assert!(
+            resolve < name_run,
+            "the snapshot's run id is named BEFORE the start resolves which run it writes into — \
+             on a 「再训一个」 that names the run being left behind"
+        );
+        assert!(
+            code[resolve..name_run].matches("let run = ").count() == 0,
+            "a second `let run = ` binding slipped between the mint and the naming — the id and \
+             the workspace in the snapshot would then be about two different runs, and nothing \
+             about the resulting screen would look wrong"
+        );
+        // …and both fields really are read off that binding in the snapshot literal.
+        assert!(
+            code.contains("workspace: run.to_string_lossy().into_owned(),\n                run_id: run_id.clone(),"),
+            "the snapshot no longer takes its path and its id from the same `run` — these two \
+             lines are deliberately adjacent so that the pair cannot drift apart unnoticed"
+        );
+
+        let guard_resolve = at("let run = trun::resolve_run_dir(&workspace, req_run)?;");
+        assert!(
+            guard_resolve < resolve,
+            "the guards' run is resolved after the mint — they exist to judge the run the request \
+             names, and post-mint they would all be asked about a directory that was created \
+             empty one line earlier (every progress probe would answer「什么都没有」)"
+        );
+        // ★§F2⒝ ④e — and the inheritance reset sits between the mint and the merge-write.
+        // ⛔ It used to live INSIDE the deleted wipe branch, which is why its absence is a silent
+        // data bug rather than a compile error: the merge below would carry another run's
+        // conditionally-written keys (`speakers`/`n_speakers`/`speaker_names`, `aug_copies`,
+        // `loudnorm`, `diff_k_step_max`) into a run that never had them.
+        let reset = at("if mints_fresh_run {\n            old_manifest = None;");
+        assert!(
+            resolve < reset && reset < manifest_write,
+            "the minted run's manifest is no longer reset between the mint and the merge-write — \
+             a run minted after a co-training would report a frozen speaker set it never had and \
+             refuse its own next 续训 with RESUME_SPEAKER_COUNT_MISMATCH"
+        );
+        // ★★S133 §F2⒝ ④e — 试听缓存的失效必须**先于**那些字节消失。
+        //
+        // ⛔ 顺序是硬的,而反过来会**静默**:`evict_audition_of` 是从 `<run>/diffusion/` 的目录
+        // 列表推出「哪几个 stem 过期了」的。删完再调,那个列表是空的 ⇒ 一条都不清 ⇒ 函数返回 0、
+        // 不报错、日志一行都没有,而试听照旧放上一次那个模型。这正是「什么都没做」的形状,
+        // 单测驱不到(`try_start` 没有任何驱动器),所以它只能落在这里。
+        let evict = at("let evicted = evict_audition_of(&run, &diff_dir);");
+        let diff_wipe = at("crate::util::remove_dir_all_robust(&diff_dir).map_err(|e| {");
+        assert!(
+            evict < diff_wipe,
+            "the stale audition caches are dropped AFTER the diffusion checkpoints they were \
+             derived from — the directory listing is empty by then, so nothing is evicted, \
+             nothing errors, and 「试听」 keeps replaying the previous run's render"
+        );
+        assert!(
+            diff_wipe < resolve,
+            "the diffusion partial wipe happens after the mint — it would then delete the NEW \
+             run's (empty) diffusion dir while the stale one it was aimed at survives"
+        );
+    }
+
+    /// `mod.rs`'s PRODUCTION source with every FULL-LINE `//` comment blanked out (line count and
+    /// relative order preserved), so a source-order ratchet anchors on CODE.
+    ///
+    /// ⛔★S127: the raw `THIS_RS.find(needle)` form these ratchets used is **one added comment
+    /// away from being decorative** — a comment that happens to contain an anchor literal becomes
+    /// the offset the assertion compares, and the real call sites are then free to move in any
+    /// order while the gate stays green. (Found by the ④b recon's completeness critic on the
+    /// sibling ratchet `trun::the_boot_chain_folds_pools_before_runs`, which is safe today only
+    /// because the nearby comments write the function names WITHOUT the opening paren.)
+    ///
+    /// ⛔★★S131 §F2⒝ ④e 笔 0 — and blanking comments was only HALF of it. The searched text still
+    /// included THIS test module, whose own source contains every anchor literal it passes in. The
+    /// hazard was known — the sibling ratchet's header says so verbatim, and works around it by
+    /// splitting each needle with `concat!` — but the workaround was applied to three needles and
+    /// NOT to `remove_dir_all_robust(&workspace)`, `std::fs::create_dir_all(&workspace)?;`,
+    /// `trun::run_dir_for_start(&workspace, &family)?` or the manifest write. Both directions of
+    /// that are bad, and the quiet one is worse:
+    /// * ④e's flip DELETES the production `remove_dir_all_robust(&workspace)` line. `find` would
+    ///   then latch onto this module's own literal — a much larger offset — so `slug < wipe`
+    ///   silently becomes a tautology and `wipe < recreate` panics with the message REVERSED
+    ///   (「the slot is re-created after the wipe, not before」about a wipe that no longer exists).
+    ///   A red nobody can attribute is the exact shape S129 made a 铁律 out of.
+    /// * a typo in a NEW production anchor matches this module's copy instead, and the order
+    ///   assertion that was supposed to guard it goes GREEN.
+    ///
+    /// ⇒ the ratchets see production only, and [`at_in`] names which of the two failures happened.
+    fn production_code() -> String {
+        static THIS_RS: &str = include_str!("mod.rs");
+        production_part(THIS_RS)
+    }
+
+    /// The truncation itself, on a source handed in — so the negative control below can drive it.
+    ///
+    /// ⚠ The marker is assembled from pieces, or this line would be a second occurrence of it and
+    /// the uniqueness assertion below would fail on its own source.
+    /// ⛔ Uniqueness is asserted rather than assumed: S129 shipped a `production()` helper that cut
+    /// at the FIRST `#[cfg(test)]`, and `trun.rs` has a function-level one — so it truncated
+    /// production code and produced a FALSE RED that cost most of a session. Cutting too early
+    /// here is loud (`at_in` panics with "not in the production source"), but the message would
+    /// send the reader after the wrong thing, so say it here instead.
+    fn production_part(src: &str) -> String {
+        // ⛔ Blank FIRST, cut second. Counting the marker in the raw text makes any prose that
+        // mentions the attribute a second occurrence — this very helper's own header did exactly
+        // that on its first run, which is the same「the ruler counted its own source」mistake S129
+        // made twice. Blanking is length-preserving, so every byte offset below is unaffected.
+        let blanked: String = src
+            .lines()
+            .map(|l| {
+                if l.trim_start().starts_with("//") {
+                    " ".repeat(l.len())
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let marker = concat!("#[cfg", "(test)]");
+        assert_eq!(
+            blanked.matches(marker).count(),
+            1,
+            "mod.rs grew a second cfg-test attribute in CODE: this helper cuts at the first one, \
+             so a function-level one would truncate PRODUCTION code and every ratchet below would \
+             report its anchor as missing (that false red is exactly what S129 paid for in \
+             `trun.rs`). Cut at the module's attribute explicitly instead."
+        );
+        let end = blanked.find(marker).expect("just counted one");
+        blanked[..end].to_string()
+    }
+
+    /// Where an anchor sits in [`production_code`] — with the three failures kept APART.
+    ///
+    /// ⛔ 「the anchor moved out of production」and「the anchor never existed」used to be one
+    /// panic, and neither of them used to happen at all when the needle also appeared in this test
+    /// module. Reporting them separately is the whole point: the first means a production edit
+    /// (probably ④e's) needs the ratchet re-anchored ON PURPOSE; the second means a typo.
+    ///
+    /// ⛔★★S132 §F2⒝ ④e 笔 0 — and there is a THIRD, which S131 left open because it comes from
+    /// the other direction: the anchor occurring TWICE **in production**. S131 closed 「the
+    /// searched text contains this test module's own copy」; this one ④e creates itself —
+    /// `delete_run` reaches for the same `remove_dir_all_robust(` the wipe used, and `find` pins
+    /// whichever comes first. The order assertion then compares two lines it was never about and
+    /// **stays green** while the property it holds is dead. That is S131's own second failure mode
+    /// (「a typo in a NEW production anchor … goes GREEN」) with a new source, so it gets the same
+    /// treatment: named, separate, and driven by a `#[should_panic]` below.
+    fn at_in(code: &str, needle: &str) -> usize {
+        let hits = code.matches(needle).count();
+        assert!(
+            hits < 2,
+            "the anchor {needle:?} occurs {hits} times in mod.rs's PRODUCTION source. `find` \
+             returns the FIRST, so the order assertion that uses it silently starts comparing a \
+             line it was never about. Give this ratchet a longer needle that names THIS call site \
+             (the way the pre-wipe resolver's anchor spells out its whole argument list); do NOT \
+             keep the ambiguous one and do NOT switch to `rfind` — which of the two is 'the' one \
+             would then depend on edit order."
+        );
+        code.find(needle).unwrap_or_else(|| {
+            static THIS_RS: &str = include_str!("mod.rs");
+            assert!(
+                !THIS_RS.contains(needle),
+                "the anchor {needle:?} is NOT in mod.rs's production source — it matches only \
+                 inside this file's own test module. Re-anchor the ratchet onto whatever the \
+                 production code says now; do NOT loosen the needle, and do not delete the \
+                 assertion: before S131 this case was accepted silently and turned the order \
+                 assertion into a tautology."
+            );
+            panic!("mod.rs no longer contains the anchor {needle:?} anywhere")
+        })
+    }
+
+    /// ★S131 笔 0 —— the two things [`production_part`] / [`at_in`] promise, driven for real.
+    ///
+    /// ⛔ All THREE of `at_in`'s refusals are error branches, and 「a branch that has never executed
+    /// is an empty criterion」 (S129). They are executed by the `#[should_panic]` tests below;
+    /// this one covers the cut itself, on synthetic source, because asserting the property against
+    /// mod.rs's real text would be satisfied by a helper that returns the whole file.
+    #[test]
+    fn the_ratchets_see_production_only() {
+        let synthetic = format!(
+            "fn real() {{ anchor_in_production(); }}\n{}\nmod tests {{\n    fn t() \
+             {{ anchor_in_production(); }}\n}}\n",
+            concat!("#[cfg", "(test)]")
+        );
+        let cut = production_part(&synthetic);
+        assert_eq!(
+            cut.matches("anchor_in_production()").count(),
+            1,
+            "the test module's own copy of an anchor is still in the searched text — every \
+             `at_in` below can latch onto it instead of the real call site"
+        );
+        assert!(!cut.contains("mod tests"), "the cut did not happen at all");
+        // …and the cut keeps BYTE OFFSETS of everything before it, which is what the order
+        // assertions actually compare.
+        assert!(synthetic.starts_with(&cut[..cut.len().min(30)]), "the prefix was rewritten");
+    }
+
+    #[test]
+    #[should_panic(expected = "matches only")]
+    fn an_anchor_that_lives_only_in_the_test_module_is_named_as_such() {
+        // `fn production_part(` is defined INSIDE this module, so it is present in mod.rs and
+        // absent from production — exactly the shape that used to be accepted silently.
+        at_in(&production_code(), "fn production_part(");
+    }
+
+    #[test]
+    #[should_panic(expected = "anywhere")]
+    fn an_anchor_that_exists_nowhere_says_so_differently() {
+        // assembled from pieces so that THIS line is not itself an occurrence of it
+        at_in(&production_code(), concat!("this-anchor-exists-", "in-no-file-at-all"));
+    }
+
+    /// ★S132 ④e 笔 0 — the third refusal, and the one ④e itself is about to trigger.
+    ///
+    /// ⚠ Driven on SYNTHETIC source on purpose. Pointing it at a real duplicated anchor in
+    /// `mod.rs` would make this test's meaning move with production code — and the whole point of
+    /// this refusal is to be the thing that notices when production code moves.
+    #[test]
+    #[should_panic(expected = "occurs 2 times")]
+    fn an_anchor_that_is_not_unique_in_production_is_named_as_such() {
+        let synthetic = format!(
+            "fn a() {{ twice_over(); }}\nfn b() {{ twice_over(); }}\n{}\nmod tests {{}}\n",
+            concat!("#[cfg", "(test)]")
+        );
+        at_in(&production_part(&synthetic), "twice_over()");
+    }
+
+    fn src_file(dir: &Path, name: &str, bytes: usize) -> String {
+        let p = dir.join(name);
+        std::fs::write(&p, vec![b'x'; bytes]).unwrap();
+        p.to_string_lossy().into_owned()
+    }
+
+    fn req_from(v: serde_json::Value) -> StartTrainingRequest {
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// THE load-bearing property of the shared project dataset: "已经是这份数据就一个字节都不动"
+    /// must be judged by CONTENT, and must need no bookkeeping.
+    ///
+    /// Two failures this pins down, both found by review:
+    /// * comparing `(产物名, 字节数)` cannot see an in-place edit — loudness normalisation and
+    ///   denoising rewrite a wav without changing its length. The import was skipped, python's
+    ///   fingerprint read the same untouched copies and matched too, every stale feature cache
+    ///   was reused, and the run trained on the pre-edit audio while reporting success.
+    /// * judging by a written-at-import ledger instead would have been exact but useless: a
+    ///   MIGRATED project has no such record, so every existing user would have been told
+    ///   their data was "changing" and blocked from the entire point of this refactor
+    ///   (一份数据喂多个架构).
+    #[test]
+    fn dataset_match_is_judged_by_content_and_needs_no_bookkeeping() {
+        let src = tmp_ws("plan_src");
+        let proj = tmp_ws("plan_proj");
+        let ds = proj.join("dataset");
+        // deliberately out of order and mixed-case extensions — the import sorts paths and
+        // lowercases extensions, and the plan must do the identical thing
+        let b = src_file(&src, "b.WAV", 10);
+        let a = src_file(&src, "a.flac", 20);
+        let mk = |files: Vec<String>| {
+            req_from(serde_json::json!({
+                "model_name": "t", "backend": "rvc", "version": "v2", "sample_rate": "40k",
+                "dataset_files": files, "total_epoch": 1, "batch_size": 1,
+            }))
+        };
+        let req = mk(vec![b.clone(), a.clone()]);
+        let plan = dataset_plan(&req, &assign_speaker_slugs(&req.speakers));
+        assert_eq!(
+            plan.iter().map(|i| i.rel.as_str()).collect::<Vec<_>>(),
+            vec!["000.flac", "001.wav"],
+            "names are positional in SORTED source order, extensions lowercased"
+        );
+        assert!(!dataset_matches(&ds, &plan), "nothing imported yet");
+
+        // import exactly as run_worker does — no ledger is written anywhere
+        std::fs::create_dir_all(&ds).unwrap();
+        for item in &plan {
+            let srcp = if item.rel.ends_with(".flac") { &a } else { &b };
+            std::fs::copy(srcp, ds.join(&item.rel)).unwrap();
+        }
+        assert!(
+            dataset_matches(&ds, &dataset_plan(&req, &assign_speaker_slugs(&req.speakers))),
+            "a migrated project has no bookkeeping either — content alone must answer this"
+        );
+
+        // ★ in-place edit, byte length unchanged → MUST read as changed
+        std::fs::write(&a, vec![b'y'; 20]).unwrap();
+        assert!(
+            !dataset_matches(&ds, &dataset_plan(&req, &assign_speaker_slugs(&req.speakers))),
+            "an edited source with the same size must never be judged unchanged"
+        );
+        std::fs::write(&a, vec![b'x'; 20]).unwrap();
+        assert!(dataset_matches(&ds, &dataset_plan(&req, &assign_speaker_slugs(&req.speakers))), "restoring content restores the match");
+
+        // a different selection is a mismatch, and so is a dataset someone deleted files from
+        assert!(!dataset_matches(&ds, &dataset_plan(&mk(vec![a.clone()]), &[])));
+        std::fs::remove_file(ds.join("000.flac")).unwrap();
+        assert!(!dataset_matches(&ds, &dataset_plan(&req, &assign_speaker_slugs(&req.speakers))));
+
+        // multi-speaker: per-speaker subdirectory keyed by the frozen slug
+        let m = req_from(serde_json::json!({
+            "model_name": "t", "backend": "sovits", "version": "4.1", "sample_rate": "44k",
+            "dataset_files": [],
+            "speakers": [
+                {"name": "歌姫", "files": [a.clone()]},
+                {"name": "second", "files": [b.clone(), a.clone()]},
+            ],
+            "total_epoch": 1, "batch_size": 1,
+        }));
+        let mplan = dataset_plan(&m, &assign_speaker_slugs(&m.speakers));
+        let slugs: Vec<String> =
+            assign_speaker_slugs(&m.speakers).into_iter().map(|(_, s)| s).collect();
+        assert!(mplan.iter().all(|i| slugs.iter().any(|s| i.rel.starts_with(&format!("{s}/")))));
+        let mds = tmp_ws("plan_multi").join("dataset");
+        for item in &mplan {
+            let dst = mds.join(&item.rel);
+            std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+            let srcp = if item.rel.ends_with(".flac") { &a } else { &b };
+            std::fs::copy(srcp, &dst).unwrap();
+        }
+        assert!(dataset_matches(&mds, &mplan));
+
+        for d in [src, proj, mds] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// 强制停止 during the import of a REPLACEMENT dataset must not cost the user the dataset
+    /// they already had. (The pre-S76 code `remove_dir_all`'d first, so an abort there was
+    /// unrecoverable; the swap exists precisely to make the failure path restore.)
+    #[test]
+    fn dataset_swap_restores_on_failure_and_reclaims_on_commit() {
+        let proj = tmp_ws("swap");
+        let ds = proj.join("dataset");
+        std::fs::create_dir_all(&ds).unwrap();
+        std::fs::write(ds.join("000.wav"), b"original").unwrap();
+
+        // abandoned (abort / error / panic): the old dataset comes back untouched
+        {
+            let _swap = DatasetSwap::begin(&ds).unwrap();
+            std::fs::create_dir_all(&ds).unwrap();
+            std::fs::write(ds.join("000.wav"), b"half-written replacement").unwrap();
+        }
+        assert_eq!(std::fs::read(ds.join("000.wav")).unwrap(), b"original");
+        // and nothing is left lying around inside the project
+        assert!(
+            std::fs::read_dir(&proj).unwrap().flatten().all(|e| {
+                !e.file_name().to_string_lossy().starts_with(".dataset.old")
+            }),
+            "an orphaned aside copy would be counted in the project size forever"
+        );
+
+        // committed: the replacement stands and the old copy is reclaimed
+        {
+            let mut swap = DatasetSwap::begin(&ds).unwrap();
+            std::fs::create_dir_all(&ds).unwrap();
+            std::fs::write(ds.join("000.wav"), b"new").unwrap();
+            swap.commit();
+        }
+        assert_eq!(std::fs::read(ds.join("000.wav")).unwrap(), b"new");
+        assert!(std::fs::read_dir(&proj).unwrap().flatten().all(|e| {
+            !e.file_name().to_string_lossy().starts_with(".dataset.old")
+        }));
+
+        // a first import (nothing to replace) is a no-op that still commits cleanly
+        let fresh = tmp_ws("swap_fresh");
+        let mut s = DatasetSwap::begin(&fresh.join("dataset")).unwrap();
+        s.commit();
+
+        for d in [proj, fresh] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// Identity is now「模型名 → 项目 → 架构槽」, and sovits_diff deliberately resolves to the
+    /// sovits slot — shallow diffusion shares the main model's preprocessing caches, which is
+    /// the entire reason it exists.
+    #[test]
+    fn slot_path_maps_backend_to_family_and_never_escapes_the_project() {
+        let data = std::env::temp_dir().join(format!("utai_slot_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(data.join("training")).unwrap();
+        let p = tproject::resolve_or_create(&data, "歌姫テスト").unwrap();
+        for (backend, family) in [
+            ("rvc", "rvc"),
+            ("sovits", "sovits"),
+            ("sovits_diff", "sovits"),
+            ("sovits_v2", "sovits_v2"),
+            ("vocoder", "vocoder"),
+        ] {
+            let got = slot_path(&data, "歌姫テスト", backend);
+            assert_eq!(got, tproject::project_dir(&data, &p.id).join(family));
+        }
+        // an unknown name resolves to a path that cannot exist, so `.exists()` probes answer
+        // false instead of erroring — and it must still land under the training root
+        assert!(slot_path(&data, "nobody", "rvc").starts_with(data.join("training")));
+        let _ = std::fs::remove_dir_all(data);
+    }
+}

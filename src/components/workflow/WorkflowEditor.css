@@ -1,0 +1,268 @@
+.workflow-editor {
+  /* Docked as an in-flow bottom panel (height set inline by the split container). Was a full-screen
+     overlay (position:absolute; inset:0); now it really occupies layout height so the track area
+     above genuinely shrinks and its scroll/hit geometry self-corrects. */
+  position: relative;
+  flex: none;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-deep, #080c16);
+  border-top: 1px solid var(--border-default);
+}
+
+.workflow-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 36px;
+  padding: 0 var(--space-xl);
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.workflow-title {
+  font-size: var(--font-size-sm);
+  color: var(--accent-secondary);
+  font-weight: 600;
+  font-family: var(--font-mono);
+  letter-spacing: 0.5px;
+}
+
+.workflow-header-left {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.workflow-header-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.wf-run-btn {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 16px;
+  height: 24px;
+  background: var(--accent-primary);
+  border: 1px solid var(--accent-primary);
+  color: var(--text-inverse);
+  cursor: pointer;
+  font-family: var(--font-mono);
+  letter-spacing: 0.5px;
+}
+
+.wf-run-btn:hover:not(:disabled) {
+  background: var(--accent-primary-dim);
+}
+
+.wf-run-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.wf-run-btn.running {
+  background: var(--color-warning);
+  border-color: var(--color-warning);
+}
+
+.wf-preset-select {
+  font-size: 11px;
+  height: 24px;
+  max-width: 150px;
+  background: var(--bg-base);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-default);
+  padding: 0 4px;
+  font-family: var(--font-mono);
+}
+
+.wf-error {
+  font-size: 10px;
+  color: var(--color-error);
+  font-family: var(--font-mono);
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workflow-close {
+  background: none;
+  border: 1px solid var(--border-default);
+  color: var(--text-muted);
+  font-size: 14px;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  font-family: var(--font-mono);
+}
+
+.workflow-close:hover {
+  color: var(--color-error);
+  border-color: var(--color-error);
+}
+
+.workflow-body {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+  position: relative;
+}
+
+/* 左侧节点面板的折叠/展开按钮：竖排在面板与画布之间；折叠后贴左侧。 */
+.palette-collapse {
+  flex: 0 0 auto;
+  align-self: stretch;
+  width: 14px;
+  padding: 0;
+  border: none;
+  border-left: 1px solid var(--border-subtle);
+  border-right: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+  color: var(--text-muted);
+  font-size: 8px;
+  cursor: pointer;
+  writing-mode: vertical-rl;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.palette-collapse.open {
+  border-left: none;
+}
+.palette-collapse:hover {
+  color: var(--accent-primary);
+  background: var(--bg-hover);
+}
+
+.workflow-canvas {
+  flex: 1;
+  position: relative;
+}
+
+/* ── React Flow overrides ── */
+
+.workflow-canvas .react-flow__node {
+  border: none;
+  background: none;
+  box-shadow: none;
+  font-size: var(--font-size-sm);
+  color: var(--text-primary);
+}
+
+/* ReactFlow tags every node with its own `.selectable` class (meaning "clickable"). That collides
+   with our GLOBAL `.selectable` copyable-content allowlist (global.css), which was unintentionally
+   re-enabling `user-select: text` on ALL node chrome — so node labels/params became drag-selectable.
+   Force selection back off for the node subtree here (higher specificity wins regardless of import
+   order); the param inputs keep their own text selection so model paths / numbers stay editable. */
+.workflow-canvas .react-flow__node,
+.workflow-canvas .react-flow__node * {
+  -webkit-user-select: none;
+  user-select: none;
+}
+.workflow-canvas .react-flow__node input,
+.workflow-canvas .react-flow__node textarea {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.workflow-canvas .react-flow__node.selected .wf-node {
+  border-color: var(--accent-primary);
+  box-shadow: 0 0 0 1px var(--accent-primary), 0 0 16px rgba(57, 197, 187, 0.15);
+}
+
+/* S66 手感: bigger square ports (xyflow's base sheet rounds them 100% — force the house
+   angular look), a 24px INVISIBLE hit zone (::after participates in the handle's pointer
+   hit-testing, so grabbing a wire no longer needs pixel-precision), and hover/connect glow.
+   Geometry stays constant on hover (only glow/color change) so ports never jump under the
+   cursor; the ReactFlow `connectionRadius` prop covers the drop-end snapping. */
+.workflow-canvas .react-flow__handle {
+  width: 10px;
+  height: 10px;
+  border-radius: 1px;
+  background: var(--accent-primary);
+  border: 2px solid var(--bg-surface);
+}
+
+.workflow-canvas .react-flow__handle::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 24px;
+  height: 24px;
+  transform: translate(-50%, -50%);
+}
+
+.workflow-canvas .react-flow__handle:hover,
+.workflow-canvas .react-flow__handle.connectingfrom,
+.workflow-canvas .react-flow__handle.connectingto,
+.workflow-canvas .react-flow__handle.react-flow__handle-connecting,
+.workflow-canvas .react-flow__handle.react-flow__handle-valid {
+  background: var(--accent-primary-bright, var(--accent-primary));
+  border-color: var(--accent-primary);
+  box-shadow: 0 0 7px var(--accent-primary);
+}
+
+.workflow-canvas .react-flow__handle-left {
+  left: -5px;
+}
+
+.workflow-canvas .react-flow__handle-right {
+  right: -5px;
+}
+
+.workflow-canvas .react-flow__edge-path {
+  stroke: var(--accent-primary-dim);
+  stroke-width: 2;
+}
+
+/* Edge affordances (classes set by WorkflowEditor displayEdges — same predicate as the delete veto).
+   A wire that CAN be cut/re-wired right now lights up under the cursor; a render-locked wire (its
+   consumer is queued/running in the live run) dims and refuses with a not-allowed cursor. */
+.workflow-canvas .react-flow__edge.wf-edge-free:hover .react-flow__edge-path {
+  stroke: var(--accent-primary-bright);
+  stroke-width: 3;
+  filter: drop-shadow(0 0 4px var(--accent-primary-glow));
+}
+.workflow-canvas .react-flow__edge.wf-edge-locked,
+.workflow-canvas .react-flow__edge.wf-edge-locked * {
+  cursor: not-allowed;
+}
+.workflow-canvas .react-flow__edge.wf-edge-locked .react-flow__edge-path {
+  opacity: 0.55;
+}
+/* Selected edge: xyflow's own .selected rule (stroke #555) outranks the base rule above now that the
+   inline default style is gone — without this override a click-selected edge reads as "locked/dim". */
+.workflow-canvas .react-flow__edge.selected .react-flow__edge-path {
+  stroke: var(--accent-primary);
+}
+
+.workflow-canvas .react-flow__controls {
+  overflow: hidden;
+  border: 1px solid var(--border-subtle);
+}
+
+.workflow-canvas .react-flow__controls button {
+  background: var(--bg-panel);
+  border: none;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  width: 24px;
+  height: 24px;
+}
+
+.workflow-canvas .react-flow__controls button:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.workflow-canvas .react-flow__minimap {
+  border: 1px solid var(--border-subtle);
+}

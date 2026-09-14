@@ -1,0 +1,905 @@
+# 训练链验证关卡（①b，S37 起）
+
+方法论同 `converter/verify/README.md`：**参照物永远是原版仓库的真实执行，绝不自证**。
+本目录覆盖 RVC 训练链（关卡0/1）、SoVITS 训练链（gate0_sovits_* / gate1_sovits_*）
+与浅扩散 train_diff 链（gate0_diff_* / gate1_diff_* + regress_extract_sovits，S39，
+见文末章节）；声码器阶段落地时在此追加。
+
+原版参照：`D:\MyDev\RVC\RVC20240604Nvidia`（20240604 NVIDIA 整合包，自带 runtime =
+python3.9 + torch 2.0.0+cu118 + fairseq 0.12.2 + librosa 0.9.1）。
+测试数据：`D:\MyDev\TESTING\Kazano_Sayo\dataset1.wav` 切出的 3×60s 段
+（`D:\MyDev\TESTING\utai-v2-testing\gate_dataset`，48k 立体声干声，未切片）。
+所有中间产物在 `D:\MyDev\TESTING\utai-v2-testing\`（不进 git）。
+
+## 关卡0 —— 预处理对拍（切片/f0/特征/filelist/index）
+
+> ⛔⛔ **S135 起，别再照抄下面这几行手敲。** gate0 的 compare 现在要求环境变量 `GATE0_T0`
+> （本轮起始 epoch 秒）——**没有它就没有新鲜度判据**，分不出读到的产物是今天算的还是七月的，
+> 脚本会以 `exit 3`（不可归因）拒绝，而不是给你一个没有意义的绿。
+> ⇒ **一律用跑器**：
+> ```
+> training\.venv\Scripts\python.exe converter\verify\training\run_gate0_chain.py all --clear
+> ```
+> 它负责钉 t0、按硬顺序跑五条链（sovits 的 prepare 产 `sovits_slices`，v2 与两条 C1 都吃它；
+> diff 的 prepare 源是 `sovits_ours/dataset_44k/gate`）、把每段分开报（出口码七档），
+> 并且**清货是"删目录"而不是"清空目录"**——compare 的守卫只看 `isdir`，
+> 清空会打印 `max|Δ|=0.000e+00` 的**假 PASS**，删掉才会正确地红。
+> ⚠ 下面这几行原始命令保留下来是为了说清**每一段到底在干什么**，不是操作配方。
+> ⚠ ③ 那句「见本 README 末尾内联脚本」是**从来没存在过**的（S135 用 `git log -S` 全历史核过）；
+> `rvc_fairseq_fp32` 今天不用重建，`gate0_compare.py` 已把它连同另外两份冻结参照
+> 用 `expect_sha` 钉死——它们被换掉会当场红，而不是只换一行日期。
+
+```
+# ① 原版侧（ground truth，用原版自带 runtime，cwd=RVC 根）：
+#    ⛔ S135 起 rvc_orig 改判【冻结参照，DO-NOT-TOUCH】：它是「不变输入 × 不变上游代码」
+#       的函数，而且 3_feature768 是 CUDA/TF32 产物、不逐位可复现 ⇒ 重跑反而换掉参照物。
+cd D:\MyDev\RVC\RVC20240604Nvidia
+runtime\python.exe infer\modules\train\preprocess.py <gate_dataset> 48000 4 <rvc_orig> True 3.7
+runtime\python.exe infer\modules\train\extract\extract_f0_rmvpe.py 1 0 0 <rvc_orig> True
+runtime\python.exe infer\modules\train\extract_feature_print.py cuda 1 0 <rvc_orig> v2 False
+# ② f0 fp32 参照（原版 CPU 分支，喂"我们的"16k wav → rvc_B2_orig）：
+runtime\python.exe infer\modules\train\extract\extract_f0_print.py <rvc_B2_orig> 1 rmvpe
+# ③ 特征 fp32 参照（真 fairseq CPU，生成 rvc_fairseq_fp32 —— 见本 README 末尾内联脚本）
+# ④ 我方侧 + 对拍：
+training\.venv\Scripts\python.exe converter\verify\training\gate0_run_ours.py
+training\.venv\Scripts\python.exe converter\verify\training\gate0_compare.py
+```
+
+**S37 实测读数（2026-07-05，全 PASS）：**
+
+| 层 | 项 | 读数 |
+|---|---|---|
+| A | 0_gt_wavs 切片链（解码→48Hz高通→slicer→3.7s窗→归一） | **逐位 0.0**（51/51 文件） |
+| A | 1_16k_wavs | min SNR 39.1 dB（librosa 版本轴，见下） |
+| A | f0 / coarse / 特征 | 0.75% / 1.9% / cos 0.985（GPU+重采样轴叠加，松线） |
+| C | f0 定审（双方 fp32 CPU） | **0/10534 帧超 0.5Hz、0 清浊翻转、max 0.24 mHz** |
+| C | 特征定审（真 fairseq fp32 CPU vs 我们 ContentVec onnx） | **max 7.7e-4，min cos = 1−1e-9**（51 文件） |
+
+### 调查中钉死的数值轴（复跑对拍时勿再踩）
+1. **librosa 0.9.1 (kaiser_best) vs ≥0.10 (soxr_hq)**：16k 重采样单行同名调用，
+   版本默认 res_type 不同 → ~39dB。代码同构，属环境轴。
+2. **原版特征脚本永远 `.to("cuda")`**（argv 的 device 会被 `torch.cuda.is_available()`
+   覆盖）→ cudnn TF32 卷积噪声 ~1e-2 弥散差；且 **`CUDA_VISIBLE_DEVICES=`（空值）在
+   Windows 上等于删除变量**（Windows 无空环境变量），根本藏不住 GPU —— 要禁用必须
+   `CUDA_VISIBLE_DEVICES=-1`。我们 runner 的 CPU 模式因此用 `"-1"` 哨兵。
+3. **原版 f0 的 is_half 是字符串**（`"False"` 恒真）→ NVIDIA 上事实恒 half。我们
+   extract_f0 默认 CUDA=half 对齐该行为；fp32 CPU 定审用显式参数。
+4. 半精度/跨 torch 版本的 f0 残差是清浊边界/八度歧义帧（10/10534 帧，含一个
+   257↔130Hz 八度翻转），训练数据容差内。
+
+## 关卡1 —— 训练等价（逐 step loss 轨迹 vs 原版 train.py）
+
+> ### ⛔⛔⛔ 先读这一段(S139 重写) —— 下面五节 gate1 共用
+>
+> **⑴ 一律用跑器,别手敲各段。**
+> ```
+> training\.venv\Scripts\python.exe converter\verify\training\run_gate1_chain.py rvc
+> training\.venv\Scripts\python.exe converter\verify\training\run_gate1_chain.py all
+> training\.venv\Scripts\python.exe converter\verify\training\run_gate1_chain.py --selftest
+> ```
+> 理由:五条 compare **现在要求跑器钉的 `GATE1_T0`**(新鲜度)。没有它会响亮判 **exit 3
+> (不可归因)**,而不是给你一个没有意义的绿 —— S139 实测:拿一份 **2026-07-07** 的 jsonl
+> 喂给八月的参照,旧版打出的 `ALL PASS (30 steps compared)` 与 S134 的转录**逐字符相同**。
+>
+> **⑵ ⛔ 默认【不跑】 `*_prepare.py`,而这份 README 以前的第一行正是叫你跑它。**
+> 它们首句就是 `shutil.rmtree` 双侧 expdir:rvc = `RVC\logs\gate1`(**1.39 GB**)+
+> `gate1_ours`(**2.93 GB**);声码器那条 = `SingingVocoders\experiments\gate1_voc`
+> (**3.66 GB**,S134 声码器我方侧**唯一**证据)+ `TESTING\gate1_vocoder`(**5.54 GB**)。
+> 要重建夹具:`--rebuild-fixtures` **且** 环境变量 `GATE1_ALLOW_REBUILD=1`,
+> 跑器会先把每条要删的路径 + 件数 + 体积逐行打出来。
+> ⚠ 这条与本文件末尾「⛔ 绝不许调任何 `*_prepare.py`」是**同一条**;此前两处相隔 746 行、
+> 分属不同标题,而**前面那条在教人做后面那条禁止的事**。
+>
+> **⑶ 出口码(与 `run_gate0_chain.py` 同一张表):**
+> `0` PASS · `1` **compare 判负(★ 只有这一种是「被测的东西不对」)** · `2` prepare 失败 ·
+> `3` 原版侧失败 · `4` 我方侧失败 · `5` 用法/夹具缺件 · `6` 读数不可归因 ·
+> **`7` 历史对拍判负(S140 新增,gate1 独有)**。
+> ⚠ **`all` 的退出码按【严重度】取,不是「第一条非零」**(S140 修):此前 rvc 排第一,
+> 一条 exit 6(语义是「重跑一次就好」)会把后面四条链里**任何一条真红整个盖住**。
+> 汇总最后一行会打 `EXIT=n 因为 <哪条链>`。⛔ 跑完**别只看 `$LASTEXITCODE`**,逐条读汇总的五个 rc。
+>
+> **⑸ ⭐ 每条链现在有【五段】:`1_prepare / 2_orig / 3_ours / 4_compare / 5_history`。**
+> 第 5 段 = `gate1_history_compare.py`,它问的是与 `4_compare` **不同的问题**:
+> 「自上一次跑 gate1 以来的那些 commit,**数值上动过什么吗**」——
+> 主判据是「**除 `eta_secs` 外整份 jsonl 归一化后逐字节相同**」(声码器那条走 TB,11 tag / 143 点),
+> 两个基线 = 七月(`s134_f7\baseline_backup\_loose`)与 08-11(`s135_f7\backup_pre_gate0\root_files`),
+> 两侧都由 `declare_frozen` 的 `expect_sha` 逐字节钉住。
+> ⛔ **它的前身 `TESTING\s134_f7\compare_vs_history.py` 别再跑** —— S140 实测它整条链上
+> 没有一处能红(新鲜度守卫是单调恒真的谓词 / 缺件走静默绿 / 地板是 `步数×5` 而真实分量数
+> 是 6/7/10/2 / NaN 恒不可见)。同一天同一份盘:老脚本**一条链都没跑**就打四行
+> `BITWISE-SAME` 退 **0**,新闸退 **3** 并点名「不是本轮产物」。旁边有 `.SUPERSEDED.md`。
+>
+> **⑹ ⛔ 声码器那条链:`2_orig` 段会删 3.66 GB,而它【不受 `--rebuild-fixtures` 管辖】。**
+> `gate1_vocoder_run_orig.py` 在 import 期无条件 rmtree
+> `SingingVocoders\experiments\gate1_voc`(= S134 声码器**原版侧**唯一在盘证据 ——
+> 上面 ⑵ 此前把它写成「我方侧」,照那句话去备份会拷错一棵树;我方侧是
+> `TESTING\gate1_vocoder\ours`)。S140 起它由 `orig_wipes` 走**同一道** `GATE1_ALLOW_REBUILD` 联锁。
+>
+> **⑷ ⚠ torch 轴:下面各节写的「双方同 torch(2.5.1)」是【陈货】。**
+> 经跑器跑时 rvc / sovits / diff / vocoder 用的是 `envs\s42_staging_nv_cu130`
+> (**torch 2.11.0+cu130**,= 出货 runtime pack 的版本),只有 sovits_v2 用 `.venv`(2.5.1)。
+> **两侧仍然是同一个**(代码轴照样隔离)。S134 §3 记过这件事,四个月没改到文件里;
+> 现在实际版本由 `gate1_guard.header` **每一跑打进转录**,别再靠这几行散文。
+
+同一份预处理产物（关卡0 的 rvc_ours）+ 同 filelist 行序 + 同 seed(1234) + 同底模
+(f0G48k/f0D48k v2) + **双方 fp32 CPU（确定性）** + 两侧同一个 torch（见上面 ⑷）。
+原版侧读 tensorboard events（stdout 只有 3 位小数）。
+
+```
+training\.venv\Scripts\python.exe converter\verify\training\run_gate1_chain.py rvc
+```
+⚠ 原版侧现在由仓内的 `gate1_run_orig.py` 驱动。**此前这里写的是一行手拼命令**
+（`USE_LIBUV=0 ... -e gate1 -sr 48k ... -pg <f0G48k> ...`），而 S134 建那个驱动时
+逐字写下了它跑不通的两个理由:① `USE_LIBUV=0 <cmd>` 是 **bash 前缀语法**,PowerShell/cmd
+下不是合法命令;② 参数里全是 `<f0G48k>` 这种占位符,而**人手拼参数正是「跑出来的红说不清
+是闸还是被测对象」的高发区**(S129 铁律)。⇒ 那一行已删。
+
+**S37 实测读数（全 PASS，30/30 step 对齐）：**
+
+| 分量 | max 相对差 | mean 相对差 |
+|---|---|---|
+| loss/g/total | 1.2e-8 | 5.9e-9 |
+| loss/d/total | 1.3e-7 | 6.7e-8 |
+| loss/g/fm | 8.6e-8 | 3.8e-8 |
+| loss/g/mel | 1.9e-8 | 8.2e-9 |
+| loss/g/kl | 1.8e-7 | 6.5e-8 |
+
+= float32/TB 序列化噪声级：vendored 训练循环对原版逐 step 复刻。
+
+### 复跑注意
+- 训练 venv 的 **matplotlib 必须 ==3.7.5**（原版 utils.plot 用 `np.fromstring/
+  tostring_rgb`，mpl≥3.8 删除；我们 vendored 版已换 `buffer_rgba` 双兼容）。
+- 原版 train.py 正常完训是 `os._exit(2333333)`；我们的 runner 在发完协议 `done`
+  之后 `os._exit(0)`（DataLoader spawn worker 在 Windows 上会吊死解释器退出）。
+  ⛔ **这个数在两个地方读出来【不一样】,而两处此前各只写了一个**(S139 实测):
+  `subprocess.run(...).returncode` 拿到的是 **2333333**;shell(`$?` / `$LASTEXITCODE`)
+  拿到的是 **2333333 & 0xFF = 149**。⇒ `run_gate1_chain.py` 是 python,它的
+  `orig_ok=(0, 2333333)` 认前者;谁按本 README 末尾那句写一个 `if ($LASTEXITCODE -ne 149)`
+  的 PowerShell 包装,就会把 python 侧的 2333333 判成失败 —— 那正是 S134 亲口记下的
+  「第一版跑器把这次**成功**报成了 ORIG-FAILED」的第二次发作,而那条被它自己称作
+  **S129 铁律的反面教材**。
+- 协议 stdout 一律 UTF-8（Reporter 构造时 reconfigure —— 本机是 cp932 控制台，
+  没这条中文 message 直接 UnicodeEncodeError）。
+- 两侧数据顺序由 filelist 行序+seed 决定，与路径字符串无关（gate1_prepare 校验
+  行序一致）。
+
+## 已知有意偏离（vendored vs 原版，全部有注释标注在对应文件头）
+- 预处理串行化（逐文件数学不变）；每次运行重建切片目录（防换数据集后的陈旧切片
+  污染 filelist —— 上游同款 bug 的修复）。
+- ContentVec 提取改用项目自有 onnx（本关卡 C 层定审 7.7e-4/cos 1−1e-9），顺带
+  消灭 fairseq 依赖，并保证训练特征空间 == 推理特征空间（同一张图）。
+- 检索库跳过 faiss：运行时本来就是暴力精确检索原始矩阵（total_fea 语义不变，
+  >2e5 行 MiniBatchKMeans 压缩保留）；faiss 的 ANSI 窄字符路径雷一并消失。
+- 检索库在特征提取后立即生成（原版在训练完成后）——早停也必有 index。
+- best 快照 = loss_mel 的 EMA(~100 step) 启发式（GAN 无验证集，见训练页 UI 标注）；
+  ckpt 原子写；停止旗标每 step 检查。
+
+---
+
+# SoVITS 训练关卡（S38 起，gate0_sovits_* / gate1_sovits_*）
+
+原版参照：`D:\MyDev\so-vits-svc\so-vits-svc`（4.1-Stable @ 730930d，代码零改动）。
+**「原版时代环境」= RVC 整合包 runtime**（python3.9 + torch 2.0.0 + torchaudio
+2.0.1+cpu + fairseq 0.12.2 + librosa 0.9.1）—— so-vits requirements 自己钉的就是
+librosa==0.9.1 / fairseq==0.12.2，与 RVC 整合包同代；so-vits 伴生 venv 是半空的
+（无 fairseq/librosa），fairseq 无 Windows wheel，此 runtime 是本机唯一能真跑
+原版预处理的环境。中间产物在 `D:\MyDev\TESTING\utai-v2-testing\sovits_*`。
+
+⚠️ **rmvpe 是两个血统**：`aux/rmvpe.pt` = RVC 版（裸 state_dict 的 E2E）；so-vits
+vendored 的是 yxlllc/RMVPE 分支（E2E0，多 60 个 `unet.tf.*` 键，`{'model': sd}`
+包装）→ 训练资产 `data/models/training/sovits/rmvpe.pt`（yxlllc release 230917 的
+model.pt）。两个文件**不可互换**（本关卡首跑就是被这个炸出来的）。
+
+## 关卡0 —— 预处理对拍
+
+```
+# ① 切片（双方共同输入；上游无切片器，README 指定同款 openvpi 工具）：
+training\.venv\Scripts\python.exe converter\verify\training\gate0_sovits_prepare.py
+# ② 原版侧（RVC runtime 原样跑 resample/flist/hubert_f0 + vencoder oracle，CPU fp32）：
+D:\MyDev\RVC\RVC20240604Nvidia\runtime\python.exe converter\verify\training\gate0_sovits_orig.py
+# ③ 我方侧 + C1 + 对拍：
+training\.venv\Scripts\python.exe converter\verify\training\gate0_sovits_run_ours.py
+D:\MyDev\RVC\RVC20240604Nvidia\runtime\python.exe converter\verify\training\gate0_sovits_c_resample.py
+training\.venv\Scripts\python.exe converter\verify\training\gate0_sovits_compare.py
+```
+
+原版侧 harness 补丁（零数值影响，脚本头注释登记）：loguru 桩、ProcessPoolExecutor
+→串行内联（runpy __main__ 无法被 spawn unpickle）、repo configs 快照/恢复、
+pretrain/rmvpe.pt 补入（双方同一权重文件）。
+
+**S38 实测读数（2026-07-05，全 PASS；gate 数据 = 3×60s 切出 33 切片）：**
+
+| 层 | 项 | 读数 |
+|---|---|---|
+| C1 | resample 链代码轴（双方 librosa 0.9.1） | **逐位 0**（33/33 文件） |
+| C2 | ContentVec 768（同16k输入，onnx vs 真 fairseq fp32 CPU） | max 1.99e-4，min cos 0.99999984 |
+| C2 | ContentVec 256（同上） | max 7.4e-5，min cos 0.99999991 |
+| C3 | f0 定审（同44k输入，双方 fp32 CPU，torch 2.0↔2.5 轴） | **0/12389 帧超 0.5Hz、0 uv 翻转、max 0.6mHz** |
+| C4/C5 | spec / vol 定审（同44k输入，torch 2.0↔2.5 轴） | **逐位 0.0 / 0.0** |
+| A | 44k wav（librosa 0.9.1 kaiser_best vs 0.11 soxr_hq 轴） | min SNR 52.3 dB |
+| A | soft / spec / vol（输入轴叠加） | cos 0.987 / 55.6 dB / 94.6 dB |
+| A | f0 浊帧判据 | 浊帧 0.67% 超 0.5Hz，uv 翻转 0.15% |
+
+### 关卡0 钉死的数值轴/度量备忘
+1. **A 层 f0 必须只判双浊帧**：so-vits 后处理在清音区做线性插值填充，uv 边界帧随
+   输入(-52dB)漂移一帧即把锚点差扩散到整段清音区（全帧口径虚高到 9.3%，浊帧口径
+   0.67% —— 与 RVC A 层 0.75% 同级）。C3 已证同输入下代码 0 帧差。
+2. spec/vol 在 torch 2.0 vs 2.5 之间**逐位一致**（CPU fp32 的 stft/unfold 未变）。
+
+## 关卡1 —— 训练等价（逐 step loss 轨迹 vs 原版 train.py）
+
+```
+⛔ 先读「关卡1」那一节开头的 S139 告示(用跑器 / prepare 默认不跑 / 出口码 / torch 轴)。
+training\.venv\Scripts\python.exe converter\verify\training\run_gate1_chain.py sovits
+# ⛔ 下面这几行是**各段的实际内容**,不是操作指示 —— prepare 会 rmtree 双侧 expdir。
+training\.venv\Scripts\python.exe converter\verify\training\gate1_sovits_prepare.py
+training\.venv\Scripts\python.exe converter\verify\training\gate1_sovits_run_orig.py
+training\.venv\Scripts\python.exe converter\verify\training\gate1_sovits_run_ours.py ^
+    > D:\MyDev\TESTING\utai-v2-testing\gate1_sovits_ours_steps.jsonl
+training\.venv\Scripts\python.exe converter\verify\training\gate1_sovits_compare.py
+```
+
+同一份关卡0 我方预处理产物（filelist 绝对路径双方直读）+ 同 seed(1234) + 同底模
+(vec768 G_0/D_0) + **双方 fp32 CPU + 同一个 torch(2.5.1)**（我们 venv 跑原版
+train.py 未改文件 —— 隔离代码轴，RVC 关卡1 同款）。原版侧 shim（只动执行环境：
+faiss 桩 / Tensor·Module.cuda→恒等 / DDP 剥 device_ids / 绕过 mp.spawn 直调
+run(0,1,hps) / gloo env + USE_LIBUV=0）。config: all_in_mem=true（双方
+num_workers=0）、vol_embedding+vol_aug=true（覆盖响度增强随机路径）、log_interval=1。
+
+**S38 实测读数（全 PASS，16/16 step 对齐）：**
+
+| 分量 | max 相对差 | mean 相对差 |
+|---|---|---|
+| loss/g/total | 1.6e-8 | 5.8e-9 |
+| loss/d/total | 1.7e-7 | 9.7e-8 |
+| loss/g/fm | 1.6e-7 | 6.2e-8 |
+| loss/g/mel | 2.4e-8 | 1.0e-8 |
+| loss/g/kl | 1.7e-7 | 7.5e-8 |
+| loss/g/lf0 | 2.4e-4 | 6.9e-5 |
+
+lf0 的 2.4e-4 是相对量纲效应：lf0 值域小（~1e-2），绝对差 ~1e-6 与其他分量同级；
+g_total（包含 lf0，值域 ~40）1.6e-8 证明合成完整。so-vits **没有** RVC 的
+mel>75/kl>9 显示夹取（TB 记原始值），对拍脚本无 clamp。
+
+### SoVITS 关卡复跑注意
+- 关卡1 前置依赖关卡0 我方产物（sovits_ours 的 filelists/config/特征）。
+- 原版侧 gate1 在 so-vits repo 里留下 `logs/gate1_sovits/`（gitignore 外目录，
+  复跑由 prepare 清理重建；repo 代码零改动）。
+- SoVITS 训练侧 vendored 有意偏离（全部登记在对应文件头）：预处理串行化 / 切片
+  统一用 slicer2（上游要求用户手切，同款工具同默认参数）/ 响度归一默认关（上游
+  默认开但其 README 自认损音质；关卡里双方都开）/ ContentVec 用项目 onnx /
+  filelist 种子化 shuffle + UTF-8（上游 locale 写 UTF-8 读 = CJK mojibake 雷修复）/
+  rmvpe 每 run 构造一次（上游每文件重载 180MB）/ kmeans 用上游 use_minibatch 代码
+  路径（默认全量 KMeans 万级中心不可行）且 n_clusters 截到行数 / DataLoader
+  persistent_workers（Windows spawn 每 epoch 重启 worker 之灾）/ 停止旗标逐 step /
+  ckpt 原子写 / best=EMA(mel) / 完训补存 latest G/D + release 导出
+  （compress_model 语义：去 enc_q + fp16）。
+
+---
+
+# SoVITS 4.0-v2 训练关卡（S68 批4，gate0_sovits_v2_* / gate1_sovits_v2_*）
+
+原版参照：`D:\MyDev\TESTING\SoVITS-4.0_v2\src\so-vits-svc`（官方 4.0-v2 分支
+@cf5a8fb 逐字节快照，代码零改动）。vendored 树 = `training/utai_train/sovits_v2/`
+（models/data_utils/utils/modules 均 verbatim + 登记偏差；编排层最大化复用
+sovits 包单源件：slicer2/augment/cache/cluster/flist split/base 播种）。
+
+## 关卡0 —— 预处理对拍（A/C/S 三层，2026-07-17 全 PASS）
+
+```bat
+# ① 原版侧（RVC runtime；resample/flist/hubert_f0(dio) + ContentVec/aam-mel oracle）：
+D:\MyDev\RVC\RVC20240604Nvidia\runtime\python.exe converter\verify\training\gate0_sovits_v2_orig.py
+# ② 我方侧（training venv；loudnorm ON + trim top_db=20 + f0=dio 对齐上游）：
+training\.venv\Scripts\python.exe converter\verify\training\gate0_sovits_v2_run_ours.py
+# ③ C1（RVC runtime，resample 代码轴）+ 对拍：
+D:\MyDev\RVC\RVC20240604Nvidia\runtime\python.exe converter\verify\training\gate0_sovits_v2_c_resample.py
+training\.venv\Scripts\python.exe converter\verify\training\gate0_sovits_v2_compare.py
+```
+
+读数（33 切片，2026-07-17）：
+- **C1 resample 代码轴（同 librosa 0.9.1，top_db=20+loudnorm）：33/33 逐位 0**
+- **C2 ContentVec（oracle 16k 输入 → 我方 onnx vs 真 fairseq）：cos 1.00000000 / max 1.29e-4**
+- **C3 dio（同 44k 输入，我方 vendored vs 上游 .f0.npy）：坏帧 0 / 翻转 0（逐位）**
+- **C4 aam mel（同输入，librosa 0.9.1↔0.11 轴）：max 5.36e-7（帧数一致）**
+- A 层：44k wav min SNR 58.3 dB / soft cos ≥0.997868 / f0 双浊帧 2.2%·uv 翻转
+  1.2%（dio 对 -58dB 输入扰动的边界抖动 = 纯输入轴，代码轴由 C3 逐位定审）/
+  aam mel SNR ≥36.3 dB
+- S 层：filelist（val=2 / train+val=全部 ≥0.3s 合格片 / 无重叠）、检索矩阵
+  [4860,256] f32、config 语义对拍（spk/model/data 全等，train 白名单外全等）
+
+### 关卡0 钉死的数值轴（v2 新增，勿再踩）
+- **aam mel 的 stft pad_mode：上游 requirements 自己就平台分裂**——
+  requirements.txt 钉 librosa 0.8.1（stft 默认 'reflect'），requirements_win.txt
+  钉 0.9.2（0.9.0 起默认改 'constant'）⇒ 上游 Win/Linux 用户训练出的边缘帧 mel
+  本就不同。我方钉 **constant = Windows/0.9.x 血统**（与本项目「原版时代参照
+  环境」= RVC runtime librosa 0.9.1 一致，C4 实测 constant 对 oracle 5.4e-7、
+  reflect 边缘帧差 1.09）。差异仅边缘帧。
+- 上游 flist 对绝对 Windows 路径逐文件打中文警告 → cp932 控制台直接
+  UnicodeEncodeError（S40 坑单同族），orig 脚本必须先 reconfigure utf-8。
+- 上游 preprocess_hubert_f0/resample 用 multiprocessing Process/Pool →
+  runpy __main__ 无法 spawn unpickle → 串行内联补丁（4.1 关卡0 同款）。
+- 上游 test split（每歌手尾 2 片）我方并入 train（house 分裂策略；test.txt
+  训练根本不消费）——S 层按 ≥0.3s 合格片数对账。
+
+## 关卡1 —— 训练等价（逐 step loss 轨迹 vs 上游原生 cpurun）
+
+```bat
+⛔ 先读「关卡1」那一节开头的 S139 告示(用跑器 / prepare 默认不跑 / 出口码 / torch 轴)。
+training\.venv\Scripts\python.exe converter\verify\training\run_gate1_chain.py sovits_v2
+# ⛔ 下面这几行是**各段的实际内容**,不是操作指示 —— prepare 会 rmtree 双侧 expdir。
+training\.venv\Scripts\python.exe converter\verify\training\gate1_sovits_v2_prepare.py
+# 双侧同 torch 2.5.1（隔离代码轴）；上游 CUDA 被藏 → main() 自然落原生 cpurun：
+training\.venv\Scripts\python.exe converter\verify\training\gate1_sovits_v2_run_orig.py
+training\.venv\Scripts\python.exe converter\verify\training\gate1_sovits_v2_run_ours.py > D:\MyDev\TESTING\utai-v2-testing\gate1_sovits_v2_ours_steps.jsonl
+training\.venv\Scripts\python.exe converter\verify\training\gate1_sovits_v2_compare.py
+```
+
+- 参照 = **上游原生 cpurun**（v2 比 4.1 好移植的关键：CPU 路径无 DDP/dist/
+  mp.spawn，零 CUDA shim）——skip_optimizer=True / epoch·step 强制 1/0 起；
+  我方 train.py 的 `skip_optimizer` gate 旗镜像该语义（产品路径 = 上游 GPU
+  run() 的 skip_optimizer=False，继承底模 optimizer 态）。
+- orig 侧 harness 补丁（零数值，登记在脚本头）：root logger 抢占 / torch.stft
+  return_complex=False→True+view_as_real / torch.istft 实数输入→view_as_complex
+  / DataLoader num_workers 双侧钉 0 / data_utils.load_wav 同数学 shim。
+- **RNG 流对拍点**：上游在 global_step=0 必然命中 eval_interval 边界 →
+  evaluate() 消耗 torch RNG（z_p randn + 相位 rand）——我方 fresh 步号从 0 起、
+  step-0 evaluate 照跑（仅跳过 G_0/D_0 覆写与 release 导出，存盘不耗 RNG）。
+- **上游懒生成 `.mel.npy` vs 我方 `.aam80.npy`**：prepare 把 .aam80.npy 复制成
+  同目录 .mel.npy 让上游命中缓存 → 两侧消费逐字节相同的 mel（mel 生成轴由
+  关卡0 C4 单独定审）。
+- 对拍九分量（v2 TB tag ↔ 我方 losses 键）：loss/total↔g_total、mel、adv、fm、
+  mel_ddsp、spec_ddsp、mel_am、kl_div、lf0；max_rel ≤ 1e-3 过线；对齐步数
+  <10 直接 FAIL（防空交集假 PASS）。
+- **读数（2026-07-17）：14/14 step 对齐 × 9 分量全过，max_rel = 4.93e-5
+  （loss/lf0 @ step13 —— 小量纲分量的相对放大，S38 的 lf0 2.4e-4 同现象；
+  其余分量更低；结构性移植错误 = O(0.1~1)，判定=轨迹一致）。**
+
+---
+
+# 浅扩散 train_diff 关卡（S39 起，gate0_diff_* / gate1_diff_*）
+
+原版参照：`D:\MyDev\so-vits-svc\so-vits-svc`（4.1-Stable @ 730930d，代码零改动）。
+gate0 原版侧仍 = RVC 整合包 runtime（torch 2.0.0 / torchaudio 2.0.1+cpu /
+librosa 0.9.1）；gate1 双方 = 我们的 venv（torch 2.5.1，隔离代码轴，S37/S38 同款）。
+输入复用 S38 sovits gate 的 33 切片（同 44k wav 喂双方 = C 层；aug 抽样上界依赖
+max|wav|，输入轴会使 aug 产物不可比）。
+
+## gate0_diff —— --use_diff 预处理对拍（vol/mel/aug_mel/aug_vol）
+
+```
+training\.venv\Scripts\python.exe converter\verify\training\gate0_diff_prepare.py
+D:\MyDev\RVC\RVC20240604Nvidia\runtime\python.exe converter\verify\training\gate0_diff_orig.py
+training\.venv\Scripts\python.exe converter\verify\training\gate0_diff_run_ours.py
+training\.venv\Scripts\python.exe converter\verify\training\gate0_diff_compare.py
+```
+
+原版侧 harness（零数值影响，脚本头登记）：预置 soft/f0/spec（skip-if-exists 跳过
+→ 无需 fairseq/GPU）+ 逐文件直调 process_one（绕开 spawn 执行器与 shuffle——
+spawn 子进程不继承种子、shuffle 先消耗随机流）+ random.seed(1234) + sorted 文件序
++ configs 快照/恢复 + CUDA_VISIBLE_DEVICES=-1。我方侧 = extract_all(diff_mode=True,
+aug_seed=1234)（random.Random(1234) 与全局 random.seed(1234) 同 MT19937 流）。
+
+**S39 实测读数（2026-07-06，全 PASS；33 切片）：**
+
+| 项 | 读数 |
+|---|---|
+| .vol.npy | **逐位 0.0** |
+| .mel.npy（torch 2.0↔2.5 轴） | max_abs 9.5e-7 |
+| .aug_mel keyshift（随机流对齐证明） | **33/33 逐 draw 一致** |
+| .aug_mel 响亮位（ln-mel > -10） | max_abs 7.6e-6 |
+| .aug_mel 近 clamp 位 | max_abs 1.1e-4（12/21632 项，全部 ln<-10.1 = S36 记档的近 clamp ln 放大；变调路径非 2 幂 FFT 的 torch 版本轴） |
+| .aug_vol.npy（同响度 shift） | **逐位 0.0** |
+| librosa mel 滤波器组 0.9.1↔0.11 | **逐位一致**（melbasis_091.npy 留档） |
+
+## gate1_diff —— 训练等价（逐 step loss 轨迹 vs 原版 train_diff.py）
+
+```
+⛔ 先读「关卡1」那一节开头的 S139 告示(用跑器 / prepare 默认不跑 / 出口码 / torch 轴)。
+training\.venv\Scripts\python.exe converter\verify\training\run_gate1_chain.py diff
+# ⛔ 下面这几行是**各段的实际内容**,不是操作指示 —— prepare 会 rmtree 双侧 expdir。
+training\.venv\Scripts\python.exe converter\verify\training\gate1_diff_prepare.py
+training\.venv\Scripts\python.exe converter\verify\training\gate1_diff_run_orig.py
+training\.venv\Scripts\python.exe converter\verify\training\gate1_diff_run_ours.py
+training\.venv\Scripts\python.exe converter\verify\training\gate1_diff_compare.py
+```
+
+同 gate0 我方产物 + 同 vec768 底模 + 同 yaml（fp32 CPU / num_workers 0 /
+cache_all_data / batch 4 / interval_val 8 / 3 epochs = 24 步 = 我方 total_steps，
+完成判定与自然结束重合）。原版侧 harness：runpy 原样跑 train_diff.py + 种子 +
+loguru/faiss 桩 + librosa.get_duration(filename=)→path= shim（librosa 0.11 环境轴）。
+**≥2 个 interval_val 边界是硬要求**：第一个边界含 NsfHifiGAN 懒加载 Generator
+构造的 RNG 大块消耗，之后的不含——两段都逐 step 对齐才证明 RNG 消耗模型完整
+（vendored 代码严禁"预热优化"该懒加载）。
+
+**S39 实测读数（全 PASS）：**
+
+| 项 | 读数 |
+|---|---|
+| train/loss（24/24 步） | **max_rel 0.0（逐位一致）** |
+| validation/loss（交集 8/16） | **max_rel 0.0** |
+| validation/loss step 24 | 原版 TB 缓冲丢失（原版不 close SummaryWriter，flush_secs=120）→ 用原版 stdout 3 位小数补核：0.081 vs 0.081112 ✓ |
+
+## regress_extract_sovits —— 共享文件回归（S38 基线）
+
+```
+training\.venv\Scripts\python.exe converter\verify\training\regress_extract_sovits.py
+```
+
+extract.py 是 S38 主链共享文件（本次加 diff_mode 分支 + vol 门扩展）：对同输入
+全新跑非 diff 模式，与 S38 存档产物比对。**S39 读数：132 产物精确相等（.pt 按
+张量精确相等——S38 基线早于原子写修复，zip 档案根名不同属序列化元数据轴；
+.npy 逐字节），非 diff 模式零杂散 diff 产物。**
+
+## 冒烟（runner 直驱，TESTING/smoke_diff4{0,1}*.json）
+
+- run A：共享工作区（S38 smoke_sovits41）30 步完训——soft/f0/spec 缓存 mtime
+  与 S38 时代逐秒一致（增量承诺兑现），val 10/20/30，best/final，encoder_dim=768。
+- run B：续训至 60——首步 31 零跳号；存档清扫后恰保留 0/20/40/60/best（幸存者
+  网格 = 里程碑谓词）。
+- run C：优雅停 @130——stop 存档**含 optimizer**（periodic 不含 = save_opt 拆分
+  偏离），done(stopped)。
+- run D：停后续训至 150——best@110 跨续训保留（diffusion/best_state.json）。
+- 4.0：vec256 无底模从零训 + k_step_max=100（浅扩散 config）完训。
+- 转换链：export_diffusion.py 直接吃 model_150.pt + expdir/config.yaml（自动解析）
+  ——schedule 重算逐位 0、ORT sanity ≤3.1e-6、sidecar speakers = 中文显示名。
+- 三段式：主模型（S38 smoke）在 diff 之后续训 2 epochs 正常（G_91 续、GAN loss
+  健康、diffusion/ 产物无扰）。
+
+## ★S118 §F8⒜ 冒烟 —— 可续训快照（端到端,真的跑循环）
+
+```
+training\.venv\Scripts\python.exe -u D:\MyDev\TESTING\s118_f8a\smoke_diff_resume.py
+```
+
+**为什么它必须存在**：`gate_resume_state.py` 的 D 组驱动的是 `load_start_state` /
+`save_solo_snapshot` / `_sweep_old_checkpoints` 这些**函数**,一次也没有执行过
+`solver.train` 的循环 —— 而 `refresh_resume_point` / `capture_state` / `restore` /
+`report_drift` / best 那一段全在循环里。「所有单元判据都绿」在那种情况下什么也不证明
+（S117b 血训）。它不做成仓内 gate 是因为要 220 MB 底模 + 一个备好的工作区。
+
+素材：`TESTING\utai-v2-testing\smoke_sovits41` **复制**出一份（原件逐字节不动）,
+只带 `diffusion\model_0.pt` 过来 ⇒ 这一轮是「全新 + 播种底模」;
+yaml 覆盖 `interval_val=4 / interval_force_save=8 / batch_size=2 /
+amp_dtype=fp16`（★fp16 是硬要求 —— 否则 GradScaler 那一半根本没被跑到）;
+vocoder 指 live 数据根的 `nsf_hifigan\model`（仓内 `data\models\` 仍是炸仓后的空缺）。
+
+**S118 实测读数（2026-08-07,**20/20 PASS**,六轮共 ~60 s）：**
+
+| 轮 | 内容 | 读数 |
+|---|---|---|
+| 1 | 全新 8 步 | 两个快照都写出;`resume_latest\model.pt` = **631.9 MB**,`state.json` 带 scaler+四套 RNG+数据集指纹;编号网格 = `[0, 8]`（第 4 步被清扫器按里程碑谓词删掉 = 设计行为） |
+| 2 | 默认续训→12 | 选中 `latest_snapshot`;日志 `scaler=restored (scale=65536.0)` + `rng[numpy,python,torch_cpu,torch_cuda 全 restored]` + `dataset unchanged` + `items=9 / batches=5`;零警告 |
+| 3 | 从 best 回退→16 | 选中 `best`(step 8),`steps_this_run=8`;★埋进去的被放弃分支存档 `model_10.pt`（不在新分支的验证网格上）**活着** —— 旧的区间写法会在第 12 步的保存时删掉它 |
+| 4 | 落到不带 optimizer 的存档上 | 删掉两个快照 + 把最新那格改回周期保存的形状 ⇒ `warn == ["TRAINING_RESUME_OPTIMIZER_MISSING"]`,训练照常进行,收工后又有完整续训点（下一次不再警告） |
+| 5 | ★§F8⒡ 最新那格是**毒的** | 写一个 nan 的 `model_22.pt`（步号高于第 20 步的健康快照）⇒ 毒的被跳过、退回快照、`warn == ["TRAINING_RESUME_ARCHIVE_POISONED"]`,训练照常跑完。⚠ 第一版把毒写在**与快照同步号**那一格,warns 是空的 —— 而那是**行为比期望更好**:同步号平局归快照,毒的压根没被读 |
+| 6 | 连快照也毒了 | 两个候选都被响亮拒绝 ⇒ `RuntimeError("TRAINING_RESUME_ARCHIVE_POISONED: …")`,而不是拿 nan 接着练 |
+
+⚠ 复跑注意：脚本会**重建** `TESTING\s118_f8a\smoke_ws`（先 rmtree）,别把东西放在那里面。
+
+### train_diff 复跑注意
+- gate1 prepare 会清双侧 expdir；gate0 prepare 会清 diff_orig/diff_ours。
+- 原版侧 gate0 需要 diff_orig 里已预置 soft/f0/spec（prepare 负责）。
+- Reporter.stage 有 0.4s 节流：一次性通知（如"无扩散底模，将从零训练"）必须
+  force=True，否则会被同窗口的前一条吞掉（S39 冒烟实锤后已修）。
+
+---
+
+# 声码器微调（backend "vocoder"，S40）
+
+原版参照：`D:\MyDev\SingingVocoders`（openvpi/SingingVocoders @4d0889c 2026-03-08，MIT，
+PyTorch Lightning）。vendored → `training/utai_train/vocoder/`（登记偏离全在
+pipeline.py 模块头 + base_task_gan.py / training_utils.py 头注；设计+红队裁决全文 =
+`D:\MyDev\TESTING\utai-v2-testing\research\s40_vocoder_train_design.md` 附录 A）。
+
+## 环境轴（与 RVC/SoVITS 的"原版时代环境"不同——本链双侧同 venv）
+
+SingingVocoders 无 requirements/无钉版（librosa 仅 load+filters.mel、torch 2.x 兼容、
+parselmouth 无版本断言）→ gate0/gate1 双侧同 training/.venv：对拍面 = 纯代码轴。
+单列证据链：librosa 0.9.1↔0.11 滤波器组逐位（S39 留档）、torch CPU fp32 stft
+2.0↔2.5 逐位（S38 C4）、**parselmouth 0.4.2↔0.4.7 = gate0b 本次实测**（双版本同嵌
+Praat 6.1.38；9 切片 8094 浊帧 f0 逐位 0 差、0 清浊翻转）：
+```
+<second venv>  gate0b_parselmouth_xenv.py --dump pm_old.npz
+training venv  gate0b_parselmouth_xenv.py --dump pm_new.npz && --compare pm_old pm_new
+```
+lightning 钉版 ==2.6.5（requirements.txt 注释：vendored get_strategy 走 lightning
+私有 API——升级 lightning = 重跑 gate1 的事件）。
+
+## gate0 — 预处理对拍（wav2spec：mel/f0/audio/uv/pe）
+
+```
+training\.venv\Scripts\python.exe converter\verify\training\gate0_vocoder.py
+```
+原版侧 = 原仓库 process.wav2spec 直调（绕 ProcessPoolExecutor 编排层，S39 教训）；
+C 层同输入 = smoke_vocoder 的 9 个 44.1k 切片。**S40 读数：audio/mel/f0/uv/pe 五字段
+9 切片全部逐位相等（bitwise 0）**。
+(b) 48k 源用例（红队 A1 回归）：440Hz 正弦 48k 源经我们 slice 阶段（统一重采样
+44100 = 偏离 #9）后 **f0 中位数 = 440.00Hz**；对照演示：上游原始路径（48k 直喂
+wav2spec）f0 = 404.25Hz = 440×44100/48000——上游 mel 用重采样后音频、f0 用原采样率
+数组按 44100 解读（process.py:34-49 + wav2F0.py:61-73），>44.1k 源整库 f0 系统性
+错标且 gate0 双侧同代码结构性抓不到 → 这就是切片阶段统一 44.1k 的存在理由。
+
+## gate1 — 训练 loss 轨迹对拍（fp32 CPU）
+
+```
+⛔ 先读「关卡1」那一节开头的 S139 告示(用跑器 / prepare 默认不跑 / 出口码 / torch 轴)。
+training\.venv\Scripts\python.exe converter\verify\training\run_gate1_chain.py vocoder
+# ⛔ 下面这几行是**各段的实际内容**,不是操作指示 —— 这条 prepare 的 rmtree 面是全仓最大的
+#    (`SingingVocoders\experiments\gate1_voc` 3.66 GB + `TESTING\gate1_vocoder` 5.54 GB)。
+training\.venv\Scripts\python.exe converter\verify\training\gate1_vocoder_prepare.py
+training\.venv\Scripts\python.exe converter\verify\training\gate1_vocoder_run_orig.py
+training\.venv\Scripts\python.exe converter\verify\training\gate1_vocoder_run_ours.py
+training\.venv\Scripts\python.exe converter\verify\training\gate1_vocoder_compare.py
+```
+- 小型化（双侧同值）：batch 2 / crop 16 / ds_workers 0 / log_interval 1（红队 A11：
+  默认 100 下只有 step0 一个点 = 空交集假 PASS——compare 先断言点数）/
+  val_check_interval 5 / **max_updates 30**（global = 2×实际步：lightning manual-opt
+  GAN 的 D、G 各计一步；`total_steps: 15` × 2，`pipeline.py:577` 现算）/ seed 1234 /
+  ⛔ **S134 更正**：这一段此前写着「max_updates 24 / 3 个 val 边界@global 0/10/20」，
+  两个数都是陈的，而且**十行之下的 S40 读数自己就写着 15 步 / 4 边界(0/10/20/30)** ——
+  同一段文字自相矛盾。真值由 `vocoder/pipeline.py:577 "max_updates": 2 * total_real`
+  与驱动里的 `total_steps: 15` 现算 = **30 global / 15 实际步**，盘上实证 =
+  `SingingVocoders\experiments\gate1_voc\model_ckpt_steps_{10,20,30}.ckpt` 三个存档。
+  `gate1_vocoder_compare.py` 断言的 `EXPECT_TRAIN_POINTS=15 / EXPECT_VAL_MIN=4` 与真值一致。
+  ⇒ **按这一段的旧文字去核对点数，会拿 24/3 去量一个 30/4 的东西，然后把对的判成错的。**/
+  finetune 底模 = 正式 2024.02 ckpt（CPU 重存副本——原版裸 torch.load 在 CPU 下炸，
+  见下"坑"）。
+- 原版侧 = 原仓库 train.py 真实执行（repo 代码零改动）+ 执行环境 shim 三件
+  （run_orig 头注：get_strategy→"auto"[lightning 2.6 删私有 API]、dataloader
+  workers==0 合法化[= vendored A2 镜像]、CUDA 屏蔽）；work_dir 必须在 repo 树内
+  （/experiments/ gitignored）——DsModelCheckpoint 的 relative_to(cwd) 出树即
+  ValueError（红队 A4 实弹，原版侧首跑撞出；我方 vendored _display_path 已修）。
+- **S40 读数：11 tags；training/* 9 分量 × 15 步全部 max_rel = 0.000e+00（逐位）；
+  validation/{stft_loss,total_loss} × 4 边界(global 0/10/20/30) max_rel = 0.000e+00；
+  步轴逐点一致。**（gate 配置必须落在存档网格上——离网 total 会触发我方侧的
+  尾验偏离 #11 而原版侧没有,点数就不对齐;compare 的点数断言会响亮抓住。）
+
+## gate2 — 导出/导入链
+
+- converter 全量回归：`converter\.venv\Scripts\python.exe converter\verify\voice\gate1_nsf_hifigan.py`
+  （S40 复跑全 PASS：gate(a) 真权重 8.3e-07/corr 1.000000；gate(b) det ORT 3.5e-06 +
+  动态 T 扫描；gate(c) mel DSP；gate(d) 旧 CLI 原样重建 aux——sidecar 精确相等/
+  mel npy 逐位/双跑噪声活性。**export_nsf_hifigan.py 参数化(--stem)+自检(--no-selfcheck
+  可关)对默认路径零扰动的机器证明**）。
+- 导出脚本自检（每次导入用户机上跑）：deterministic 孪生 torch-vs-ORT ≤1e-4 +
+  corr>0.9999 双 T + 动态 T + 活图噪声活性（S40 实测 3.9e-06~4.5e-06）。
+- 三形态输入实测：{'generator':sd}（so-vits pretrain 2022.12，CJK stem）、
+  lightning ckpt（v0.0.2 底模，剥 generator. 前缀）、训练 weights/ 快照
+  （冒烟 vocoder_best.ckpt + 伴随 config.json）→ 全过；mini_nsf（pc 2025.02）
+  中文拒绝（导入面与 exporter 双层）。
+
+## 冒烟（runner 直驱，TESTING/smoke_vocoder/run*.json）
+
+素材 = ikanaiteyo vocal.wav（126s 44.1k 干声 → 9×≤15s 切片）。GPU：
+- run A：30 步完训——协议 JSONL 零污染；periodic@10/20/30 = weights/ 快照
+  （vocoder_<实际步>.ckpt + config.json）；best = 真 val loss（0.3593→0.3562 递减）；
+  lightning 工作区档 = model_ckpt_steps_{40,60}（global=2×实锤；keep=2 清扫生效）。
+- run B：总步 60 续训——31→60 零跳号，best 跨续训延续（0.3511→0.3494），final@60。
+- run C：优雅停 @81（离网）——stop 档 model_ckpt_steps_162 补存（离网尾段不丢，
+  红队 A8），weights/vocoder_81 + kind=stop；清扫仍 keep=2。
+- run D：死胡同守卫——总步 60 < 进度 81 → 响亮拒绝（Rust 侧另有 //2 口径 guard）。
+- run F：freeze_mpd=true 10 步——**MPD 参数 vs 底模逐位不变、MSD/G 均变化**（断言
+  过；freezing_enabled 联动 = 红队 A3）。
+- SovitsOptions serde 兼容单测（tests/voice_pipeline.rs）：缺键/null→None（默认
+  声码器路径）、CJK 名透传、未知键不炸。cargo test 全绿（41+5+3+1）。
+
+## ★S119 §F8⒝ 冒烟 —— 声码器的可续训 best + 活分支指针（端到端，真的跑 fit 循环）
+
+```
+training\.venv\Scripts\python.exe -u D:\MyDev\TESTING\s119_vocoder\smoke_voc_resume.py
+```
+**16/16 PASS / ~151 s**（RTX 3080 Ti）。为什么必须有它:`gate_resume_state` 的 V 组驱动的是
+`choose_start_ckpt` / `_prune_workspace_ckpts` / `save_solo_snapshot` 这些**函数**,而
+`on_fit_start` 的 RNG 恢复、`note_saved` 的指针刷新、`_save_resumable_best`、
+`UtaiDsModelCheckpoint._save_checkpoint` **全都在 lightning 的循环里**。
+
+配方(每一项都是判据的一部分):
+- 素材 = `TESTING\smoke_vocoder\dataset\vocal.wav`(126 s 44.1k 干声 → 9 切片 / 8 train / 1 val),
+  拷成 `TESTING\s119_vocoder\smoke_data`;底模指 live 数据根(仓库 `data/models` 仍是弹坑)。
+- ⛔**工作区必须在 D:** —— 每个 lightning 存档 **1.2 GB**,C: 只剩十几 GB,实测在 C: 上
+  `_atomic_save` 会中途死在 `unexpected pos …`,而那看起来完全像本轮改的存档路径出了 bug。
+- ⛔**脚本必须有 `if __name__ == "__main__"` 守卫** —— `ds_workers=4` 写死在
+  `build_train_config`,Windows spawn 会重新 import `__main__`(扩散那份冒烟不需要,别照抄它的
+  平铺写法)。`aug_copies=0` 才能免掉 RMVPE 资产。
+- **步数编排是分辨力的来源**(global = 2×real,存档只落在 val 边界):
+  R1 total 8 → 存档 8/16 · R2 total 12 → 24 · **埋诱饵 26**(`26 % 8 != 0` ⇒ 新分支的验证网格
+  永远写不出这个名字)· R3 `resume_from="best"` total 11 → 新 tip 22 **低于** 24/26 ·
+  R4 默认续训 total 14 → **必须从 22 起,而不是盘上最大的 26**。
+- 读数(不是推的):`resume state: scaler=absent; rng[numpy,python,torch_cpu,torch_cuda 全 restored]` ·
+  `resume: dataset unchanged (<指纹前 12 位>)` · `dataset items = 8` ·
+  回退后 `grid=[16,22,24,26] pointer=22` · R4 后 `grid=[26,28] pointer=28`,
+  `pruned workspace checkpoint 24/22/16`(全部 ≤ tip)。
+- ★**它当场买回两条**:①E14 第一版实现照搬扩散「只试最大那一格」是错的——扩散有
+  `resume_latest/` 兜底,声码器的编号网格就是它的主要续训面,一格中毒会让整个工作区不可续训;
+  ②另一条红的是**我的夹具**:诱饵是别处复制来的,内部 `global_step` 与文件名不一致 ⇒
+  断言必须落在「选中了哪个**文件**」上。
+
+## 坑（S40 新增）
+
+1. **上游 wav2spec 的 f0/mel 采样率错配**（gate0(b) 有数值实证）——切片统一 44.1k
+   是数学正确性问题，不是便利问题。
+2. **lightning global_step = 2×实际步**（manual-opt GAN，D/G 各计一步）：ckpt 文件名、
+   TB 步轴、max_steps、log_interval 全是 global 口径；协议/UI/run.json 全是实际步。
+   任何比较 total_steps 的地方漏 //2 = 步数翻倍级 bug（Rust guard 有注释）。
+3. **val_check_interval（int）+ check_val_every_n_epoch=None = 跨 epoch 累计 batch 数**
+   = 实际步口径——与 save_every_steps 直接对齐（gate1 3 epoch 交叉实证）。
+4. 原版 DsModelCheckpoint 的 relative_to(cwd)：出树工作区首存档即崩（vendored
+   _display_path 修；原版侧 gate 用 repo 内 work_dir）。
+5. 原版 get_strategy 深走 lightning ≤2.5 私有 accelerator_connector API——2.6 直接
+   AttributeError（我方 pipeline 传 "auto" 登记偏离；单设备语义等价）。
+6. CUDA 存档底模 + CPU 训练：上游裸 torch.load 崩（vendored map_location="cpu"）。
+7. 上游 print_arch 用裸 print 打 stdout —— 协议卫生：UtaiNsfTask 覆写为 logging；
+   root logger 必须在任何 vendored/lightning import 前配置（basicConfig(stdout) 才是 no-op）。
+8. 函数体内的缩进 import（`from utils import ...`）会躲过行首锚定的 vendored 重写
+   正则——全包 grep 收尾（vendor_vocoder.py 教训）。
+9. 连续歌声在 openvpi 默认切片参数下可能只出个位数巨型切片（126s → 2×60s 实测）
+   → 切片 ≤15s 上限（偏离 #10，兼收 val 全长前向显存）。
+10. **尾验偏离 #11（用户 S40 走查提出）**：自然完训停在存档网格之间时 lightning
+   不跑收尾 val（优雅停会跑——实测两场），final 档从未与 best 比较 → pipeline
+   post-fit 补 `trainer.validate(task, verbose=False)`（verbose=False 硬要求：
+   结果表裸 print 打 stdout=协议）。实测（total 13/save 5）：修前 final metric=None、
+   best 卡在 10；修后 val 0.363→0.3614→0.3585→**0.3577@13** 且 best 正确更新到 13。
+   ⚠️ 连环坑：上游 `build_model()` **无 return**（只赋 self.generator/discriminator），
+   `self.model` 永远是 None——setup 幂等守卫拿 self.model 当哨兵永不生效，
+   trainer.validate 二次 setup 重建随机权重 + 因工作区有 ckpt 跳过底模播种，
+   尾验得 0.88（随机 G 的成绩）：哨兵必须用 `self.generator`。
+11. 上游 spec_to_figure 用 plt.pcolor 在 1025×万列网格逐格画 quad——每次 val 10 张图
+   ≈ 用户实测 ~2min 边界停顿的大头；vendored 登记偏离改 pcolormesh
+   （openvpi 自家 DiffSinger HEAD commit #302 同款修法），单图 0.20s。
+
+---
+
+# S41：PSOLA 数据增强关卡（2026-07-07）
+
+方法论提醒：增强是我们自己的设计（音频域 PSOLA 变调副本，歌声领域零先例——证据链与
+红队裁决全在 `D:\MyDev\TESTING\utai-v2-testing\research\s41_two_features_design.md`），
+没有上游端到端参照，所以验证拆层：引擎语义关卡 + 份数0 逐字节 noop（vs git HEAD 真旧码
+冷跑）+ 管线不变量阶梯 + 跨代 extract 回归 + runner 冒烟。
+
+## gate_aug_semantic.py（引擎/门语义，27 检查全 PASS）
+- 干净真人素材（kaz mp3）生产切片链 ×2 份：f0 目标 worst median 3.5 / p90 30.6 cents；
+  时长守恒 ≤1 hop；跨 run 逐位确定（parselmouth 0.4.7 版本内性质）。
+- 共振峰：PSOLA ±3st 位移 est=0.00st；度量锚（重采样 +3st）est=+3.00st（度量自身测得准，
+  V11 反自证）。
+- 真实脏片双臂：human(OpenUtau 渲染) p90 臂 1/1 剔除；kazane@30s median 臂 1/3 剔除；
+  逐片分布档 gate_aug_semantic_dist.json。
+- ⚠ V9 裁决实据：**parselmouth 对 PSOLA 毛刺失明**（同批片 rmvpe p90=323/245 cents，
+  praat 读 12/17 且浊覆盖率不变=连续性先验平滑）→ 生产门四链统一 rmvpe 血统
+  （vocoder 门对音频现算 rmvpe，禁用其自产 parselmouth npz f0）；part4 = 盲区在案断言
+  （praat 若某天看见了会翻红提醒重评估）。
+- 单元语义：全清拒/忠实留/不变调拒/高音截顶豁免（sweep 700→1000Hz +3st）。
+
+## gate_aug0_noop.py（份数0 = 逐字节 no-op，四链全 PASS）
+冷跑协议（V1 反自证）：git worktree 检出基线（默认 HEAD）跑 pipeline.run 编排层（V3，
+gate_aug0_driver.py，CPU 钉死 CUDA_VISIBLE_DEVICES=-1）→ 同路径快照 → 现行代码冷跑 →
+按后缀比对（V6：wav/npy/txt/json=字节；.pt=字节→张量级降级[torch zip 档案名轴]；
+.wav 字节不等时=采样级降级[**libsndfile float32 wav 的 PEAK chunk 带写入时间戳**，
+vocoder 切片跨 run 恒差 1 字节，本次实测定责]）。复跑：
+`.venv\Scripts\python.exe ..\converter\verify\training\gate_aug0_noop.py --backend <b>`
+
+⚠ **读数 sovits 21/21、rvc 43/43、vocoder 12/12、sovits_diff 37/37 是 S122 期（2026-08-08
+以前）的，今天【没有被复核过】，而且已知会漂**：S125 之后每条链的池里多一个 `pool.json`，
+S136 的 `build_cfg` 又多写 `run_dir` / `run_has_main_model` 两个键。⇒ 下次真跑这个闸时把这四个
+数当**地板**重新量，别拿它们对表判退化。
+⭐ **2026-08-12 直接数过盘上那四棵 `ws_noop_*`：22 / 44 / 13 / 38 件**，各减掉一个被
+`EXCLUDE_FILES` 排除的 `train.log`，正好是 **21 / 43 / 12 / 37** ⇒ **这四个数今天仍然对得上
+盘上的树**，它们的含义是「**参与比较的文件数**」而不是「树里有多少文件」。
+⛔ **但重跑一次会各加一**：那四棵树的 mtime 是 2026-07-08 / 08-08，**都还没有 `pool.json`**
+（`open_pool` 的 `POOL_REF` 是 S125 之后才写的，本轮在 `gate_aug_pipeline` 那三棵上实测到它是
+「只在新」）⇒ 真跑之后**预期变成 22 / 44 / 13 / 38**。
+⚠ 这一段是**先推错了再被实测纠正的**：我起初以为盘上就已经多了 `pool.json`。**别按推论对表。**
+⛔ 另外 `--baseline-rev` 默认 `HEAD`：工作树干净时那是 **A/A**（同一份码跑两遍），
+**不是** S41 那条跨代码断言；要做后者得显式传 `c82ca55`。闸自己会打 `[axis]` 说明这一次量了哪种。
+
+## gate_aug_pipeline.py（管线不变量，**两条臂**：`--arm v1` / `v2` / `both`）
+
+### `--arm v1` —— ④d 之前那个池身份公式（既有基线）
+每链 0→2→2(rerun)→3→1→0 档位阶梯：val 与份数0 逐字节同且永无 aug；检索/index 资产
+与份数0 逐字节同（原片-only 拍板）；meta==幸存 aug 数；rerun 逐位稳定+缓存 mtime 不变
+（rvc 每 run 重算但逐位相同=名键特征缓存有效性的实证）；降档产物连坐清除（vocoder 含
+npz 侧）；**2→…→0 树 == fresh-0**。dirty 混合集：≥1 剔除 + **≥1 幸存**(S137 新增地板)
++ 幸存片全材料化 + 零残渣。diff 继承：增量路径 aug 不动 + **换数据集铸兄弟池、旧池
+逐字节存活** + diff 产物齐全。
+
+**`--backend all` = 57 条**（sovits 15 + rvc 12 + vocoder 14 + dirty 5 + diff 7 + 模板申报 4），
+**地板不是钉子**（`MIN_CHECKS_ALL=48`，且自 S137 起**只数 v1 臂自己的**——`CHECKS` 与 v2 臂共享，
+之前 `--arm both` 下 v1 臂打零条也照样过）。
+⭐ **2026-08-12 实测**：对着盘上那三棵存量池夹具真跑，**53 条 ALL PASS / 172 s**
+（那次还没有末尾那 4 条模板申报）。此前最后一次真跑是 2026-08-08。
+
+⛔ **跑这条臂会【合法地】改写 `legs_s129.py` 的输入面**，先备份再跑：
+`exercise()` 第一句 `wipe(ws, base_snap)` 重建 `ws_pipe_{sovits,rvc,vocoder}` 与三个 `_c0`；
+`run_pipeline` 把 cfg 写到 `dirname(ws)` = GATE_ROOT ⇒ 重写四份 `cfg_pipe_*.json`。
+⇒ 跑完 `check_fixtures_untouched.py` **应该红**，工作是证明那片红**恰好等于**下面这张表。
+
+⭐ **重建一次到底变了什么（2026-08-12 逐件对拍，`TESTING\s137_f7\compare_rebuilt_vs_backup.py`）**：
+
+| | |
+|---|---|
+| `ws_pipe_sovits` **21/21** · `ws_pipe_rvc` **43/43** · `ws_pipe_dirty` 38/38 · `ws_pipe_diff` 200/200 | **逐字节相同** |
+| `ws_pipe_vocoder` | 8/8 相同，**4 个 `slices/*.wav` 差** = libsndfile 的 PEAK-chunk 时间戳轴（本文件上一节记的同一条轴） |
+| 每棵树 `pool.json` | **ONLY-NEW** —— S125 之后新增的产物，08-08 那批树里没有 |
+| 四份 `cfg_pipe_*.json` | 多出 `run_dir` / `run_has_main_model`（S136 起 `build_cfg` 无条件写） |
+| 三个 `train.log` | 追加写，比较器按 `.log` 跳过并计数 |
+
+⚠ **rvc 的 f0/特征在这份夹具上逐字节可复现**，但**别把它读成「RVC 的 CPU f0 是确定性的」**：
+S135 在 gate0 的 51 件样本里量到过 2 件不同（`max|Δ| = 8.87e-05 Hz`）。这里只有 4 个源切片，
+**是没踩到，不是踩不到**。
+
+⛔ 末尾 4 条「模板申报」不是装饰：`run_pipeline` 每调用一次就重写一份 `cfg_pipe_<backend>.json`，
+所以每份模板留下的是**该后端最后一次调用**的值，而 `legs_s129.py:182` 直接读它去盖
+`run_manifest.json`。`cfg_pipe_sovits.json` 是 2 **只因为** `dirty_rejection()`（copies=1）排在
+`diff_inherit()`（copies=2）**前面** —— 两行一对调它就静默变 1，而 legs 会**照样全绿**，
+只是它的 L4⒞ 阴性对照不再是对照。⇒ `LEGS_TEMPLATE_AUG` 把这条耦合钉成会红的判据。
+
+### `--arm v2` —— ④d 的公式（`aug_copies` 与 `sample_rate` 进池身份，单说话人切片改名）
+S136 建、S137 接进 sovits。它**不是「同一条阶梯加个旋钮」**：v2 下每个份数是一个**兄弟池**，
+所以阶梯钉的是 `pool.py:204-208` 说的 `|aug=` 立项理由本身 ——
+**两个不同份数的 run 不再互相摧毁产物**。逐级：解析到 `pool_id_for(BASE+后缀)` 命名的兄弟池、
+fingerprint **整串相等**、是**新**池、**更早的每一个池逐字节没少也没多一个东西**、
+切片落在闸**预先声明**的目录里、恰好 aug1..augn、meta 计数相等；回零重选**同一个**池且逐字节相同。
+⭐ BASE **从盘上推导**，绝不在闸里重算（五条链构造它的方式各不相同，第六份副本 = 两侧一起漂）。
+
+| | 期望条数（**地板，不是钉子**） | 备注 |
+|---|---|---|
+| `--backend sovits` | **43** | 阶梯 41 + 链地板 1 + legs 守卫 1 |
+| `--backend rvc` | **40** | 阶梯 38 |
+| `--backend vocoder` | **39** | 阶梯 37 |
+| `--backend all` | **120** | 三条阶梯 + 三条链地板 + 1 条 legs 守卫 |
+
+⛔ **v2 臂覆盖不到什么（写在这里，免得被当成整块 ④d 覆盖记账）**：
+- 它只读 `slice_dir` 与 `meta`，**`val` / `train` / `index` 一次都不碰** ⇒
+  「aug 永不进 val」「检索资产原片-only」这两条 sovits 家特有的协议在 v2 下**覆盖仍然是 0**，
+  而且结构上够不着（阶梯五步共用一个 run 目录，filelists/index 被每一档覆写）。
+- `observe_v2` 的 `spk0` 观测**不是新覆盖**：`legs_s129.py:418-424` 已经对 sovits 与 sovits_v2
+  钉过逐字同义的一条。这条臂的净买入是**阶梯那一半**（legs 只驱一个份数）。
+- **`sovits_diff` / `sovits_v2` 的 ④d 覆盖仍然是零**，每一跑由 `main` 的 `[NOTE]` 点名
+  （它对 `noop.BACKENDS` 取差集，**不是**对本次 `--backend` 取差集，否则两个元组一相等就哑了）。
+- `vocoder` 的 copies=0 那一格没有任何 v1/v2 可观测量（无 `|sr=`、`|aug=` 在 0 时不产出、
+  无 `dataset_44k`）⇒ 闸打 `[NOTE]` 标成结构性空判据，不计入覆盖。
+- **`smoke_aug.py` 从没走过 v2**（`:84` 从不传 `identity_version`）。
+
+▶ `--selftest`（毫秒级、不碰夹具）：`DRIVABLE_V2 ⊆ DRIVABLE` · 目录名两档真的不同且 v1 那档
+取自 `build_cfg` · `backend_paths_in` 拒绝猜说话人 · **`assert_pool_intact` 的
+lost / gained / changed / 空快照四条臂各真触发一次** · 零链空转与 legs 名单变空各被拒一次 ·
+v2 臂拒绝把工作区解析进 GATE_ROOT。
+
+▶ 阴性对照 `TESTING\s137_f7\negctl_s137.py {NC1,NC3,NC4,NC5}`，跑在自己的 arena 里。
+
+## 既有关卡复跑协议（V13）
+- 基线归档：`TESTING/utai-v2-testing/sovits_ours_s38_archive`（永久只读参照）。
+- **regress_extract_sovits.py 实跑 PASS**：新 extract.py（含 aug 失败降级改动）vs S38
+  时代存档 132 产物逐字节 0 失配、零杂散。
+- ~~**传递规则生效**：四链 noop 树等价 + 训练循环文件（train.py/solver/data_loaders/
+  losses/harness）git diff 为空 ⇒ S37-40 的 gate1 结论直接传递，不重跑（S33 先例）。~~
+  ⛔⛔ **S134 作废（2026-08-11）**：这条捷径的前提早已不成立。取证命令与读数——
+  `git log --oneline --since=2026-07-08 -- training/utai_train/{rvc,sovits,sovits_v2}/train.py
+  training/utai_train/sovits/diffusion/{solver,data_loaders}.py
+  training/utai_train/{rvc,sovits,sovits_v2}/../*/losses.py training/utai_train/vocoder/pipeline.py`
+  = **20 笔**（S68/S114/S116/S117/S118/S119/S122/S125/S129）。
+  ⇒ **S37-40 的 gate1 结论对今天的代码不再可传递，gate1 必须真跑。**
+  ⚠ 但这条规则本身没有错，错的是「它还成立」这个前提：它今天仍然是判断「要不要重跑」的
+  正确形状，只是答案变成了「要」。
+- ~~旧 gate 脚本调用面：既有阶段函数签名零改动（build_flist_and_config 保留为兼容包装；
+  extract_all 仅新增返回值）。~~
+  ⛔⛔ **S134 判为【今天为假】，而且它比上面那条更危险** —— 它会让人以为零号前置不存在。
+  §F2⒝（S122/S125）给五条链的入口加了 `pool_dir` 形参，而 `converter/verify/training/` 里
+  **七个我方侧调用点一个都没跟上**：`gate0_run_ours.py` 的 `build_index`/`build_filelist_and_config`、
+  五条 `gate1_*_run_ours.py` 的 `train()`/`_train_diff()`/`_train()`。
+  ⇒ **五条链的 gate1 与 RVC 的 gate0 在第 0 步之前就 TypeError**，而这个事实
+  **从每一个绿着的闸里都看不见**（python 夹具不进任何自动闸）。S134 已补齐。
+  ▶ 新的机械看守 = **`gate_driver_arity.py`**（把每个 gate 脚本的调用点静态绑到
+  `utai_train` 今天的签名上，自带 `--selftest` 阴性对照）。**跑任何 gate 之前先跑它。**
+  ⛔ 它的边界写在脚本 docstring 里：**只看得见 arity，看不见「插错位置」** ——
+  `pool_dir` 在四个签名里都在第 3 位，追加到末尾会让实参数刚好凑够而把后面每个参数错绑一格。
+
+## smoke_aug.py（runner 直驱真训练，21 检查全 PASS）
+sovits(dirty 混合, 剔除消息实证)→sovits_diff(同工作区继承)→rvc→vocoder 各 aug=1 短训完训：
+协议全 JSON、augment/aug_check 阶段齐、done=completed、step 消息正常。JSONL 存档
+`TESTING/utai-v2-testing/gate_aug/smoke_*.jsonl`。
+
+## 坑（本次新增）
+- libsndfile float32 WAV 的 PEAK chunk 时间戳（见上）——凡逐字节比较 soundfile 写的
+  float wav 都要有采样级降级；scipy wavfile / int16 无此轴。
+- serde_json::json! 宏递归深度：run.json 字面量加键顶爆默认 128 上限 → lib.rs
+  `#![recursion_limit = "256"]`（纯编译期）。
+- augment 的 seed 状态防线（aug_meta/_state.json）：aug 文件名不含 keyshift，seed 变更
+  会让名键下游缓存静默错配——状态守卫先全清再生成（生产 seed 恒 1234，属 belt）。
+
+---
+
+# 速度闸(§F7 笔 D,S138 起,`gate_speed_rvc.py`)
+
+**这是本仓第一条 wall-clock 判据。** 它回答用户 2026-08-07 那句:
+「按我们现在这一堆优化,**我们只可能比原包快不可能比原包慢**」。
+
+⚠ **别和 `gate_loader_budget.py` 搞混**:那个证明的是 `plan_loader` 的**逻辑**
+(REDUCE-ONLY / 阶梯顺序 / RNG 纪律),**零时间量、零阈值、零阴性对照**。
+
+```
+# ① 铺两侧 arena(⛔ 会往上游树写 RVC\logs\s138speed,脚本会先登记那里现在有什么)
+<py> converter/verify/training/speed_arena_setup.py
+
+# ② 自检(每一条拒绝分支都真触发一次,毫秒级)
+<py> converter/verify/training/gate_speed_rvc.py --selftest
+
+# ③ 真跑(约 9 分钟:3 对 × 两侧 × 6 epoch)
+<py> converter/verify/training/gate_speed_rvc.py --pairs 3 --epochs 6
+
+# ④ 阴性对照:给我方侧每步注射已知延迟 ⇒ 必须翻红
+<py> converter/verify/training/gate_speed_rvc.py --pairs 3 --epochs 6 --inject-ms 60
+```
+
+## 实测过的三条出口
+
+| | 对内比值(我方/上游) | 判决 |
+|---|---|---|
+| 真实代码 | 0.9559 / 0.9613 / 0.9527 | **我方快 4.34%**,3σ 门限 0.75% ⇒ **PASS** |
+| `--inject-ms 60` | 1.0707 / 1.0715 / 1.0713 | **我方慢 7.12%** ⇒ **RED** |
+| 见下「闸抓住我三次」 | —— | **GATE-UNRUNNABLE**(退出码 3) |
+
+## ⛔ 它为什么长成这样(三条实测的机器状态,与被测代码无关)
+
+1. **冷卡**:GPU 长时间空闲后的第一次训练只有 **780 MHz**(不是 2010),step 慢 **1.85 倍**;
+   温度 51°C / 功耗 88 W ⇒ **不是节流,是没升频**。
+   ⛔ **开跑前的 preflight 结构上看不见它** ⇒ 必须做成**运行中不变量**。
+2. **会话内系统漂移 3.19%**,而被测效应实测也是 ≈3-4%
+   ⇒ **「先跑 A 三遍再跑 B 三遍」会凭空产出一个正确量级、正确方向、完全合法的结论**
+   ⇒ 必须 **A/B/A/B 交替**,统计量是**对内比值**。
+3. **写盘的持久档位迁移**(纯计算 spread 1.1-1.45%,一叠写盘 ⇒ 稳态 8-10%、瞬态 45-56%)。
+
+**统计量**:⛔ 不许用极差 —— 同一批数据极差给 5.53% 而真实相对标准差只有 2.12%,
+**把噪声高估 2.6 倍**,3σ 分辨力从 0.80% 掉到 16.6%,而靶子是 3%。
+⇒ 用**配对比值的均值 ± SEM**,并配一条**硬天花板**(`3×SEM > 8% ⇒ 退 3`)。
+理由见 `gate0_guard.py:173-175`:**打印是汇报不是判据**。
+
+## 读数取自哪里
+
+**两侧 `train.log` 的 `====> Epoch:` 时间戳之差**,同一个解析器。
+两侧 formatter **逐字节相同**(我方 `rvc/train_utils.py:180` vs 上游 `infer/lib/train/utils.py:443`)
+⇒ 它是**被测代码自己写下、这个闸改不动的外部记录**。
+
+* ⛔ **不用** `EpochRecorder` 自报的那个括号里的值:两侧都在 batch 循环**之前**构造它
+  ⇒ 它**不含 epoch 边界**,而边界正是我方已知更贵的那一段。
+* ⛔ **不许把 `log_interval` 设成 1** 去换逐 step 读数:那会让**上游也**每步取 6 个 loss 的
+  `.item()`(上游只在 log 步做,我方无条件每步做)⇒ **抹掉我方唯一确定的减速项**;
+  而且给两侧每步都加 3 张 matplotlib 渲染 —— **实测 0.22 s/步 = 40%**。
+
+## ⭐ 闸抓住我三次(逐条记住形状)
+
+1. 上游侧只有 `gpu_after`(**跑完之后**采的,卡已掉回 615-750 MHz)⇒ 三对全被剔。
+   **闸的行为是对的,不对称的是探针。**
+2. 不变量写成 `min(clocks)` ⇒ 把我方 epoch 边界的**正常掉档**(等 `resume_best` 存档 +
+   全张量 isfinite 扫描,**CPU/磁盘活,我方独有**)当成冷卡,而它
+   **只会系统性地剔掉我方那条臂 —— 那是偏倚不是噪声**。⇒ 改成**中位时钟**。
+3. 一次真跑里上游侧整跑慢 30%(**GPU 时钟全程 2025 ⇒ 不是显卡,是写盘瞬态**),
+   比值 0.7281;**若无硬天花板,闸会报「我方快 12.39%」并打绿**。
+
+## ⛔ 诚实边界(别当成没有)
+
+* 它是**代码轴**(两侧同一个解释器)。**不回答**「我们的安装包 vs 用户手上的 RVC 整合包」
+  —— 那一轴 ContentVec 走 **CPU ORT**、预处理**单进程**,**我方大输**,归②号尺子(§F7 笔 D 的 D-5)。
+* **只有 RVC 一条链。** 其余四条:sovits_v2 **结构上不可**(上游 `train.py:73` 硬编 nccl);
+  diff 最省事(上游产物不落在上游树里);声码器要在**副本**里摘掉 `DsTQDMProgressBar`
+  (lightning 2.6.5 在 `enable_progress_bar=False` 时会抛 MisconfigurationException)。
+* `-se 1`(每 epoch 存档)下**写盘噪声受限**:约三对可能撞上一次污染。
+  **天花板会正确拒绝**,但那意味着重跑。⇒ 下一步二选一:**加对数**(SEM ∝ 1/√N),
+  或做**低写盘变体** —— ⚠ 后者会同时抹掉「我方 epoch 边界更贵」这条真信号,
+  所以它只能是**另一条**读数,不是这条的替代。
+
+## 两条容易踩的
+
+* ⛔ **上游「正常完训」是 `os._exit(2333333)`**。⚠ **这个数在两个地方读出来不一样**(S139 实测):
+  **shell**(`$?` / `$LASTEXITCODE`)拿到 `2333333 & 0xFF = **149**`;
+  **python** 的 `subprocess.run(...).returncode` 拿到 **2333333**。
+  本段是给写 shell 包装的人的 ⇒ 用 149;`run_gate1_chain.py` 是 python ⇒ 它的 `orig_ok` 写 2333333。
+  两边各自都对,**但都必须说出自己的适用面**,否则就是 S134 那条「把成功报成 ORIG-FAILED」的第二次发作。
+  判成功**不看 rc**,看日志里有没有够数的 `====> Epoch:` 行。
+* ⛔ **绝不许调任何 `*_prepare.py`**:`gate1_prepare.py` 第一句就是 `shutil.rmtree(dst)`,
+  两个 dst 是 `RVC\logs\gate1`(1.39 GB)与 `gate1_ours`(2.93 GB)—— S134 花一整笔跑通的两侧夹具。
+  ⚠ 声码器那条更大:`SingingVocoders\experiments\gate1_voc`(3.66 GB)+
+  `TESTING\gate1_vocoder`(5.54 GB)= **9.20 GB**(S139 实测,记忆里此前只记了前一半)。
+  ⇒ **S139 起这条已经落进代码**:`run_gate1_chain.py` 默认不跑 prepare,要跑得给
+  `--rebuild-fixtures` **且** `GATE1_ALLOW_REBUILD=1`,并且先把体积逐条打出来。
+  ⚠ 而本文件「关卡1」那五节此前**第一行就是叫你跑 prepare** —— 一份文件里的自相矛盾,已修。
+  速度闸的 arena **自己铺**(`speed_arena_setup.py`)。

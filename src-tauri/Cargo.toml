@@ -1,0 +1,138 @@
+[workspace]
+members = ["crates/utai-dsp", "crates/utai-stretch"]
+
+[package]
+name = "muno"
+version = "0.12.2"
+description = "Muno — AI Music Workstation"
+authors = ["Muno Contributors"]
+edition = "2021"
+rust-version = "1.77"
+# AGPL is a hard requirement, not a choice: the app vendors so-vits-svc (AGPL-3.0) training
+# code — the whole work must carry the same license (community-reported, S66).
+license = "AGPL-3.0-only"
+
+[lib]
+name = "muno_lib"
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png", "image-ico", "protocol-asset"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-shell = "2"
+tauri-plugin-window-state = "2"
+# S64 release: in-app update check + install from GitHub Releases (Rust-side UpdaterBuilder so the
+# endpoint list can follow the user's GH-mirror setting at runtime). No process plugin needed: on
+# Windows install() exits the app and the NSIS /UPDATE run relaunches it.
+tauri-plugin-updater = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ort = { version = "2.0.0-rc.12", features = ["load-dynamic", "preload-dylibs"] }
+ndarray = "0.16"
+ndarray-npy = "0.9"
+hound = "3.5"
+symphonia = { version = "0.5", features = ["mp3", "flac", "ogg", "vorbis", "pcm", "wav", "aac", "isomp4", "mkv"] }
+rubato = "0.15"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
+thiserror = "2"
+tracing = "0.1"
+# "time" enables fmt's OffsetTime timer — S67: file/stdout log lines carry the LOCAL
+# time with an explicit UTC offset (users could never match the panel's local times
+# against the old UTC-Z file lines). `time` itself is already in the tree via
+# tracing-appender; local-offset's Windows path is pure WinAPI (no soundness cfg).
+tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
+tracing-appender = "0.2"
+# "parsing" (S68b): crashlog.rs parses Windows Event Log TimeCreated (RFC3339) stamps.
+time = { version = "0.3", features = ["formatting", "local-offset", "macros", "parsing"] }
+parking_lot = "0.12"
+rustfft = "6.2"
+rayon = "1.10"
+zip = "2"
+walkdir = "2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+reqwest = { version = "0.12", features = ["stream", "json"] }
+futures-util = "0.3"
+# S42 embedded-runtime packs: sha256 part verification + .tar.zst pack extraction
+sha2 = "0.10"
+tar = "0.4"
+zstd = "0.13"
+rand = "0.8"
+rand_distr = "0.4"
+# S56 score import: ustx (YAML) / ust (INI, Shift-JIS legacy) / midi (binary SMF) → 人声轨
+serde_yaml_ng = "0.10"
+midly = "0.5"
+encoding_rs = "0.8"
+# Muno 阶段2(工程规划第七节):cpal 实时音频输出——音源试听的常驻低延迟流。
+# 时间线播放仍是离线 bake → WAV → WebAudio,cpal 只承担试听发声。
+cpal = "0.15"
+utai-dsp = { path = "crates/utai-dsp" }
+# S59 Tempo Slider: offline time-stretch via vendored Signalsmith Stretch (MIT, FFI shim crate)
+utai-stretch = { path = "crates/utai-stretch" }
+
+# Windows-only: disable WebView2 browser-accelerator keys (Ctrl+F/P, F5/F7, zoom, reload…) natively — a
+# page-level keydown preventDefault can't stop them (they're handled by the WebView2 host above the DOM).
+# Versions pinned to what Tauri 2 already resolves (Cargo.lock) so the COM interface types match.
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.38"
+# Dxgi features (S68b): gpu.rs adapter enumeration (EnumAdapters1 = the ORT DML device_id
+# space) + QueryVideoMemoryInfo VRAM forensics. Win32_Foundation was already unified in
+# via webview2-com; declared explicitly because gpu.rs uses LUID/BOOL types directly.
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    # S68d: GetDiskFreeSpaceExW — disk-space preflight for GB-scale writes (runtime
+    # packs / data-dir migration), so ENOSPC fails loud+early instead of mid-extract.
+    "Win32_Storage_FileSystem",
+    # S68d fullportable: registry self-heal after a moved install (portable.rs).
+    # Win32_Security gates RegCreateKeyExW's SECURITY_ATTRIBUTES parameter.
+    "Win32_System_Registry",
+    "Win32_Security",
+] }
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
+# The separation hot loops live in utai-dsp precisely so dev builds can run them at
+# opt-3 without slowing the app crate's incremental compiles. S32 measured opt-0 DSP
+# at 10-30x the wall time of release on the conv-arch pipelines (dev htdemucs 380s vs
+# release 12s per 120s of audio). The per-dependency overrides below do NOT cover
+# ndarray-indexing loops in opt-0 caller crates (monomorphization happens in the
+# calling crate) — that is WHY the sub-crate exists.
+[profile.dev.package.utai-dsp]
+opt-level = 3
+# The ort BINDING layer (Value construction / output extraction) sits on the per-chunk
+# path too — at opt-0 it added ~250 ms per htdemucs segment (S32: dev "inference"
+# 350 ms/seg vs release 94 ms/seg on identical GPU work).
+[profile.dev.package.ort]
+opt-level = 3
+[profile.dev.package.ort-sys]
+opt-level = 3
+[profile.dev.package.rustfft]
+opt-level = 3
+[profile.dev.package.ndarray]
+opt-level = 3
+# ndarray's f32 matmul (RVC KNN retrieval / RMVPE mel projection in the voice pipeline)
+# dispatches into matrixmultiply — the gemm kernels live THERE, so this override (unlike
+# generic ndarray indexing) actually covers the hot loop in dev builds.
+[profile.dev.package.matrixmultiply]
+opt-level = 3
+[profile.dev.package.num-complex]
+opt-level = 3
+[profile.dev.package.rayon]
+opt-level = 2
+[profile.dev.package.rayon-core]
+opt-level = 2
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = 3
+strip = true
+

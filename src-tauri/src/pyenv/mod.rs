@@ -1,0 +1,1386 @@
+//! Embedded Python runtime packs (S42 Phase A).
+//!
+//! A *pack* = one fully self-contained CPython (python-build-standalone, msvc-shared,
+//! flat `Lib\site-packages` — NO venv, see s42_training_env_design.md §2.2) plus a
+//! `pack.json` describing it. One directory per pack under `<data_root>/runtimes/`:
+//!
+//!   <data_root>/runtimes/
+//!     runtime-cpu-v1/        ← the tar unpacks DIRECTLY here; there is no staging copy
+//!       pack.json            ← presence = installed (scan-based discovery, no registry) AND
+//!                              the install commit point: written LAST, via a same-dir
+//!                              tmp+rename of that one file ⇒ a torn install is a MARKER-LESS
+//!                              directory — invisible to list_packs, reclaimed by sweep_staging.
+//!                              ⛔ There is deliberately NO staging→final DIRECTORY rename; the
+//!                              WHY-NOT is on `extract_and_commit` and is load-bearing (it cost
+//!                              a live failure to learn). Read it before touching the protocol.
+//!       envtest.json         ← latest self-test report (written by utai_train.envtest)
+//!       python/python.exe    ← the interpreter (invoked as `python.exe -m ...`)
+//!     .staging/              ← NOT an extraction target. Exactly two tenants, one writer each:
+//!                              `dl-<id>/`            resumable download parts (commands/pyenv.rs)
+//!                              `.old-<id>-<millis>/` the previous tree, moved aside during a
+//!                                                    reinstall and renamed back if it fails
+//!
+//! ⚠ S115: the three lines that used to describe `.staging/` ("in-flight extractions; the
+//! staging→final DIRECTORY RENAME is the install commit point") described the design that was
+//! REJECTED, as if it had shipped. It never shipped — `git log -S` puts this header and the
+//! WHY-NOT paragraph that refutes it in the SAME commit (`4e9c77d`), and every one of the 9
+//! revisions of this file unpacks straight into the final directory. The header was not made
+//! stale by later work; it was born contradicting the code beneath it.
+//!
+//! Distribution: `<id>.manifest.json` + `<id>.tar.zst` (split into `.partNN` volumes
+//! when a host caps file size — GH releases: 2 GiB) hosted on HF/GH. The manifest
+//! carries per-part sha256; parts stream through MultiFileReader → zstd → tar with no
+//! joined intermediate copy.
+//!
+//! Variant strategy (design §2.1): ONE unified dependency set (training ∪ converter),
+//! built per torch backend: cpu / nv-cu130 / xpu / amd. Any installed pack can serve
+//! the CONVERTER role (CPU-bound scripts); the TRAINING role stays on the dev .venv
+//! until Phase B wires it to packs.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+
+use serde::{Deserialize, Serialize};
+
+use crate::{Result, UtaiError};
+
+fn err(msg: impl Into<String>) -> UtaiError {
+    UtaiError::Pyenv(msg.into())
+}
+
+/// Render `e` with its full `source()` chain — "outer: cause: root (os error N)".
+/// tar's TarError Display prints ONLY its own desc; the real io cause (os error
+/// 5/87/112…) lives exclusively in `source()`, so a plain `{e}` drops it — S68d: the
+/// E:\ EXTRACT_FAILED field report ended at the file path and left the actual OS
+/// failure a guess. A link whose text is already present is skipped (some wrappers
+/// duplicate their cause's Display). Appended text is io-error prose — it can never
+/// contain another SCREAMING_SNAKE code or the CANCELLED sentinel, so the frontend's
+/// substring code matcher keeps working (backendError.ts).
+fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut acc = e.to_string();
+    let mut cur = e.source();
+    while let Some(src) = cur {
+        let s = src.to_string();
+        if !acc.contains(&s) {
+            acc.push_str(": ");
+            acc.push_str(&s);
+        }
+        cur = src.source();
+    }
+    acc
+}
+
+// ─── runtime root ───────────────────────────────────────────────────────────
+
+static RUNTIME_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+/// Called once from lib.rs setup AFTER the data root is resolved (incl. the legacy
+/// AppData fallback) — pack discovery/installation is rooted here. Harnesses that
+/// never call it (unit tests, bare cargo test) simply see "no packs".
+pub fn init_runtime_root(data_root: &Path) {
+    let _ = RUNTIME_ROOT.set(data_root.join("runtimes"));
+}
+
+pub fn runtime_root() -> Option<&'static PathBuf> {
+    RUNTIME_ROOT.get()
+}
+
+/// Non-ASCII install paths are the single most reproducible way to break an embedded
+/// CPython + torch on Windows (DLL loader + multiprocessing spawn both choke) — refuse
+/// early with an actionable message instead of failing later with `DLL load failed`.
+pub fn ensure_ascii_path(p: &Path) -> Result<()> {
+    let ok = p.to_str().map(|s| s.is_ascii()).unwrap_or(false);
+    if ok {
+        Ok(())
+    } else {
+        Err(err(format!(
+            "RUNTIME_PATH_NON_ASCII: {}",
+            p.display()
+        )))
+    }
+}
+
+// ─── pack model ─────────────────────────────────────────────────────────────
+
+/// `pack.json` written by the pack builder (training/packs/build_pack.py) into the
+/// archive root. Tolerant deserialization — future builders may add keys.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackMeta {
+    #[serde(default)]
+    pub schema: u32,
+    pub id: String,
+    pub variant: String,
+    /// Monotonic per-variant version (the vN in the id) — same-variant coexistence
+    /// picks the HIGHEST (upgrade path: install v2 next to v1, delete v1 after its
+    /// envtest passes). Older pack.json without the field reads as 0.
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub python: String,
+    #[serde(default)]
+    pub torch: String,
+    #[serde(default)]
+    pub disk_bytes: u64,
+    #[serde(default)]
+    pub built: String,
+}
+
+/// Whether `s` is safe as a SINGLE path component under our control dirs. Pack ids
+/// and manifest part names come from REMOTE json — without this, a hostile/corrupt
+/// manifest could rename-commit outside the runtimes root or write parts through
+/// `..`/absolute paths (audit S42). Also enforces the ASCII invariant.
+pub fn is_safe_component(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 120
+        && !s.starts_with('.')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// An installed pack as reported to the frontend.
+#[derive(Debug, Clone, Serialize)]
+pub struct PackStatus {
+    #[serde(flatten)]
+    pub meta: PackMeta,
+    pub path: String,
+    /// Parsed envtest.json (None = self-test never ran). The frontend reads
+    /// `overall` ("pass"/"fail") for the badge.
+    pub envtest: Option<serde_json::Value>,
+    /// S74b: can THIS machine actually run this installed pack (settings::variant_supported)?
+    /// Filled by get_runtime_env_info, which is where the hardware facts live — list_packs reads
+    /// only on-disk facts and leaves it `true`. An installed-but-unsupported pack is NOT hidden:
+    /// it keeps its card, its self-test button (a driver fix must be re-testable) and its delete
+    /// button, and says WHY it can't be used. Hiding it would strip exactly the affordances the
+    /// user needs, which is how a package becomes invisible dead weight.
+    pub supported: bool,
+    /// S74b: the self-test report was produced on DIFFERENT hardware than this machine has now
+    /// (its `machine` stamp disagrees). The badge then says "re-run the self-test" instead of
+    /// showing a verdict that no longer describes anything. Reports predating the stamp are NOT
+    /// called stale — absence of evidence is not evidence of a swap, and flagging every existing
+    /// install once would be noise. Filled by get_runtime_env_info.
+    pub envtest_stale: bool,
+}
+
+pub fn pack_python(pack_dir: &Path) -> PathBuf {
+    pack_dir.join("python").join("python.exe")
+}
+
+/// Scan-based discovery: every `<root>/<dir>/pack.json` (skipping dot-dirs like
+/// `.staging`) is an installed pack. No registry file to drift out of sync.
+pub fn list_packs() -> Vec<PackStatus> {
+    let Some(root) = runtime_root() else { return vec![] };
+    let Ok(entries) = std::fs::read_dir(root) else { return vec![] };
+    let mut packs = Vec::new();
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        if dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with('.'))
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(dir.join("pack.json")) else { continue };
+        let Ok(meta) = serde_json::from_str::<PackMeta>(&text) else {
+            tracing::warn!("unparseable pack.json in {} — ignoring", dir.display());
+            continue;
+        };
+        let envtest = std::fs::read_to_string(dir.join("envtest.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok());
+        packs.push(PackStatus {
+            meta,
+            path: dir.to_string_lossy().to_string(),
+            envtest,
+            supported: true, // hardware-independent here; get_runtime_env_info decides
+            envtest_stale: false, // ditto
+        });
+    }
+    packs.sort_by(|a, b| a.meta.id.cmp(&b.meta.id));
+    packs
+}
+
+pub fn find_pack(id: &str) -> Option<PackStatus> {
+    list_packs().into_iter().find(|p| p.meta.id == id)
+}
+
+/// Highest installed pack VERSION for a variant (None = none installed with a usable
+/// python). Same existence filter as `available_training_variants`, so the two can never
+/// disagree about whether a pack counts. S168: the device gate needs the VERSION because a
+/// variant's kernel inventory grows per version (amd v1 = gfx1103 only, v2 adds the RDNA3
+/// dGPUs) — "the variant is installed" is not the same fact as "the installed pack can run
+/// this die", and conflating them handed an RX 7700S user v1 + backend=cuda +
+/// hipErrorInvalidImage (the first community report after v0.12.0).
+pub fn max_installed_version(variant: &str) -> Option<u32> {
+    list_packs()
+        .into_iter()
+        .filter(|p| p.meta.variant == variant && pack_python(Path::new(&p.path)).exists())
+        .map(|p| p.meta.version)
+        .max()
+}
+
+/// The CONVERTER-role interpreter (S42 — replaces the 7 scattered
+/// `find_python(app_dir/converter, app_dir)` call sites). Priority:
+///   1. dev venv `converter/.venv` (dev machines keep their known-good env);
+///   2. best installed runtime pack — any variant runs the CPU-bound converter
+///      scripts; GPU variants first so a machine holding only `nv-cu130` needs no
+///      extra cpu pack;
+///   3. the manual `<app_dir>/python/python.exe` slot;
+///   4. bare `python` on PATH (dev fallback).
+pub fn converter_python(app_dir: &Path) -> PathBuf {
+    let venv = app_dir
+        .join("converter")
+        .join(".venv")
+        .join("Scripts")
+        .join("python.exe");
+    if venv.exists() {
+        return venv;
+    }
+    const CONVERTER_PRIORITY: [&str; 4] = ["nv-cu130", "amd", "xpu", "cpu"];
+    let packs = list_packs();
+    for variant in CONVERTER_PRIORITY {
+        // Same-variant coexistence (v1 + v2 during an upgrade): the NEWEST version
+        // wins — id lexicographic order would pick v1 forever (and sort v10 < v2).
+        if let Some(p) = packs
+            .iter()
+            .filter(|p| p.meta.variant == variant)
+            .max_by_key(|p| p.meta.version)
+        {
+            let py = pack_python(Path::new(&p.path));
+            if py.exists() {
+                return py;
+            }
+        }
+    }
+    let embedded = crate::util::manual_python_slot(app_dir);
+    if embedded.exists() {
+        return embedded;
+    }
+    PathBuf::from("python")
+}
+
+/// `converter_python`, but a bare-PATH fallback becomes a LOUD, actionable error
+/// instead of a doomed spawn ("系统找不到指定的文件" pointing at nothing). On dev
+/// machines the venv always resolves first, so this only fires on end-user machines
+/// with no runtime pack installed — exactly where the guidance is needed.
+pub fn converter_python_checked(app_dir: &Path) -> Result<PathBuf> {
+    let py = converter_python(app_dir);
+    if py == Path::new("python") {
+        return Err(err("RUNTIME_PACK_REQUIRED"));
+    }
+    Ok(py)
+}
+
+/// Training runtime variants, GPU-first — the resolution order AND the set of variants that
+/// can drive a training run. Single source: `training_interpreter`'s priority scan, the
+/// device gate's vendor→variant map, and `available_training_variants` all read this.
+pub(crate) const TRAINING_VARIANTS: [&str; 4] = ["nv-cu130", "amd", "xpu", "cpu"];
+
+fn dev_training_venv(app_dir: &Path) -> PathBuf {
+    app_dir.join("training").join(".venv").join("Scripts").join("python.exe")
+}
+
+/// ★S75 THE single criterion behind "can this GPU be picked for training": which training
+/// runtime variants can this installation ACTUALLY run right now. Three consumption points and
+/// no fourth — the device list's gate (`settings::training_gpu_list`), the resolution
+/// (`training_interpreter_for`), and try_start's fail-closed re-validation.
+///
+/// The dev venv counts as nv-cu130 + cpu, and ONLY those: it is a torch+cu121 environment, so it
+/// drives NVIDIA and CPU and nothing else. Saying so here is what stops a dev box from offering
+/// its AMD iGPU — before S75 the venv branch reported device_backend="cuda" for ANY chosen GPU,
+/// so picking the iGPU trained on the NVIDIA card (or on nothing) without a word.
+///
+/// ⚠ This MUST cover every tier `training_interpreter` resolves to, or the two disagree and the
+/// difference is a silent CPU demotion (S75 review): the manual python slot is such a tier — it
+/// used to report `default_gpu()` = "cuda", i.e. NVIDIA + CPU, so it counts the same as the venv.
+/// The bare-`python` last resort is deliberately NOT counted: `training_env_ready` already
+/// refuses that machine, and claiming a variant for an interpreter we know nothing about is
+/// exactly the fail-open this whole gate exists to remove.
+pub fn available_training_variants(app_dir: &Path) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    let mut add = |v: &'static str| {
+        if !out.contains(&v) {
+            out.push(v);
+        }
+    };
+    if dev_training_venv(app_dir).exists() || crate::util::manual_python_slot(app_dir).exists() {
+        add("nv-cu130");
+        add("cpu");
+    }
+    for p in list_packs() {
+        if !pack_python(Path::new(&p.path)).exists() {
+            continue;
+        }
+        if let Some(v) = TRAINING_VARIANTS.iter().find(|v| **v == p.meta.variant) {
+            add(v);
+        }
+    }
+    out
+}
+
+/// Resolve the interpreter for a SPECIFIC wanted variant (S75). `want: None` = no preference =
+/// byte-identical to `training_interpreter`.
+///
+/// `None` return = this install cannot run that variant, so the caller must fail LOUDLY. That is
+/// the whole point: the pre-S75 resolver scanned a fixed priority order and ignored which GPU the
+/// user had picked, so an AMD box that still held an nv-cu130 pack resolved to it and reported
+/// device_backend="cuda" — and a box holding only the CPU pack reported "cpu", which
+/// `require_wanted_accelerator` deliberately lets through as legitimate explicit-CPU. Result:
+/// the dropdown named a GPU and the run trained on the CPU, with one tracing::warn as the only
+/// trace. Resolution must follow the choice, or the choice is a lie.
+pub fn training_interpreter_for(
+    app_dir: &Path,
+    force_cpu: bool,
+    want: Option<&str>,
+) -> Option<TrainingInterpreter> {
+    let Some(want) = want else {
+        return Some(training_interpreter(app_dir, force_cpu));
+    };
+    let backend =
+        if force_cpu { "cpu".to_string() } else { variant_backend(want).to_string() };
+    // Same tier order as `training_interpreter`, filtered to what can serve `want` — and the same
+    // NVIDIA+CPU-only claim for the two non-pack tiers that `available_training_variants` makes.
+    let venv = dev_training_venv(app_dir);
+    if venv.exists() && matches!(want, "nv-cu130" | "cpu") {
+        return Some(TrainingInterpreter::non_pack(venv, backend));
+    }
+    // ⚠ python-bearing packs only, BEFORE max_by_key — the same filter
+    // `available_training_variants` and `max_installed_version` use. Reviewed S168: taking
+    // the max over ALL packs and then requiring that one's python meant a python-less v2
+    // dir could shadow a working v1, and the version gate would be reasoning about a pack
+    // the spawner then refuses — three pickers, one rule.
+    if let Some(p) = list_packs()
+        .into_iter()
+        .filter(|p| p.meta.variant == want && pack_python(Path::new(&p.path)).exists())
+        .max_by_key(|p| p.meta.version)
+    {
+        let py = pack_python(Path::new(&p.path));
+        return Some(TrainingInterpreter::from_pack(py, backend, want));
+    }
+    let manual = crate::util::manual_python_slot(app_dir);
+    if manual.exists() && matches!(want, "nv-cu130" | "cpu") {
+        return Some(TrainingInterpreter::non_pack(manual, backend));
+    }
+    None
+}
+
+/// What the training-role resolution decided — carried as a NAMED struct, never a tuple.
+///
+/// ⛔ `device_backend` and `variant` are both strings and they are NOT interchangeable:
+/// `variant_backend` collapses **amd → "cuda"** (torch-hip drives the `torch.cuda.*`
+/// namespace), so anything that must tell an NVIDIA run from a ROCm one has to read
+/// `variant`, not `device_backend`. S115 found that exact confusion while designing the
+/// diagnostic-mode env injection — `if device_backend == "cuda"` would have fired on every
+/// ROCm run and set a variable that build does not read (measured: 0 occurrences of
+/// `CUDA_LAUNCH_BLOCKING` in the amd pack's `c10_hip.dll`, which asks for
+/// `AMD_SERIALIZE_KERNEL` instead). Two same-typed positional fields is precisely the shape
+/// this repo banned after S85, so the resolvers return this instead of a 3-tuple.
+pub struct TrainingInterpreter {
+    pub python: PathBuf,
+    /// device.py's shim key: "cuda" (nv-cu130 AND amd), "xpu", or "cpu".
+    pub device_backend: String,
+    /// The PACK variant that won — "nv-cu130" / "amd" / "xpu" / "cpu".
+    ///
+    /// `None` = the interpreter is NOT a pack (dev venv / manual slot / bare python). Those
+    /// tiers are claimed for NVIDIA+CPU only, by the same rule `available_training_variants`
+    /// states, so `None` with `device_backend == "cuda"` means an NVIDIA CUDA torch — but
+    /// say so at the point of use rather than storing a guess here.
+    pub variant: Option<String>,
+}
+
+impl TrainingInterpreter {
+    fn from_pack(python: PathBuf, device_backend: String, variant: &str) -> Self {
+        Self { python, device_backend, variant: Some(variant.to_string()) }
+    }
+    fn non_pack(python: PathBuf, device_backend: String) -> Self {
+        Self { python, device_backend, variant: None }
+    }
+}
+
+/// nv-cu130 and amd(torch-hip) both drive the `torch.cuda.*` namespace, so both map
+/// to the "cuda" backend for device.py's shim; xpu and cpu map to themselves.
+fn variant_backend(variant: &str) -> &'static str {
+    match variant {
+        "xpu" => "xpu",
+        "cpu" => "cpu",
+        _ => "cuda",
+    }
+}
+
+/// The TRAINING-role interpreter AND its device backend. Unlike the converter role
+/// (any variant runs its CPU-bound scripts), the pack VARIANT drives `device_backend`
+/// for device.py's shim. `force_cpu` pins "cpu" regardless (the train-on-CPU-anyway
+/// path). Priority: dev venv (unchanged dev experience — backend from the box's own
+/// GPU) → best installed pack (GPU variants first, newest version) → manual slot →
+/// bare python. Returns a `TrainingInterpreter` (⛔ read its doc before touching `variant`).
+pub fn training_interpreter(app_dir: &Path, force_cpu: bool) -> TrainingInterpreter {
+    let default_gpu = || if force_cpu { "cpu" } else { "cuda" }.to_string();
+
+    let venv = dev_training_venv(app_dir);
+    if venv.exists() {
+        return TrainingInterpreter::non_pack(venv, default_gpu());
+    }
+    // Same GPU-first order as the converter role; here the variant also fixes the
+    // backend, so an NVIDIA box holding only nv-cu130 trains on GPU (device=cuda).
+    let packs = list_packs();
+    for variant in TRAINING_VARIANTS {
+        if let Some(p) = packs
+            .iter()
+            .filter(|p| p.meta.variant == variant)
+            .max_by_key(|p| p.meta.version)
+        {
+            let py = pack_python(Path::new(&p.path));
+            if py.exists() {
+                let backend = if force_cpu {
+                    "cpu".to_string()
+                } else {
+                    variant_backend(variant).to_string()
+                };
+                return TrainingInterpreter::from_pack(py, backend, variant);
+            }
+        }
+    }
+    let embedded = crate::util::manual_python_slot(app_dir);
+    if embedded.exists() {
+        return TrainingInterpreter::non_pack(embedded, default_gpu());
+    }
+    TrainingInterpreter::non_pack(PathBuf::from("python"), default_gpu())
+}
+
+// ─── catalog ────────────────────────────────────────────────────────────────
+
+/// A downloadable pack the app knows about. The catalog deliberately carries NO
+/// hashes/part lists — those live in the published `<id>.manifest.json` next to the
+/// archive, so pack rebuilds don't require an app update.
+#[derive(Debug, Clone, Serialize)]
+pub struct CatalogEntry {
+    pub id: &'static str,
+    pub variant: &'static str,
+    pub label: &'static str,
+    /// Rough sizes for the UI (真源 = manifest once fetched).
+    pub download_bytes: u64,
+    pub disk_bytes: u64,
+    pub experimental: bool,
+    /// Published manifest URLs (mirrors). Empty until the pack is uploaded —
+    /// the dev override UTAI_PACK_BASE_URL (comma-separated base URLs) extends
+    /// this at runtime for local end-to-end testing against `python -m http.server`.
+    pub manifest_urls: &'static [&'static str],
+}
+
+pub const CATALOG: &[CatalogEntry] = &[CatalogEntry {
+    id: "runtime-cpu-v1",
+    variant: "cpu",
+    label: "CPU runtime (model conversion base + CPU training)",
+    // Real numbers from the published pack (S42): 236 MB download / 1.18 GB on disk.
+    download_bytes: 236_000_000,
+    disk_bytes: 1_180_000_000,
+    experimental: false,
+    // Published S42 (datasets/yasoukyoku/utai-runtimes). Order matters: official
+    // first, hf-mirror second — the downloader walks them with resume carried
+    // across, so CN users blocked from hf.co fail over automatically. Both
+    // verified live: anonymous resolve ✓, Range→206 ✓, mirror manifest ✓.
+    manifest_urls: &[
+        "https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-cpu-v1.manifest.json",
+        "https://hf-mirror.com/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-cpu-v1.manifest.json",
+        // S168: GH release mirror (tag packs-v1) — the first fallback that actually leaves
+        // the huggingface.co network path (hf-mirror 308s back to it); expanded through the
+        // gh proxies by manifest_url_candidates.
+        "https://github.com/yasoukyoku/UtaiSynthesizer/releases/download/packs-v1/runtime-cpu-v1.manifest.json",
+    ],
+}, CatalogEntry {
+    id: "runtime-nv-cu130-v1",
+    variant: "nv-cu130",
+    label: "NVIDIA runtime (cu130; RTX 20-50 training + model conversion)",
+    // Real numbers from the Phase B build: 1.84 GB download / 3.59 GB on disk (single
+    // part — under the 1.9 GiB split cap).
+    download_bytes: 1_838_043_109,
+    disk_bytes: 3_587_520_577,
+    experimental: false,
+    // Same HF dataset repo as cpu; goes live once uploaded (`hf upload
+    // yasoukyoku/utai-runtimes <dist> . --repo-type dataset`). Until then the dev
+    // override UTAI_PACK_BASE_URL serves it for local end-to-end tests.
+    manifest_urls: &[
+        "https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-nv-cu130-v1.manifest.json",
+        "https://hf-mirror.com/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-nv-cu130-v1.manifest.json",
+        // S168: GH release mirror — see the cpu entry.
+        "https://github.com/yasoukyoku/UtaiSynthesizer/releases/download/packs-v1/runtime-nv-cu130-v1.manifest.json",
+    ],
+}, CatalogEntry {
+    // S167 (§F6): v2 REPLACES v1 in the catalog — same variant, superset kernels (the RDNA3 dGPU
+    // device wheels gfx1100/1101/1102 join v1's gfx1103, all on the same pinned nightly tag).
+    // v1 stays published on HF for existing installs, and an installed v1 keeps working (the
+    // scan-based resolver picks the highest installed version per variant); offering BOTH here
+    // would hand RX 7000 users the one pack that cannot run on their card.
+    id: "runtime-amd-v2",
+    variant: "amd",
+    label: "AMD runtime (TheRock ROCm; RX 7000 series + 780M/760M/740M iGPUs, training + model conversion, experimental)",
+    // Real numbers from the S167 build: 1.769 GB download / 5.92 GB on disk (single
+    // part, under the 1.9 GiB split cap). v1's 780M (gfx1103) validation carries over
+    // (same wheels, same tag); the dGPU targets are inventory-verified but have never
+    // been run on real RDNA3 dGPU silicon — the reason the tier stays experimental and
+    // the envtest stays the on-device authority.
+    download_bytes: 1_769_345_825,
+    disk_bytes: 5_916_078_212,
+    // EXPERIMENTAL tier (design §4.3): TheRock ROCm is a pinned nightly; MIOpen ships
+    // no precompiled conv DB for gfx1103 (#6335) → first-encounter conv configs pay a
+    // one-time kernel-compile cost, then cache. envtest is the release gate.
+    experimental: true,
+    manifest_urls: &[
+        "https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-amd-v2.manifest.json",
+        "https://hf-mirror.com/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-amd-v2.manifest.json",
+        // S168: GH release mirror — see the cpu entry. The first community report's six
+        // MANIFEST_REQUEST_FAILED were exactly this pack with no route off huggingface.co.
+        "https://github.com/yasoukyoku/UtaiSynthesizer/releases/download/packs-v1/runtime-amd-v2.manifest.json",
+    ],
+}, CatalogEntry {
+    id: "runtime-xpu-v1",
+    variant: "xpu",
+    label: "Intel runtime (XPU; Arc training + model conversion, experimental)",
+    // Real numbers from the S45 build: 1.356 GB download / 5.27 GB on disk (single part,
+    // under the 1.9 GiB split cap). Bulkier than cpu/nv because the Intel SYCL/oneMKL
+    // runtime + triton-xpu (359 MB) ship as separate wheels. Built + verified on the dev
+    // machine (RTX 3080 Ti, NO Intel GPU): flat-PBS torch-2.11.0+xpu import OK + envtest
+    // --device cpu 20/20 PASS (tiny_gan 0.6350→0.4609 bitwise-identical to cpu/nv/amd).
+    download_bytes: 1_355_876_805,
+    disk_bytes: 5_273_762_795,
+    // EXPERIMENTAL tier (design §4.3/§4.5). xpu runs fp32 (no bf16). Four of the five training
+    // objects (RVC / SoVITS 4.0 / 4.1 / shallow-diffusion) use the Intel GPU via the device
+    // shim; the vocoder finetune trains on CPU (Lightning 2.6.5 ships no XPU accelerator — it
+    // warns loudly rather than silently fall back). torch 2.11.0+xpu is on the
+    // download.pytorch.org/whl/xpu RELEASE channel (permanent, no HF wheel mirror). No numeric
+    // xpu gate is possible without Intel silicon — correctness is by-construction + the
+    // on-device envtest, validated by the first community reports (keep the flag until then).
+    experimental: true,
+    // Published S45 to datasets/yasoukyoku/utai-runtimes. Verified live: HF LFS oid ==
+    // local sha256 (6e9610e0…, byte-identical 1.36 GB), manifest HTTP 200 on both sources,
+    // tar Range→206 (resumable), served manifest id/variant/sha correct. Official first,
+    // hf-mirror second (downloader fails over with resume carried).
+    manifest_urls: &[
+        "https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-xpu-v1.manifest.json",
+        "https://hf-mirror.com/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-xpu-v1.manifest.json",
+        // S168: GH release mirror — see the cpu entry.
+        "https://github.com/yasoukyoku/UtaiSynthesizer/releases/download/packs-v1/runtime-xpu-v1.manifest.json",
+    ],
+}];
+
+/// Manifest URL candidates for a catalog entry: an optional user-chosen HF host swap first
+/// (assets.rs precedent — the 下载源 preset must reorder the rotation, not be ignored), the
+/// published URLs (github-family rows expanded through the caller's gh proxy routes — ONE
+/// builder, `download::expand_routes`), the dev override last.
+///
+/// S168: hf-mirror.com 308-redirects this dataset straight back to huggingface.co, so the
+/// two HF rows are ONE network path in practice — the first community report failed six
+/// installs with both "routes" dying on the same unreachable host. The GitHub release
+/// mirror (tag `packs-v1`) is the first fallback that actually leaves that path, and the gh
+/// proxies make it reachable where github.com itself is not. Part URLs inherit whichever
+/// base wins (`fetch_manifest` returns every candidate's base, winner first), so a manifest
+/// served through a proxy downloads its parts through the same proxy.
+///
+/// ⛔ TRUST CONTRACT on `gh_routes` (reviewed S168): the manifest is UNSIGNED and its own
+/// sha256 table is the only integrity gate over the pack's parts — a rogue proxy serving a
+/// forged manifest also serves matching parts, and the pack's python.exe gets executed.
+/// Callers therefore pass ONLY routes the user explicitly configured (frontend:
+/// `ghTrustedRoutes` — explicit choice + direct), NEVER the community preset tail that the
+/// hashed/signed consumers (updater, GAME model) may use. Build-pinned hosts (the two HF
+/// rows, github.com direct) plus an explicit user choice is the whole trusted set.
+pub fn manifest_url_candidates(
+    entry: &CatalogEntry,
+    hf_base: Option<&str>,
+    gh_routes: Option<&[String]>,
+) -> Vec<String> {
+    fn push(urls: &mut Vec<String>, u: String) {
+        if !urls.contains(&u) {
+            urls.push(u);
+        }
+    }
+    let mut urls: Vec<String> = Vec::new();
+    if let Some(base) = hf_base {
+        let base = base.trim().trim_end_matches('/');
+        if !base.is_empty()
+            && base.starts_with("http")
+            && base != crate::commands::assets::HF_HOST
+        {
+            for s in entry.manifest_urls {
+                if let Some(rest) = s.strip_prefix(crate::commands::assets::HF_HOST) {
+                    push(&mut urls, format!("{base}{rest}"));
+                    break;
+                }
+            }
+        }
+    }
+    let routes: Option<Vec<String>> = gh_routes.map(|r| r.to_vec());
+    for s in entry.manifest_urls {
+        let is_gh = tauri::Url::parse(s)
+            .map(|u| crate::download::is_github_family(&u))
+            .unwrap_or(false);
+        if is_gh {
+            for u in crate::download::expand_routes(&routes, s) {
+                push(&mut urls, u.to_string());
+            }
+        } else {
+            push(&mut urls, s.to_string());
+        }
+    }
+    if let Ok(bases) = std::env::var("UTAI_PACK_BASE_URL") {
+        for base in bases.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            push(&mut urls, format!("{}/{}.manifest.json", base.trim_end_matches('/'), entry.id));
+        }
+    }
+    urls
+}
+
+/// Published distribution manifest (written by the pack builder next to the parts).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackManifest {
+    #[serde(default)]
+    pub schema: u32,
+    pub id: String,
+    pub variant: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub disk_bytes: u64,
+    pub parts: Vec<ManifestPart>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestPart {
+    pub name: String,
+    pub size: u64,
+    pub sha256: String,
+}
+
+/// Fetch the manifest from the first reachable candidate. Returns (manifest,
+/// base_url_of_the_winning_candidate) — part URLs resolve against that base first,
+/// with every other candidate base as fallback mirror.
+///
+/// ⚠ EVERY failed candidate is kept (warn-logged as it happens AND joined into the final
+/// error), not just the last one. S168: the first community report failed six installs in a
+/// row and the log named only hf-mirror.com — huggingface.co had been tried first and had
+/// ALSO failed each time, but its error was overwritten per-candidate, so "which routes are
+/// actually unreachable from that machine" was undiagnosable from the log. An error that
+/// merges several failures into one line must name each of them.
+pub async fn fetch_manifest(
+    client: &reqwest::Client,
+    candidates: &[String],
+) -> Result<(PackManifest, Vec<String>)> {
+    if candidates.is_empty() {
+        return Err(err("PACK_NO_DOWNLOAD_SOURCE"));
+    }
+    let mut failures: Vec<String> = Vec::new();
+    // One failure entry stays readable inside a joined line; reqwest error chains can run long.
+    fn push_failure(failures: &mut Vec<String>, msg: String) {
+        tracing::warn!("manifest candidate failed: {msg}");
+        const PER_CANDIDATE_MAX: usize = 220;
+        let short: String = msg.chars().take(PER_CANDIDATE_MAX).collect();
+        let ellipsis = if msg.chars().count() > PER_CANDIDATE_MAX { "…" } else { "" };
+        failures.push(format!("{short}{ellipsis}"));
+    }
+    for url in candidates {
+        match client.get(url).send().await {
+            Ok(resp) if resp.status().is_success() => match resp.text().await {
+                Ok(text) => match serde_json::from_str::<PackManifest>(&text) {
+                    Ok(man) => {
+                        let mut bases: Vec<String> = Vec::new();
+                        // Winning base first, then the rest (mirror order preserved).
+                        for u in std::iter::once(url).chain(candidates.iter().filter(|u| *u != url)) {
+                            if let Some(pos) = u.rfind('/') {
+                                bases.push(u[..pos].to_string());
+                            }
+                        }
+                        return Ok((man, bases));
+                    }
+                    Err(e) => push_failure(&mut failures, format!("MANIFEST_PARSE_FAILED: {e} ({url})")),
+                },
+                Err(e) => push_failure(&mut failures, format!("MANIFEST_READ_FAILED: {e} ({url})")),
+            },
+            Ok(resp) => push_failure(&mut failures, format!("MANIFEST_REQUEST_FAILED: HTTP {} ({url})", resp.status())),
+            Err(e) => push_failure(&mut failures, format!("MANIFEST_REQUEST_FAILED: {e} ({url})")),
+        }
+    }
+    // The error carries ONLY the first candidate's failure (the primary source — the one
+    // the user should see); the rest are counted, not joined. Joining them was tried and
+    // reviewed away: the frontend's findCode matches the LONGEST code anywhere in the
+    // string and drops everything before it, so a joined line showed one arbitrary late
+    // candidate. The per-candidate detail all went to the log above (push_failure warns as
+    // it happens), which is where S168's diagnosability gap actually was.
+    match failures.split_first() {
+        None => Err(err("MANIFEST_FETCH_FAILED")),
+        Some((first, [])) => Err(err(first.clone())),
+        Some((first, rest)) => Err(err(format!(
+            "{first} (+{} more route(s) failed — see the log)",
+            rest.len()
+        ))),
+    }
+}
+
+// ─── install ────────────────────────────────────────────────────────────────
+
+/// Single concurrent install/download (the UI drives one at a time; a second request
+/// while busy is a hard error, not a queue). Holds the cooperative cancel flag of the
+/// in-flight install so `cancel_runtime_install` can reach it.
+static ACTIVE_INSTALL: parking_lot::Mutex<Option<Arc<AtomicBool>>> = parking_lot::Mutex::new(None);
+
+pub struct InstallGuard;
+
+impl InstallGuard {
+    pub fn acquire() -> Result<(Self, Arc<AtomicBool>)> {
+        let mut slot = ACTIVE_INSTALL.lock();
+        if slot.is_some() {
+            return Err(err("INSTALL_BUSY"));
+        }
+        let flag = Arc::new(AtomicBool::new(false));
+        *slot = Some(Arc::clone(&flag));
+        Ok((InstallGuard, flag))
+    }
+}
+
+impl Drop for InstallGuard {
+    fn drop(&mut self) {
+        *ACTIVE_INSTALL.lock() = None;
+    }
+}
+
+pub fn cancel_active_install() -> bool {
+    match ACTIVE_INSTALL.lock().as_ref() {
+        Some(flag) => {
+            flag.store(true, Ordering::SeqCst);
+            true
+        }
+        None => false,
+    }
+}
+
+/// An install/download is currently in flight (drives the frontend's busy-state
+/// rebuild when the settings panel is reopened mid-install — audit S42).
+pub fn install_active() -> bool {
+    ACTIVE_INSTALL.lock().is_some()
+}
+
+/// Envtest single-flight — lives HERE (not the command layer) so `delete_pack` can
+/// refuse to pull a pack out from under a running self-test (audit S42: a partial
+/// remove_dir_all deletes pack.json first, then fails on the locked python.exe,
+/// leaving an invisible undeletable orphan).
+static ENVTEST_BUSY: AtomicBool = AtomicBool::new(false);
+
+pub struct EnvtestGuard;
+
+impl EnvtestGuard {
+    pub fn acquire() -> Result<Self> {
+        if ENVTEST_BUSY.swap(true, Ordering::SeqCst) {
+            return Err(err("ENVTEST_BUSY"));
+        }
+        Ok(EnvtestGuard)
+    }
+}
+
+impl Drop for EnvtestGuard {
+    fn drop(&mut self) {
+        ENVTEST_BUSY.store(false, Ordering::SeqCst);
+    }
+}
+
+pub fn envtest_active() -> bool {
+    ENVTEST_BUSY.load(Ordering::SeqCst)
+}
+
+/// The envtest tier a pack must pass, from its variant. AMD deliberately maps to
+/// "cuda": torch-hip exposes the `torch.cuda.*` namespace (design §4.2), so the
+/// cuda-tier checks ARE the ROCm checks. Forgetting this mapping when GPU packs
+/// land would hand GPU packs a green badge from a cpu-tier run — the exact silent
+/// false-green §2.6 exists to prevent.
+///
+/// ★S115 moved it here (from `commands::pyenv`, where it was private) so the manual
+/// end-to-end harness `tests/pyenv_pack.rs` can call the SAME mapping the app uses.
+/// It could not before, and so it ran `utai_train.envtest` with no `--device` at all
+/// — whose default is `cpu`. Re-verifying a GPU pack through that harness therefore
+/// produced a green that said nothing whatsoever about the GPU, which is the very
+/// false-green the paragraph above warns about, reached by a different door.
+/// ⛔ Do not re-privatise this or copy the match arms anywhere: two copies of this
+/// mapping is how the badge and the harness start disagreeing about the same pack.
+pub fn envtest_device_for_variant(variant: &str) -> &'static str {
+    match variant {
+        v if v.starts_with("nv") => "cuda",
+        "amd" => "cuda",
+        "xpu" => "xpu",
+        _ => "cpu",
+    }
+}
+
+/// S169, the companion of the mapping above: the `--gfx-targets` value for envtest.py —
+/// the arch list the INSTALLED amd pack under test carries kernels for, as a comma list.
+/// envtest's `amd_device_pick` uses it to choose the GPU by arch instead of trusting HIP
+/// device 0 (which on mixed-arch laptops can be an iGPU the pack cannot drive — the S169
+/// field failure was a native 0xC0000005 on exactly that touch). `None` for every other
+/// variant → the flag is omitted → envtest behaves as before.
+///
+/// ⛔ Same single-source rule as `envtest_device_for_variant`, and for the same reason:
+/// `tests/pyenv_pack.rs` must hand envtest the SAME list the app would, or the harness
+/// re-verifies a pack under a different device pick than the badge did.
+pub fn envtest_gfx_targets_for(variant: &str, version: u32) -> Option<String> {
+    if variant == "amd" {
+        Some(crate::commands::settings::amd_pack_targets_for_version(version).join(","))
+    } else {
+        None
+    }
+}
+
+/// Validate everything a REMOTE manifest feeds into filesystem paths — one gate,
+/// called right after fetch (covers the download flow; local installs derive part
+/// paths from a real directory listing and extract_and_commit re-validates the id).
+pub fn validate_manifest(man: &PackManifest) -> Result<()> {
+    if !is_safe_component(&man.id) {
+        return Err(err(format!("MANIFEST_BAD_ID: {:?}", man.id)));
+    }
+    if man.parts.is_empty() {
+        return Err(err("MANIFEST_NO_PARTS"));
+    }
+    for p in &man.parts {
+        if !is_safe_component(&p.name) {
+            return Err(err(format!("MANIFEST_BAD_PART_NAME: {:?}", p.name)));
+        }
+        if p.sha256.len() != 64 || !p.sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(err(format!("MANIFEST_BAD_SHA256: {}", p.name)));
+        }
+    }
+    Ok(())
+}
+
+/// Ensured + ASCII-checked runtime root (install-time entry point).
+pub fn install_root() -> Result<PathBuf> {
+    let root = runtime_root().ok_or_else(|| err("RUNTIME_ROOT_UNINIT"))?;
+    ensure_ascii_path(root)?;
+    std::fs::create_dir_all(root)?;
+    Ok(root.clone())
+}
+
+/// Verify each part against the manifest (blocking; wrap in spawn_blocking).
+pub fn verify_parts(manifest: &PackManifest, dir: &Path) -> Result<()> {
+    for part in &manifest.parts {
+        let p = dir.join(&part.name);
+        let meta = std::fs::metadata(&p)
+            .map_err(|e| err(format!("PART_MISSING: {}: {e}", part.name)))?;
+        if meta.len() != part.size {
+            return Err(err(format!(
+                "PART_SIZE_MISMATCH: {} (expected {}, got {})",
+                part.name, part.size, meta.len()
+            )));
+        }
+        let got = crate::download::sha256_file(&p)?;
+        if !got.eq_ignore_ascii_case(&part.sha256) {
+            return Err(err(format!("PART_SHA256_MISMATCH: {}", part.name)));
+        }
+    }
+    Ok(())
+}
+
+/// `\\?\`-prefix an absolute path so tar extraction of deep site-packages trees
+/// (torch easily exceeds 200 chars below the root) survives MAX_PATH on systems
+/// without the LongPathsEnabled policy. canonicalize() returns the prefixed form.
+fn long_path(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// Best-effort recursive byte count (metadata only) — credits a torn install tree
+/// that the extract is about to clear in the disk-space preflight.
+fn dir_size(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            if let Ok(md) = e.metadata() {
+                if md.is_dir() {
+                    total = total.saturating_add(dir_size(&e.path()));
+                } else {
+                    total = total.saturating_add(md.len());
+                }
+            }
+        }
+    }
+    total
+}
+
+/// Extract a (possibly multi-part) `.tar.zst` pack archive DIRECTLY into its final
+/// directory and commit with a single-FILE marker write. Blocking — call in
+/// spawn_blocking. `progress(entries_done)` ticks as tar entries land.
+///
+/// WHY NOT staging + directory rename (the first design, replaced S42 after a live
+/// failure): renaming a directory on Windows fails with ACCESS_DENIED while ANY
+/// process holds ANY handle anywhere below it — and right after extracting ~10k
+/// brand-new files (hundreds of them PE binaries) Defender's async inspection queue
+/// holds handles somewhere in the tree essentially CONTINUOUSLY, for minutes; a
+/// retry window can't outlast it (10 s of backoff still failed on the dev box while
+/// the identical code passed into %TEMP%). File CREATES are never blocked that way —
+/// the extraction itself writing 10k files is the proof — so the commit point is
+/// the exact thing discovery already keys on: **pack.json presence**, written LAST
+/// via a same-dir tmp+rename of one fresh file. A torn install is a marker-less
+/// directory: invisible to list_packs, reclaimed by sweep_staging.
+///
+/// Requires pack.json to be the FIRST tar entry (build_pack.py writes entries
+/// sorted: "pack.json" < "python/") — the id inside decides the target directory
+/// before anything touches disk.
+pub fn extract_and_commit(
+    parts: &[PathBuf],
+    cancel: &AtomicBool,
+    mut progress: impl FnMut(u64),
+) -> Result<PackMeta> {
+    use std::io::Read;
+
+    let root = install_root()?;
+    let reader = crate::download::MultiFileReader::new(parts.to_vec());
+    let decoder = zstd::stream::read::Decoder::new(reader)
+        .map_err(|e| err(format!("ZSTD_INIT_FAILED: {e}")))?;
+    let mut archive = tar::Archive::new(decoder);
+    // S68d ROOT-CAUSE FIX (the E:\ EXTRACT_FAILED report): the pack builder's staging
+    // trees carry mtime=0, so every archived file says "1970" — and restoring that via
+    // SetFileTime is REJECTED by FAT32/exFAT volumes (timestamp epoch 1980) with
+    // os error 87, killing the very FIRST file of every extract on such drives. NTFS
+    // (epoch 1601) accepts it, which is why dev machines never saw this. The archived
+    // mtimes are worthless anyway — don't write them at all; extracted files carry the
+    // extraction time on every filesystem. (build_pack.py now also clamps mtimes for
+    // future packs, but THIS line is what rescues the four already-published ones.)
+    archive.set_preserve_mtime(false);
+    let mut entries = archive
+        .entries()
+        .map_err(|e| err(format!("TAR_READ_FAILED: {}", error_chain(&e))))?;
+
+    // ── entry 0: pack.json → memory (determines the target dir) ──
+    let mut first = entries
+        .next()
+        .ok_or_else(|| err("PACK_EMPTY"))?
+        .map_err(|e| err(format!("TAR_ENTRY_CORRUPT: {}", error_chain(&e))))?;
+    let first_path = first
+        .path()
+        .map_err(|e| err(format!("TAR_ENTRY_BAD_PATH: {}", error_chain(&e))))?
+        .into_owned();
+    if first_path != Path::new("pack.json") {
+        return Err(err(format!(
+            "PACK_FORMAT_INVALID: first entry is {:?}, expected pack.json (rebuild with the latest build_pack.py)",
+            first_path
+        )));
+    }
+    let mut meta_text = String::new();
+    first
+        .read_to_string(&mut meta_text)
+        .map_err(|e| err(format!("PACK_JSON_READ_FAILED: {e}")))?;
+    let meta: PackMeta = serde_json::from_str(&meta_text)
+        .map_err(|e| err(format!("PACK_JSON_PARSE_FAILED: {e}")))?;
+    // The id becomes a directory under the runtimes root — an id like "..\\evil"
+    // or "包名" would escape the root / break the ASCII invariant.
+    if !is_safe_component(&meta.id) {
+        return Err(err(format!("PACK_JSON_BAD_ID: {:?}", meta.id)));
+    }
+
+    let final_dir = root.join(&meta.id);
+    let marker = final_dir.join("pack.json");
+
+    // S68d disk preflight — BEFORE anything touches an existing install, so a refusal
+    // leaves the working pack in place. Needed = the extracted tree size (pack.json
+    // disk_bytes, real numbers from the builders). A TORN remnant (dir without marker)
+    // is about to be cleared, so its bytes count as available again; a reinstall's old
+    // tree is only moved ASIDE and stays occupied until commit, so it earns no credit.
+    // disk_bytes==0 (older builder, serde default) or a failed probe skips the check —
+    // fail open: a residual ENOSPC still surfaces with its os error via error_chain.
+    if meta.disk_bytes > 0 {
+        if let Some(free) = crate::util::free_bytes_at(&root) {
+            let torn_credit =
+                if !marker.exists() && final_dir.exists() { dir_size(&final_dir) } else { 0 };
+            let avail = free.saturating_add(torn_credit);
+            if avail < meta.disk_bytes {
+                return Err(err(format!(
+                    "INSTALL_DISK_FULL: {} MB needed, {} MB free at {}",
+                    meta.disk_bytes / 1_000_000,
+                    avail / 1_000_000,
+                    root.display()
+                )));
+            }
+        }
+    }
+
+    let mut old_backup: Option<PathBuf> = None;
+    let mut preclean_err: Option<String> = None;
+    if marker.exists() {
+        // Reinstall over an INSTALLED same-id pack: move the old tree ASIDE, never
+        // destroy it up front — a failed install must roll the working pack back
+        // (audit S42-r2). This dir rename targets a COLD tree (no fresh-file scan
+        // storm — that only ever hit the just-extracted side), so retry suffices.
+        let staging_parent = root.join(".staging");
+        std::fs::create_dir_all(&staging_parent)?;
+        let moved = staging_parent.join(format!(
+            ".old-{}-{}",
+            meta.id,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ));
+        crate::util::rename_with_retry(&final_dir, &moved, "PACK_MOVE_OUT").map_err(err)?;
+        old_backup = Some(moved);
+    } else if final_dir.exists() {
+        // Torn earlier attempt. Prefer a clean slate; extracting over identical
+        // content is the fallback when something still holds a subdir. Failing LOUD
+        // here would re-create the S42 pain (Defender's scan queue pins fresh-file
+        // handles for minutes right after a failed extract, while file CREATES keep
+        // working) — so the fallback stays, but the failure is REMEMBERED: if the
+        // extract-over then fails too, both causes surface in one message instead of
+        // an unexplainable unpack error (S68d).
+        if let Err(e) = crate::util::remove_dir_all_robust(&final_dir) {
+            preclean_err = Some(e.to_string());
+            tracing::warn!("torn install dir not fully cleared ({e}) — extracting over it");
+        }
+    }
+    std::fs::create_dir_all(&final_dir)?;
+
+    let result = (|| -> Result<PackMeta> {
+        let dest = long_path(&final_dir);
+        let mut count: u64 = 0;
+        for entry in entries {
+            if cancel.load(Ordering::SeqCst) {
+                return Err(err("INSTALL_CANCELLED"));
+            }
+            let mut entry = entry.map_err(|e| err(format!("TAR_ENTRY_CORRUPT: {}", error_chain(&e))))?;
+            // unpack_in refuses paths escaping dest (tar 路径穿越防护).
+            entry.unpack_in(&dest).map_err(|e| {
+                let mut msg = format!("EXTRACT_FAILED: {}", error_chain(&e));
+                if let Some(pc) = &preclean_err {
+                    // Both causes in one line: an extract-over failure is usually a
+                    // symptom of whatever blocked the pre-clean (locked/readonly
+                    // remnant) — alone, the unpack error is a riddle.
+                    msg.push_str(&format!(" [pre-clean incomplete: {pc}]"));
+                }
+                err(msg)
+            })?;
+            count += 1;
+            if count % 100 == 0 {
+                progress(count);
+            }
+        }
+        progress(count);
+
+        if !pack_python(&final_dir).exists() {
+            return Err(err("PACK_NO_PYTHON: python/python.exe missing from the archive"));
+        }
+
+        // ── the commit: one fresh file, same-dir rename ──
+        let tmp = final_dir.join("pack.json.tmp");
+        std::fs::write(&tmp, meta_text.as_bytes())
+            .map_err(|e| err(format!("INSTALL_COMMIT_WRITE_FAILED: {}: {e}", tmp.display())))?;
+        crate::util::rename_with_retry(&tmp, &marker, "INSTALL_COMMIT").map_err(err)?;
+        Ok(meta)
+    })();
+
+    match &result {
+        Ok(_) => {
+            // New pack committed — the old backup (reinstall case) is now redundant.
+            if let Some(old) = &old_backup {
+                let _ = std::fs::remove_dir_all(old);
+            }
+        }
+        Err(_) => {
+            // Marker never landed — the dir is invisible to discovery either way.
+            // Best-effort reclaim; sweep_staging finishes the job on next startup.
+            let _ = std::fs::remove_file(final_dir.join("pack.json.tmp"));
+            if let Err(e) = std::fs::remove_dir_all(&final_dir) {
+                tracing::warn!("failed install not fully reclaimed ({e}) — sweep will finish");
+            }
+            // Reinstall case: roll the previous pack back IN-SESSION — waiting for
+            // the next startup's sweep would leave the user packless until restart.
+            if let Some(old) = &old_backup {
+                match crate::util::rename_with_retry(old, &final_dir, "PACK_ROLLBACK") {
+                    Ok(()) => tracing::warn!("reinstall failed — previous pack rolled back"),
+                    Err(e) => tracing::error!("old-pack rollback failed ({e}) — startup sweep will restore it"),
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Resolve the part files for a LOCAL archive pick: a single `.tar.zst`, or the
+/// first `.partNN`/`.NNN` volume (siblings collected by numeric suffix). When a
+/// `<id>.manifest.json` sits next to the pick it is loaded for verification;
+/// otherwise (dev convenience) verification is skipped with a warning.
+pub fn resolve_local_parts(picked: &Path) -> Result<(Vec<PathBuf>, Option<PackManifest>)> {
+    let dir = picked
+        .parent()
+        .ok_or_else(|| err("LOCAL_FILE_BAD_DIR"))?;
+    let fname = picked
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| err("LOCAL_FILE_BAD_NAME"))?;
+
+    // Split-volume naming: <stem>.tar.zst.partNN (builder convention).
+    let (stem, parts) = if let Some(idx) = fname.find(".tar.zst.part") {
+        let stem = &fname[..idx + ".tar.zst".len()]; // "<id>.tar.zst"
+        let prefix = format!("{stem}.part");
+        let mut vols: Vec<(u32, PathBuf)> = Vec::new();
+        for e in std::fs::read_dir(dir)?.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if let Some(numpart) = name.strip_prefix(&prefix) {
+                if let Ok(n) = numpart.parse::<u32>() {
+                    vols.push((n, e.path()));
+                }
+            }
+        }
+        if vols.is_empty() {
+            return Err(err("LOCAL_PARTS_NOT_FOUND"));
+        }
+        vols.sort_by_key(|(n, _)| *n);
+        // Volumes must be contiguous from 1 — a missing middle volume would
+        // otherwise silently produce a corrupt stream.
+        for (i, (n, _)) in vols.iter().enumerate() {
+            if *n != (i as u32) + 1 {
+                return Err(err(format!("LOCAL_PARTS_GAP: missing {prefix}{:02}", i + 1)));
+            }
+        }
+        (stem.to_string(), vols.into_iter().map(|(_, p)| p).collect())
+    } else if fname.ends_with(".tar.zst") {
+        (fname.to_string(), vec![picked.to_path_buf()])
+    } else {
+        return Err(err("LOCAL_FILE_BAD_TYPE"));
+    };
+
+    let manifest_name = format!("{}.manifest.json", stem.trim_end_matches(".tar.zst"));
+    let manifest = std::fs::read_to_string(dir.join(&manifest_name))
+        .ok()
+        .and_then(|t| serde_json::from_str::<PackManifest>(&t).ok());
+    if manifest.is_none() {
+        tracing::warn!("no {manifest_name} next to the archive — installing WITHOUT hash verification");
+    }
+    Ok((parts, manifest))
+}
+
+pub fn delete_pack(id: &str) -> Result<()> {
+    // Interlocks first: deleting under a live install/self-test tears files out
+    // from under a running python.exe.
+    if install_active() {
+        return Err(err("DELETE_WHILE_INSTALLING"));
+    }
+    if envtest_active() {
+        return Err(err("DELETE_WHILE_ENVTEST"));
+    }
+    let root = runtime_root().ok_or_else(|| err("RUNTIME_ROOT_UNINIT"))?;
+    if !is_safe_component(id) {
+        return Err(err(format!("PACK_BAD_ID: {id:?}")));
+    }
+    let dir = root.join(id);
+    let marker = dir.join("pack.json");
+    if !marker.exists() {
+        return Err(err(format!("PACK_NOT_FOUND: {id}")));
+    }
+    // Marker-FIRST delete — the mirror image of the install commit: removing ONE
+    // closed file is never blocked by scanner handles elsewhere in the tree, and
+    // once the marker is gone the pack is de-listed everywhere (discovery keys on
+    // it). The tree itself is best-effort now + startup sweep later — the old
+    // "rename the whole dir out" approach hit the same ACCESS_DENIED wall as the
+    // install commit (see extract_and_commit).
+    let mut last: Option<std::io::Error> = None;
+    for attempt in 0..5u64 {
+        match std::fs::remove_file(&marker) {
+            Ok(()) => {
+                last = None;
+                break;
+            }
+            Err(e) => {
+                last = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(150 * (attempt + 1)));
+            }
+        }
+    }
+    if let Some(e) = last {
+        return Err(err(format!(
+            "PACK_DELETE_FAILED: {}: {e}",
+            marker.display()
+        )));
+    }
+    if let Err(e) = std::fs::remove_dir_all(&dir) {
+        // Invisible already; the startup sweep reclaims marker-less dirs.
+        tracing::warn!("pack tree removal deferred ({e}) — sweep will reclaim {}", dir.display());
+    }
+    Ok(())
+}
+
+/// Startup reclamation of `.staging` — AND of marker-less directories under the
+/// runtimes root (the second loop below); the name understates it (audit S42 —
+/// nothing else ever GC'd either):
+///   - `.old-<id>-<ts>`: the previous pack moved out during a reinstall. If the
+///     final dir went MISSING (crash between the two commit renames), RESTORE it —
+///     the user's working pack must not silently vanish. Otherwise delete.
+///   - `dl-<id>`: KEEP (resumable downloaded parts).
+///   - anything else: remove. Only those two are ever written here (the only two
+///     writers in the tree: `commands/pyenv.rs` and `extract_and_commit`), but the
+///     sweep stays blind on purpose — blindness is free insurance.
+/// ⚠ S115 deleted two bullets that named tenants NOTHING has ever created here:
+/// `.del-*` "deferred deletes" (the only `.del-` prefix in this repo is
+/// `CUDA_TRASH_PREFIX` = `.del-cuda-` under `<app>/runtime/` — a different root,
+/// swept by `sweep_deleted_cuda`) and "uuid extraction dirs", which belonged to the
+/// staging-extraction design that was rejected before this module's first commit.
+pub fn sweep_staging() {
+    // Hold the install slot for the whole sweep: without it an install starting
+    // mid-sweep can have its (deliberately marker-less) target dir reclaimed out
+    // from under the extracting tar, or a mid-reinstall .old- backup "recovered"
+    // into the commit target (audit S42-r2). If somehow busy, just skip.
+    let Ok((_guard, _flag)) = InstallGuard::acquire() else {
+        tracing::info!("pyenv sweep skipped — an install is in flight");
+        return;
+    };
+    let Some(root) = runtime_root() else { return };
+    let staging = root.join(".staging");
+    if let Ok(entries) = std::fs::read_dir(&staging) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
+                continue;
+            };
+            if name.starts_with("dl-") {
+                continue; // resumable download parts
+            }
+            if let Some(rest) = name.strip_prefix(".old-") {
+                // ".old-<id>-<millis>" — id may itself contain '-'.
+                if let Some((id, _ts)) = rest.rsplit_once('-') {
+                    let final_dir = root.join(id);
+                    if !final_dir.exists() && path.join("pack.json").exists() {
+                        match crate::util::rename_with_retry(&path, &final_dir, "INSTALL_RECOVERY") {
+                            Ok(()) => {
+                                tracing::warn!("recovered pack {id} from interrupted reinstall");
+                            }
+                            Err(e) => {
+                                // NEVER fall through to deletion here: this backup can
+                                // be the ONLY remaining copy of the user's pack (the
+                                // fall-through was audit S42-r2's HIGH finding). Leave
+                                // it for a later sweep.
+                                tracing::warn!("recovery of {id} failed ({e}) — keeping backup for next sweep");
+                            }
+                        }
+                        continue;
+                    }
+                    // final dir exists (or backup is incomplete) → stale backup: delete below.
+                }
+            }
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => tracing::info!("pyenv sweep: removed stale {}", path.display()),
+                Err(e) => tracing::warn!("pyenv sweep: could not remove {} ({e})", path.display()),
+            }
+        }
+    }
+
+    // Marker-less dirs under the ROOT = torn installs / deferred deletes of the
+    // marker-file commit protocol — reclaim them too (safe: we HOLD the install
+    // slot, so no live extraction target can be among them).
+    let Ok(entries) = std::fs::read_dir(root) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        if name.starts_with('.') || !path.is_dir() {
+            continue;
+        }
+        if !path.join("pack.json").exists() {
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => tracing::info!("pyenv sweep: reclaimed marker-less {}", path.display()),
+                Err(e) => tracing::warn!("pyenv sweep: could not reclaim {} ({e})", path.display()),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The variant→tier mapping is the ONLY thing between a GPU pack and a green badge
+    /// earned by a run that never touched a GPU — S115 found the manual E2E harness had
+    /// exactly that hole (it passed no `--device`, whose default is `cpu`, so four GPU
+    /// checks reported "not applicable to this tier" and the pack still went green).
+    /// Two halves, and the SECOND is the one that survives a new pack being added.
+    #[test]
+    fn s115_envtest_tier_is_derived_for_every_catalog_variant() {
+        // (1) the arms, including the counterintuitive one: torch-hip answers to
+        //     `torch.cuda.*`, so ROCm's tier IS the cuda tier.
+        assert_eq!(envtest_device_for_variant("amd"), "cuda");
+        assert_eq!(envtest_device_for_variant("nv-cu130"), "cuda");
+        assert_eq!(envtest_device_for_variant("xpu"), "xpu");
+        assert_eq!(envtest_device_for_variant("cpu"), "cpu");
+
+        // (2) tie it to the CATALOG. Exactly one shipped variant may take the cpu tier,
+        //     and it must be the one whose whole point is the cpu. A new GPU pack added
+        //     without extending the mapping lands in the `_ => "cpu"` arm and reddens
+        //     HERE, instead of shipping a self-test that skips everything it exists for.
+        for e in CATALOG {
+            let tier = envtest_device_for_variant(e.variant);
+            if e.variant == "cpu" {
+                assert_eq!(tier, "cpu", "the cpu pack must take the cpu tier");
+            } else {
+                assert_ne!(
+                    tier, "cpu",
+                    "catalog variant {:?} ({}) falls through to the cpu tier — extend \
+                     envtest_device_for_variant, or this pack's self-test will pass \
+                     without ever touching the device it exists for",
+                    e.variant, e.id
+                );
+            }
+        }
+
+        // …and pin the TABLE too, so the loop above can never pass vacuously (S105: an
+        // assertion over a table needs a second one that only the table can fail).
+        assert_eq!(CATALOG.len(), 4, "catalog size changed — re-read the loop above");
+        assert_eq!(CATALOG.iter().filter(|e| e.variant != "cpu").count(), 3);
+    }
+
+    /// S169 — the tier mapping's companion: the arch list envtest's `amd_device_pick`
+    /// masks with must follow the INSTALLED pack's version (v1 = gfx1103 only, v2 = the
+    /// RDNA3 superset), and only the amd variant gets one at all — a stray list on the
+    /// nv/xpu lanes would flip envtest into the AMD device pick on the wrong runtime.
+    #[test]
+    fn s169_envtest_gfx_targets_follow_the_installed_pack_version() {
+        assert_eq!(
+            envtest_gfx_targets_for("amd", 2).as_deref(),
+            Some("gfx1100,gfx1101,gfx1102,gfx1103")
+        );
+        // v0 = pack.json predating the version field; reads as the v1 inventory.
+        assert_eq!(envtest_gfx_targets_for("amd", 0).as_deref(), Some("gfx1103"));
+        assert_eq!(envtest_gfx_targets_for("amd", 1).as_deref(), Some("gfx1103"));
+        for v in ["nv-cu130", "xpu", "cpu"] {
+            assert_eq!(envtest_gfx_targets_for(v, 2), None, "{v} must not get a gfx list");
+        }
+    }
+
+    /// S168 — the candidate builder: user HF base first, HF rows in catalog order, the GH
+    /// row expanded through the given proxy routes (one URL per route, "" = direct), all
+    /// deduped. The reporter's failure mode — six installs dying on one unreachable host
+    /// while the log named another — is only fixable if the rotation actually leaves
+    /// huggingface.co, which is what the gh expansion pins here.
+    #[test]
+    fn manifest_candidates_expand_gh_routes_and_put_the_custom_hf_base_first() {
+        let entry = CATALOG.iter().find(|e| e.id == "runtime-amd-v2").unwrap();
+        let gh = "https://github.com/yasoukyoku/UtaiSynthesizer/releases/download/packs-v1/runtime-amd-v2.manifest.json";
+
+        let routes = vec!["https://gh-proxy.com".to_string(), String::new()];
+        let urls = manifest_url_candidates(entry, Some("https://hf.example.cn"), Some(&routes));
+        assert_eq!(
+            urls[0],
+            "https://hf.example.cn/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-amd-v2.manifest.json"
+        );
+        assert!(urls[1].starts_with("https://huggingface.co/"), "{}", urls[1]);
+        assert!(urls[2].starts_with("https://hf-mirror.com/"), "{}", urls[2]);
+        assert_eq!(urls[3], format!("https://gh-proxy.com/{gh}"));
+        assert_eq!(urls[4], gh);
+        assert_eq!(urls.len(), 5, "{urls:?}");
+
+        // No routes → GH direct only; no custom base → the HF pair leads unchanged.
+        let plain = manifest_url_candidates(entry, None, None);
+        assert!(plain[0].starts_with("https://huggingface.co/"));
+        assert_eq!(plain[2], gh);
+        assert_eq!(plain.len(), 3, "{plain:?}");
+
+        // A custom base equal to a fixed row REORDERS the rotation instead of duplicating
+        // (the hf-mirror preset must not be silently ignored — audit S64's asset rule).
+        let dup = manifest_url_candidates(entry, Some("https://hf-mirror.com"), None);
+        assert!(dup[0].starts_with("https://hf-mirror.com/"));
+        assert_eq!(dup.len(), 3, "{dup:?}");
+    }
+}

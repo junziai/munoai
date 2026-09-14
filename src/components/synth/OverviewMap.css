@@ -1,0 +1,10 @@
+.overview-map {
+  width: 220px;
+  height: 32px;
+  min-height: 32px;
+  flex-shrink: 0;
+  cursor: pointer;
+  display: block;
+  border-radius: var(--radius-md);
+  margin: 4px 8px;
+}

@@ -1,0 +1,487 @@
+import type { RvcOptions, SovitsOptions } from "../lib/workflow/voiceDefaults";
+
+export interface LaneControl {
+  volumeDb: number;
+  pan: number;
+  muted: boolean;
+}
+
+/** 乐器轨的音源选择(阶段1/2:Muno 音源管理)。fontId = 音源目录/文件标识(SFZ 目录名或
+ *  SF2 文件 stem),presetId = SFZ 文件 stem 或 SF2 "bank:program"。presetName 冗余存显示名,
+ *  轨道头直接显示,不用再查表。写入走 project.setTrackSoundfont(可撤销,进 meaningfulSig)。 */
+export interface TrackSoundfont {
+  fontId: string;
+  presetId: string;
+  presetName?: string;
+}
+
+export interface Track {
+  id: string;
+  name: string;
+  trackType: "vocal" | "audio" | "instrument";
+  color?: string;
+  segments: Segment[];
+  volumeDb: number;
+  pan: number;
+  muted: boolean;
+  solo: boolean;
+  /** 文件夹分组轨道(DAW 式): isFolder=true 的轨道是纯容器(无 segments), 仅作折叠头。
+   *  子轨通过 folderId 指向所属文件夹轨道的 id; folderCollapsed 仅存在于文件夹轨道上。 */
+  isFolder?: boolean;
+  folderId?: string;
+  folderCollapsed?: boolean;
+  voiceModel?: string;
+  voiceModelAvatar?: string;
+  /** ② Vocal-track (自己唱) settings — backend + the ScoreToCV speaker/lang + a track-level transpose.
+   *  Present only on vocal tracks that have been configured; absent = defaults. Persisted + UNDOABLE
+   *  (in meaningfulSig, like voiceModel). The SVC voice itself stays in `voiceModel`; the render-time SVC
+   *  inference knobs (noise_scale…) join here in Phase 6 when the vocal render is wired. (S48 Phase 3) */
+  vocalParams?: VocalTrackParams;
+  expanded: boolean;
+  /** S59: the audio track's LOUDNESS LANE band (playback-domain clip-gain envelope editor) is
+   *  open. Pure VIEW state, mirroring `expanded` exactly: excluded from undo/dirty, overlay
+   *  re-merged on snapshot restore, stripped from the autosave compare. Absent/false = closed. */
+  loudnessLaneOpen?: boolean;
+  /** S59b: which sub-lane GROUPS are showing/editing their loudness envelope (keyed by
+   *  laneGroupId, the group-bar dB toggle). Same view-state posture as loudnessLaneOpen; while
+   *  ON, the group's rows edit envelope points instead of piece trims. Canonical write: true
+   *  entries only, sorted keys, record deleted when empty. */
+  laneLoudnessOpen?: Record<string, boolean>;
+  /** Per-GROUP mix (volume/pan), keyed by the producing Output node id (`laneGroupId`) — "recorded ON
+   *  the Output node", exactly like laneOps: all lanes of one 组 share the setting (解组 to control
+   *  independently), a 轨道组 rename OR any upstream rewiring (insert an effects node, reconnect to the
+   *  same Output) never re-keys it, and an ungroup inherits it per new node. Future loudness envelopes
+   *  live at this same identity. Read through `laneControlFor` (legacy pre-S28 saves keyed by laneId —
+   *  the fallback). `muted` inside is LEGACY too — mute lives in `laneMutes` via `isLaneRowMuted`. */
+  laneControls: Record<string, LaneControl>;
+  /** Per-ROW mute, keyed by `laneRowKey` (轨道组 name + laneId). Deliberately LOOSER than laneControls:
+   *  mute is a view/audibility toggle on the ROW you see — resets on rename/ungroup (one click to
+   *  redo, one predicate or display/export disagrees with playback), and diverged split-half rows mute
+   *  independently. THE "audible or not" source of truth (via isLaneRowMuted) — the future mixdown
+   *  export + overall-waveform display MUST consult the same predicate, never laneControls.muted
+   *  directly. Absent on old saves. */
+  laneMutes?: Record<string, boolean>;
+  /** S12 效果发送(FX send,0..1,0=关闭):整轨输出叠进全局混响/延迟辅助总线(后期处理域,
+   *  只作用于「听到/导出」,绝不进声源渲染)。仅在 >0 时落盘(默认即删除,防假脏);可撤销
+   *  (进 meaningfulSig)。播放与导出共用 effectsBus 中同一套总线拓扑,保证听导一致。 */
+  reverbSend?: number;
+  delaySend?: number;
+  /** SOURCE selector: true = this track plays its ORIGINAL audio, bypassing the deposited sub-lanes
+   *  (they leave the output entirely — playback AND the future mixdown export; a Mute/Solo-class
+   *  state, persisted + undoable). Default false = sub-lanes play whenever a segment has ready ones.
+   *  NEVER read this (or processedOutputs presence) directly to decide the source — go through
+   *  `segmentPlaysLanes` (trackLayout), THE one predicate shared by playback, the main-row waveform,
+   *  and (future) mixdown, so what you see is always what you hear. */
+  playOriginal?: boolean;
+  /** 乐器轨音源(soundfont)选择——仅 instrument 轨使用。缺省 = 未选(轨道头显示占位,
+   *  播放/试听时提示先选音色)。可撤销(进 meaningfulSig),随 .usp 持久化。 */
+  soundfont?: TrackSoundfont;
+  /** AMT 节点自动生成的 MIDI 音符轨道标记：记录产出它的 amtMidi 工作流节点 id。用于该节点
+   *  再次运行时"替换式"去重（移除旧轨道再重新生成）。仅节点自动生成时为非空；普通手动/导入
+   *  轨道不含此字段。仅作标记，不参与 meaningfulSig 内容比较。 */
+  amtNodeId?: string;
+  /** autoArrange 节点自动生成的乐器轨标记：记录产出它的工作流节点 id。
+   *  用于 TrackList 把这些轨分组显示浮动工具条（整组换风格 / 单轨换音色 / Solo）。
+   *  仅 autoArrange 自动生成时为非空；普通手动/导入轨道不含此字段。
+   *  仅作标记，不参与 meaningfulSig 比较。 */
+  autoArrangeNodeId?: string;
+  /** 6 个效果器槽位 — Inspector 面板的插件链。
+   *  固定长度 6；null = 空槽；字符串 = 插件 id (如 "eq"/"reverb")。
+   *  可撤销（进 meaningfulSig），随 .usp 持久化。 */
+  pluginSlots?: (string | null)[];
+}
+
+/** One kept audio piece of a sub-lane GROUP within a segment, in STEM MILLISECONDS (absolute position
+ *  in the rendered stem, 0 = stem start). Non-destructive: the recipe of which portions of the rendered
+ *  audio play — the stem file itself is untouched (D2). Stem-ms is INVARIANT under the parent segment's
+ *  move / split / resize / tempo change (those only shift the visible window [offsetMs, offsetMs+durMs]
+ *  into the stem), so ops never need re-basing — read-time they're intersected with the window. A missing
+ *  `laneOps[outputNodeId]` entry = the whole lane plays (implicit); an empty `[]` = explicitly silenced. */
+export interface LaneClip {
+  /** Start position in the stem, milliseconds. */
+  start: number;
+  /** End position in the stem, milliseconds. */
+  end: number;
+}
+
+export interface ProcessedOutput {
+  /** Stable per-lane IDENTITY = the producing Output node id (+ `::stem` when that node fans out
+   *  multiple stems). The key for rendering rows / selection / laneControls — distinct even when two
+   *  Output nodes share a display `laneLabel`, so same-named lanes never collapse onto one row. */
+  laneId: string;
+  /** Human DISPLAY name ("Group" or "Group · stem"). NOT an identity — may collide across nodes
+   *  (the header row de-collides visually by numbering, see getLanes). */
+  laneLabel: string;
+  /** The producing Output node's GROUP name at deposit time (laneLabel's base, no stem suffix).
+   *  Part of the ROW identity (`laneRowKey` = group + laneId) so two split halves that share a laneId
+   *  but DIVERGE their group (rename one half's Output node) get separate rows instead of the
+   *  first-seen label swallowing the sibling. Backfilled from laneLabel on load for older saves. */
+  group?: string;
+  audioPath: string;
+  totalDurationMs: number;
+  waveformPeaks?: number[];
+  /** Which Output node produced this lane. Lets a per-node deposit replace only that node's OWN prior
+   *  contribution (merge by node identity, not by laneLabel) so two Output nodes sharing a lane name
+   *  don't clobber each other. Optional/undefined on legacy projects (merge falls back to laneLabel). */
+  outputNodeId?: string;
+  /** True while an Output-node deposit is decoding this lane's audio — the track renders a loading
+   *  placeholder (same look as an audio import) until the real waveform is merged in. */
+  loading?: boolean;
+  /** ② Vocal bake ONLY: the render-input signature (notes+pitchDev+params+voice+tempo) this stem was
+   *  baked from — set on the ② vocal lane's deposit (vocalRenderSig). Lets "auto-render changed tracks on
+   *  Play" skip a segment whose bake still matches. Overlay-only (excluded from the history meaningfulSig,
+   *  like the rest of processedOutputs) so it never causes false-dirty / a phantom undo step; it rides the
+   *  `.usp` with the bake so a reloaded project doesn't needlessly re-render on first Play. */
+  renderedSig?: string;
+  /** ② Vocal bake ONLY: on a notes SPLIT the carried stem is the PARENT's (renderedSig stays the parent's full
+   *  sig), but this half only shows a WINDOW of it — `windowSig` = the vocalRenderSig of THIS half's (windowed)
+   *  content. isVocalDirty accepts the bake when EITHER renderedSig OR windowSig matches the current content:
+   *  renderedSig matches after an undo-of-split (the full stem == the restored full content) and windowSig
+   *  matches right after the split (the window == this half). Both live on the OVERLAY (never undoable), so
+   *  they can't desync from the bake — any real drift (edit / tempo / param / singer) fails BOTH → re-render. */
+  windowSig?: string;
+  /** ② Vocal bake ONLY: ms INTO the stem where this half's playback + waveform begin — set on the RIGHT half
+   *  of a notes SPLIT so BOTH halves WINDOW the same baked stem (like an audioClip's offsetMs) instead of
+   *  re-rendering (§user: "把已有整段在切点切开"). 0/absent = the stem starts at the segment start (the normal,
+   *  un-split case → byte-identical). Overlay-only, like renderedSig (rides the bake, not the history sig). */
+  offsetMs?: number;
+}
+
+export interface Segment {
+  id: string;
+  startTick: number;
+  durationTicks: number;
+  content: SegmentContent;
+  workflow?: Workflow;
+  processedOutputs?: ProcessedOutput[];
+  /** Non-destructive sub-lane edits (slice / edge-stretch / delete), keyed by the producing Output
+   *  node id (the GROUP — all lanes fanned into one Output node share one recipe: "group-operate").
+   *  Each value is the list of kept audio pieces in STEM MS (see LaneClip). UNLIKE processedOutputs
+   *  (the baked render = a non-undoable overlay), laneOps is an ARRANGEMENT edit: it IS in the history
+   *  meaningfulSig (undoable) and survives a re-render (keyed by node id, not baked into the audio). */
+  laneOps?: Record<string, LaneClip[]>;
+  /** S59b: per-GROUP loudness envelope for the sub-lanes, keyed by the producing Output node id
+   *  (laneGroupId — the SAME identity as laneControls volume/laneOps; 解组 for independent
+   *  stems, exactly like the V/P faders). Values are dB curves on BOX-RELATIVE ticks, drawn on
+   *  the group's lane rows and ADDED on top of the clip-wide loudness curve at playback (dB sum,
+   *  playback-domain only — never fed to rendering). Undoable (meaningfulSig, like laneOps);
+   *  box-relative ⇒ sliced on split and rescaled with tempo/stretch alongside paramCurves. */
+  laneLoudness?: Record<string, PitchCurve>;
+  /** True while the audio file backing this segment is still being decoded after a drag/import.
+   *  A loading segment renders as a striped placeholder and is skipped during playback;
+   *  `content.totalDurationMs` holds the probed (approximate) duration until decode finishes. */
+  loading?: boolean;
+}
+
+export type SegmentContent =
+  | {
+      type: "notes";
+      notes: Note[];
+      /** ② Hand-drawn ADDITIVE f0 offset over the whole part (SynthV "Pitch Deviation"), in cents,
+       *  X = ticks relative to the segment start. Adds ON TOP of the note-derived baseline (§3.2 layer ③);
+       *  a paint gesture REPLACES the covered x-interval. Absent = no manual deviation. (S48 Phase 3) */
+      pitchDev?: PitchCurve;
+      /** ② Per-parameter automation lanes (loudness / tension / breath / gender …), keyed by param name.
+       *  Same PitchCurve shape (X = ticks rel. segment start, Y = param value). Absent = all defaults. */
+      paramCurves?: Record<string, PitchCurve>;
+    }
+  | {
+      type: "audioClip";
+      sourcePath: string;
+      offsetMs: number;
+      totalDurationMs: number;
+      /** S59 detected BPM/beat grid. Anchored in SOURCE-audio ms → stable under split/resize/stretch
+       *  (both split halves keep the same grid). Absent = never analyzed / cleared. Undoable (contentSig). */
+      tempoDetect?: TempoDetect;
+      /** S59 Tempo Slider: played duration / source duration (>1 = slower). The clip window
+       *  (offsetMs/totalDurationMs, laneOps, stems) stays in UNSTRETCHED source coordinates — r applies
+       *  only at the tick↔source-ms boundary and playback feeds per-(content,r) stretched artifacts.
+       *  Stored ONLY when ≠ 1 (false-dirty rule: old projects stay byte-identical). */
+      stretch?: number;
+      /** S59 loudness lane (playback-domain clip-gain envelope, dB) — mirrors the notes variant's
+       *  paramCurves ("loudness" key; X = ticks rel. segment start). Applied as a WebAudio gain
+       *  envelope at schedule time, NEVER fed into rendering (the cover pipeline already derives its
+       *  loudness from the source audio itself — vol_embedding / rms_mix). */
+      paramCurves?: Record<string, PitchCurve>;
+    };
+
+/** S59 BPM/beat-grid detection result carried on an audio clip. All values canonical-rounded at the
+ *  single store write point (setSegmentTempoDetect) so serialize stays byte-stable. */
+export interface TempoDetect {
+  /** Constant-grid tempo in BPM (regression-refined). */
+  bpm: number;
+  /** First grid beat in SOURCE-audio ms; the grid is anchorMs + k·(60000/bpm) for all k ≥ 0. */
+  anchorMs: number;
+  /** Which grid beat (0-based, counting from the anchor) is bar-beat 1. */
+  downbeat: number;
+  /** Detector confidence ∈ [0,1]. */
+  conf: number;
+  /** True = the material did not fit a constant grid (UI marks the grid advisory). Stored ONLY when true. */
+  notConstant?: boolean;
+}
+
+/** One vocal note (§3.1 "VocalNote"). A SUPERSET of the original 7-field Note: the base fields are the
+ *  musical note; the optional fields (all absent = a plain note at its谱-derived pitch) carry the pitch/
+ *  expression edits SynthV/OpenUTAU expose. UNITS ARE FIXED: X = ticks (480 PPQ), Y = cents — end to end.
+ *  Every optional is written ONLY when non-default (the store omits defaults) so the raw-JSON
+ *  save/autosave compare stays byte-stable (§5 false-dirty rule). All fields are UNDOABLE (contentSig). */
+export interface Note {
+  id: string;
+  tick: number;
+  duration: number;
+  pitch: number;
+  lyric: string;
+  phoneme?: string;
+  velocity: number;
+  /** Fine pitch offset in cents (± ), added to `pitch`. Absent = 0. */
+  detune?: number;
+  /** ② Per-note pitch-TRANSITION override (SynthV Pitch Transition, §10.3). Shapes how this note connects
+   *  to its neighbours (glide in from prev / out to next). Every field optional → absent fields fall back
+   *  to the track default (VocalTrackParams.transition). Absent whole = pure track default. */
+  transition?: NoteTransition;
+  /** ④ Tail/mid vibrato (SynthV model). All fields present when on; absent = none. */
+  vibrato?: VibratoSpec;
+  /** false = the note's pitch baseline is FROZEN to the user's manual edits (v1 "Path B"); absent/true =
+   *  re-derived from the score (Path A). Stored ONLY when false. */
+  pitchAuto?: boolean;
+  /** Explicit tie / sustain to the previous note (承前元音 legato). Stored ONLY when true. */
+  tie?: boolean;
+  /** ② S73 调教所有权标记:true = 此音符的 transition/vibrato 是「自动调教」写入的(机器调教,
+   *  后续 auto-tune/Retake/Expressiveness 可自由改写)。用户在侧栏手动改 transition/vibrato 时
+   *  剥除(所有权移交用户,自动过程从此绕行——SynthV SV1「用户设过值则跳过」同构)。
+   *  Stored ONLY when true。 */
+  autoTuned?: boolean;
+  /** Per-note language override (zh/ja/en/de/fr/es/it). Absent = follow the track default (§3.7 ACE-style). */
+  lang?: string;
+  /** User override at the TRADITIONAL-phoneme layer (拼音/假名/ARPABET — NOT raw IPA); stage2 converts it
+   *  to IPA at render (§3.7). Absent = derive from `lyric`. */
+  phonemeInput?: string;
+  /** S167 (§E2): per-note phoneme timing/strength override (SynthV-style), made in the phoneme lane.
+   *  `phones` = the emitted phone sequence the edit was made against — the STALENESS key: if a later
+   *  change (lyric / language / dictionary update) makes the note emit a different sequence, the
+   *  render IGNORES the edit (and the lane shows it as stale) rather than misapply it. `scale` =
+   *  per-phone duration weights (1 = the allocator's own split; the note's total length is conserved,
+   *  so a phone grows at its neighbours' expense, never the timeline's). `gainDb` = per-phone output
+   *  gain in dB (0 = untouched). Absent = the allocator's own timing, byte-identical to pre-S167. */
+  phoneTiming?: { phones: string[]; scale: number[]; gainDb?: number[] };
+}
+
+/** S167 (§E4): the Spanish dialect ids the wire accepts (absent = the dictionary's primary rows,
+ *  today's behaviour). Rust parses tolerantly — an unknown value lands on the default. */
+export type EsDialectId = "castilian" | "castilian_yeista" | "latam" | "andean";
+
+/** ② SynthV Pitch Transition — how a note connects to its neighbours (§10.3). ALL times are ABSOLUTE ms
+ *  (NOT ticks) so a glide sounds the same at any tempo; overshoot depths are cents. As a per-note override
+ *  every field is optional (absent → the concrete track default in VocalTrackParams.transition). */
+export interface NoteTransition {
+  /** Shift the whole cross-note transition earlier(−)/later(+), ms (SynthV Offset). */
+  offsetMs?: number;
+  /** How long AFTER this note's onset the pitch arrives from the previous note (arrive-late), ms ≥ 0. */
+  durLeftMs?: number;
+  /** How long BEFORE this note's end the pitch begins leaving toward the next note (leave-early), ms ≥ 0. */
+  durRightMs?: number;
+  /** Arrival overshoot at the left transition, signed cents (SynthV Depth Left; ~15¢ default = human feel). */
+  depthLeftCents?: number;
+  /** Departure overshoot at the right transition, signed cents (SynthV Depth Right). */
+  depthRightCents?: number;
+  /** Open-edge scoop depth, cents ≥ 0 (§10.5). At a boundary with NO connected neighbour, the pitch references
+   *  `tone − openEdgeCents`: an isolated ONSET scoops UP from it (with durLeft/depthLeft), an isolated RELEASE
+   *  drifts DOWN to it (with durRight/depthRight). SynthV renders this via its AI; we synthesize it with the
+   *  transition machinery + this one reference amount. 0 = flat onset/release (pre-§10.5 behaviour). */
+  openEdgeCents?: number;
+}
+
+/** An ordered polyline (X = ticks, Y = cents/param-value). Parallel arrays keep it compact + JSON-stable;
+ *  painting replaces the covered x-interval. `xs` is strictly increasing; `xs.length === ys.length`. */
+export interface PitchCurve {
+  xs: number[];
+  ys: number[];
+}
+
+/** ④ Vibrato (SynthV model, §10.3). Times ABSOLUTE ms; frequency Hz; amplitude cents. The onset delay
+ *  (startMs) is why short notes don't visibly vibrate. (jitter = natural pitch flutter — deferred Phase 6.) */
+export interface VibratoSpec {
+  /** Amplitude in cents (peak deviation, ± around the base). SynthV default ≈ 100¢ (1 semitone). */
+  depthCents: number;
+  /** Oscillation rate in Hz (SynthV 1–10, default 5.5). */
+  freqHz: number;
+  /** Start phase, −1…+1 (fraction of a cycle). */
+  phase: number;
+  /** Onset delay after the note's start, ms (short notes stay flat). */
+  startMs: number;
+  /** Linear fade-in / fade-out durations, ms. */
+  easeInMs: number;
+  easeOutMs: number;
+}
+
+/** S91: the UTAU alias conventions an English track's lyrics may be written in. The wire spelling is
+ *  shared with Rust's `g2p_alias::PhonemeSet::as_str` — the two must only ever change together. */
+export type PhonemeSetId = "arpasing" | "xsampa" | "vccv";
+
+/** S113 (§C14): the NON-ERROR remarks `validate_lyrics` may attach to a `phones` verdict. A note
+ *  carrying one RESOLVED and SOUNDS — this is not a failure channel and must never be unioned into
+ *  a red/blocking set (see `AppState.vocalAliasHint`).
+ *
+ *  Wire spelling shared with Rust's `g2p_alias::AliasHint::wire`. Unlike `PhonemeSetId` above, that
+ *  sharing is ENFORCED: `s113_alias_hint_wire_matches_the_ts_union` reads THIS line out of this
+ *  file, so a variant added on one side and not the other goes red at `cargo test`. */
+export type AliasHintId = "multiple_nuclei";
+
+/** ② Vocal-track (自己唱) parameters (§3.1). The SVC voice/singer stays in `Track.voiceModel`; this holds
+ *  the backend choice + the ScoreToCV conditioning (speaker/lang) + a track-level transpose. */
+export interface VocalTrackParams {
+  backend: "rvc" | "sovits";
+  /** ScoreToCV speaker id (0–76; near speaker-invariant, default 49 = kiritan). NOT the SVC voice. */
+  speakerId: number;
+  /** ScoreToCV language id (zh0 ja2 en1 de3 fr4 es5 it6). */
+  langId: number;
+  /** Track-level transpose in semitones, applied to every note's pitch → f0. */
+  transpose: number;
+  /** ② 共振腔/formant — track-level SCALAR in semitones (singer-tab), ADDED to the per-frame formant lane
+   *  (`paramCurves["formant"]`); the sum → `formant_warp` ratio = 2^(semi/12) at render. 0 = no shift (a
+   *  ratio-1 pass-through). Always present (default 0), mirroring `transpose` — never optional-stripped. */
+  formant: number;
+  /** Track-level DEFAULT note transition — every field concrete. A note's NoteTransition overrides it
+   *  per-field, so every note has a smooth SynthV-style glide by default (§10.3). */
+  transition: Required<NoteTransition>;
+  /** Item-1 quality-path overrides — only the keys the user CHANGED from the contract default are stored
+   *  (absent = SOVITS_DEFAULTS/RVC_DEFAULTS). The render (render_vocal_segment) fills the full contract and
+   *  force-neutralizes the params that would break the ② render (auto_f0 / f0_shift / loudness / only_diff /
+   *  rms_mix). `backend` picks which one is used. */
+  sovits?: Partial<SovitsOptions>;
+  rvc?: Partial<RvcOptions>;
+  /** M3 breath: the lyric token that means "audible inhale". Mapped to the canonical `AP` phone at render
+   *  time, so the user can pick a convenient trigger without the breath function stealing a glyph they need
+   *  as a real lyric. Absent = "AP" (the default; `ap` also works, being AP's case variant Rust-side). */
+  breathToken?: string;
+  /** S88: the lyric token that means "a rest" — those notes are silent AND carry no pitch (exactly like
+   *  leaving a gap). Mapped to the canonical `R` before the score reaches Rust, so the trigger the user
+   *  picks never has to be stolen from real lyric material. Absent = "R" (the default; `r` and an empty
+   *  lyric also work, being what Rust hard-wires). The counterpart of `breathToken`. */
+  restToken?: string;
+  /** S83 knife 6b: voiceless-ONSET emphasis in dB (the SynthV "consonant strength" analogue) — a small
+   *  output-domain trapezoid gain on voiceless onset phone windows (codas untouched). 0 = off (exact
+   *  no-op); absent = DEFAULT_CONSONANT_EMPHASIS_DB (2.5). The default folds OUT of the render sig so
+   *  pre-knob bakes stay clean. */
+  consonantEmphasis?: number;
+  /** S84 C 刀: chain-internal consonant-valley scale (×measured per-class depth) — an output-domain
+   *  gain valley on syllable-boundary consonant windows (voiced AND voiceless; codas + post-rest
+   *  onsets excluded), restoring the per-syllable energy alternation real singing has (fast-run 粘连
+   *  treatment). 0 = off (exact no-op); absent = DEFAULT_CONSONANT_VALLEY (1). Folds out of the
+   *  render sig at default so pre-knob bakes stay clean. */
+  consonantValley?: number;
+  /** S84 E 刀: vowel-clarity articulation oversampling — short nuclei (≤4 frames) render at an
+   *  inflated S2CV duration and their cv resamples back onto the true timeline, so fast-run vowels
+   *  reach their articulation target (「渲染长音素再缩短」, cv-domain; ma 发成闭口类的欠冲治标)。
+   *  Absent/true = ON (the production default; a REAL measured win — F1 646→836 on the S84 ま
+   *  case); stored ONLY as false (absent≡true, the autoTuneFollow fold pattern). */
+  vowelClarity?: boolean;
+  /** S89 「自动音素时序」: onset consonants are PRE-ROLLED ahead of the beat (borrowed from the
+   *  previous phone) so the vowel lands ON the beat — what real singing does, what the training data
+   *  annotates, and what a UTAU voicebank's oto preutterance does. `false` keeps every phone INSIDE
+   *  its own note.
+   *  ⚠ S91 CORRECTION: S89 shipped this saying a UTAU CVVC/VCCV score's author "already moved the
+   *  consonants ahead by hand", so pre-rolling would apply the head start twice. That is FALSE, and
+   *  measurement on the four reference USTs says so. (1) The pre-utterance lives in the file's own
+   *  `PreUtterance` field — 486-489 notes in each of the three parallel scores carry a numeric one
+   *  (median 82-120 ms); the fourth leaves it blank and inherits it from the bank's `oto.ini` —
+   *  and in UTAU semantics either form moves the SAMPLE, never the note's tick. (2) Against the
+   *  1/8-beat (60-tick) unit these files are written on, the median start offset is 0 for EVERY
+   *  onset class, and longer consonants do not start earlier (nasals are the latest) — the
+   *  fingerprint a hand-made pre-shift would leave is absent. ⚠ Do NOT restate this as "median 0
+   *  against every grid": against the app's own 1/4 grid it is ~+49 ticks, because these scores are
+   *  transcribed from an UNQUANTISED performance (review S91 caught the overstatement).
+   *  So our pre-roll is the analogue of preutterance, applied ONCE — leave it ON for alias scores too.
+   *  Absent/true = ON (the production default); stored ONLY as false (the vowelClarity fold pattern). */
+  consonantPreroll?: boolean;
+  /** S91 「音素约定」(queue 5c): which UTAU alias convention this track's ENGLISH lyrics are written
+   *  in. An English UST written against a voicebank carries sample ALIASES, not words — `-aI` / `e@n`
+   *  / `y uw` / `&m` / `1ng-` — and each convention spells the same sound differently.
+   *  Absent = `"words"`: ordinary spelling through the dictionary, byte-for-byte the pre-S91 behaviour.
+   *  Only ENGLISH notes are affected (the conventions ARE English reclists), and an explicit
+   *  `phonemeInput` or a `[bracket hint]` still wins over it. An alias the convention cannot read
+   *  fails LOUDLY (red note + VOCAL_ALIAS) and NEVER falls back to the dictionary — a third of these
+   *  aliases are also real English words. Rust: `inference/g2p_alias.rs`. */
+  phonemeSet?: PhonemeSetId;
+  /** S167 (§E4): Spanish dialect for DICTIONARY-derived phones (distinción/seseo · lleísmo/yeísmo).
+   *  Absent = the shipped primary rows exactly as they are (pre-S167, byte-identical). The named
+   *  dialects normalize toward one consistent variety (the shipped rows are a measured mixture —
+   *  ~11% of ⟨z/ce/ci⟩ keys are seseo-primary). Spanish notes only; a per-note phoneme override or
+   *  [bracket hint] still wins untouched. Rust: `g2p::EsDialect`. */
+  esDialect?: EsDialectId;
+  /** S60-2 音域扩展: out-of-comfort parts render translated into the singer's tested comfort zone and are
+   *  shifted back (TD-PSOLA inverse; needs a vocal_range record on the model — else a no-op).
+   *
+   *  ⭐⭐ **S159:极性翻过来了 —— ABSENT = ON**,`false` = 用户关掉了它。折叠规则跟着翻:
+   *  canonical write(`setVocalParams`)把 `true` 折成 ABSENCE,`vocalNotes` 只序列化 `false`。
+   *  与 `autoTuneFollow` / `vowelClarity` 同款(默认开的那一族)。
+   *
+   *  ⛔⛔ **S62c 那句「OPT-IN」为什么作废了**:当时它是 opt-in,因为整条渲染的重着色是一笔
+   *  没有量清的取舍。S145-S159 把这条线量完了 —— 引擎换成 TD-PSOLA、根因定案、五个默认逐个
+   *  盲测翻开、S159 把逆变换做进窗内(实机 186.6 → 78.6 s)。用户 2026-08-21 拍板默认打开。
+   *
+   *  ⚠⚠ **翻这个极性会改掉【已存工程】的行为,而且没有版本号能挡**:`.usp` 里没有 format
+   *  version,而「关」在 S62c-S158 之间存的就是**缺省**。⇒ 老工程打开之后音域扩展是**开**的。
+   *  影响面:模型没有 `vocal_range` 记录 ⇒ 空操作;有记录且有超域的音 ⇒ 那些音会被救(输出变),
+   *  并且 `rangeRecordSig` 从 `""` 变成记录指纹 ⇒ **那条轨会重渲一次**。
+   *  ⚠ 有记录但没有超域的音时,重渲出来的东西**逐位相同** —— 那正是 `audition_cache_tag` 的 doc
+   *  点名的「a re-render where nothing changed」。这是翻极性的一次性代价,不是缺陷。 */
+  rangeExtend?: boolean;
+  /** S73b 自动音高常开(SynthV Sing 模式同构):true/absent = AutoTuneWatcher 对未调教/机器调教音符
+   *  持续跟随(松手级提交后 debounce 静默刷新);false = 手动模式(只有侧栏按钮触发)。 */
+  autoTuneFollow?: boolean;
+  /** S73b/c 表现力(0–4,默认 2):自动调教 θ 的整体缩放——滑音过冲 depthL/R + 起收滑幅 openEdge +
+   *  颤音深度都乘它。进 vocalParamsSig(改它=重调教+重渲染,常开语义下正确)。 */
+  autoTuneExpr?: number;
+  /** S73b/c 颤音维缩放(0–2,默认 1;UI 以 Rigidness 反向百分比展示:+100%=0 拉平/−100%=2)。
+   *  总颤音深度 = θ.depth × expr × vib。 */
+  autoTuneVib?: number;
+  /** S73d 唱法版本 Take(整数 0–99,默认 0):逐音符颤音相位 = phaseForTake(take, noteId)——
+   *  确定可复现的「换一版」,替代 Retake 按钮抽奖;0 = 基准相位(KA3 耳测口径)。 */
+  autoTuneTake?: number;
+}
+
+export interface Workflow {
+  nodes: WorkflowNode[];
+  connections: WorkflowConnection[];
+}
+
+export interface WorkflowNode {
+  id: string;
+  nodeType: WorkflowNodeType;
+  position: { x: number; y: number };
+  params: Record<string, unknown>;
+}
+
+export type WorkflowNodeType =
+  | "input"
+  | "output"
+  | "rvc"
+  | "sovits"
+  // S61: fidelity pitch-shift (Signalsmith spectral transpose) — replaced the dead Effects node.
+  // Legacy graphs' "pitchShift"/"formantShift"/"audioEnhance" nodes migrate to it at LOAD
+  // (parseLoadedBundle), so they never reach the editor/engine.
+  | "transpose"
+  | "msstSeparation"
+  | "split"
+  | "amtMidi"
+  // 新增: 纯前端/AI 自动编曲节点 (不需要 Tauri 后端即可在浏览器预览里跑)
+  | "speedShift"
+  | "chordDetect"
+  | "autoArrange"
+  | "deepOriginal"
+  // 新增: 输入源节点 (零输入)
+  // 注: 效果器节点 (EQ/Reverb/Compressor/Limiter) 已移除 — 轨道级效果链更实时直观
+  | "midiFileIn"
+  | "chordBlockIn"
+  // Song Studio: 外部推理服务驱动的歌曲生成节点 — 两种后端协议
+  // YuE2 (字节/MMAP) 与 ACE-Step (字节/ACE) 的字段差异较大, 拆成两个节点让 UI 精准渲染
+  | "songGenYue2"
+  | "songGenAceStep";
+
+export interface WorkflowConnection {
+  fromNode: string;
+  fromPort: number;
+  toNode: string;
+  toPort: number;
+}

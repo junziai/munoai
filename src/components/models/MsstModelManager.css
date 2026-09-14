@@ -1,0 +1,1034 @@
+﻿.msst-model-manager {
+  position: fixed;
+  /* size is state-driven (useFloatingPanel inline style, S67 resizable panels) */
+  min-width: 380px;
+  min-height: 320px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  z-index: calc(var(--z-overlay, 100) + 10);
+}
+
+.msst-model-manager .panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-lg);
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-panel);
+  cursor: move;
+  user-select: none;
+}
+
+.msst-model-manager .panel-title {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--accent-secondary);
+}
+
+.panel-close {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  font-size: 12px;
+}
+
+.panel-close:hover {
+  color: var(--text-primary);
+}
+
+.msst-error {
+  padding: var(--space-md) var(--space-lg);
+  background: color-mix(in srgb, var(--color-error) 12%, var(--bg-panel));
+  color: var(--color-error, #ff4466);
+  font-size: var(--font-size-xs);
+  cursor: pointer;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.msst-toolbar {
+  display: none;
+}
+
+.msst-filter {
+  display: flex;
+  gap: 2px;
+  flex-wrap: wrap;
+  justify-content: center;
+  padding: var(--space-sm) var(--space-lg);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.msst-filter button {
+  padding: 2px var(--space-sm);
+  font-size: var(--font-size-xs);
+  background: none;
+  border: 1px solid transparent;
+  color: var(--text-muted);
+}
+
+.msst-filter button:hover {
+  color: var(--text-primary);
+  border-color: var(--border-default);
+}
+
+.msst-filter button.active {
+  color: var(--accent-primary);
+  border-color: var(--accent-primary-dim);
+  background: var(--accent-primary-glow);
+}
+
+.msst-import-btn {
+  padding: 2px var(--space-md);
+  font-size: var(--font-size-xs);
+  white-space: nowrap;
+}
+
+.msst-model-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--space-md);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+}
+
+.msst-model-card-wrap {
+  display: flex;
+  /* long categories (vocals 鈮?18 models) must scroll, not compress: overflow:hidden would
+     zero min-height and let default flex-shrink:1 squash cards into clipped slivers */
+  flex-shrink: 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  background: linear-gradient(180deg, var(--bg-surface) 0%, var(--bg-base) 100%);
+  box-shadow: var(--shadow-sm);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+  animation: fadeUpIn 0.18s ease;
+}
+
+.msst-model-card-wrap:hover {
+  border-color: var(--accent-secondary);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+  transform: translateY(-1px);
+}
+
+.msst-model-card-wrap.installed {
+  border-color: var(--accent-primary-dim);
+}
+
+.msst-model-card-status {
+  width: 36px;
+  min-width: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.02);
+  border-right: 1px solid var(--border-subtle);
+  flex-shrink: 0;
+  transition: background 0.2s ease;
+}
+
+.msst-model-card-wrap.installed .msst-model-card-status {
+  background: rgba(74, 222, 128, 0.05);
+}
+
+.msst-model-card-status button.model-status-icon.primary {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent-primary);
+  color: #000;
+  border: none;
+  cursor: pointer;
+  transition: all 0.2s;
+  box-shadow: 0 0 8px var(--accent-primary-glow);
+}
+
+.msst-model-card-status button.model-status-icon.primary:hover {
+  transform: scale(1.1);
+  background: #fff;
+}
+
+.model-status-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  opacity: 0.8;
+  width: 20px;
+  height: 20px;
+}
+
+.model-status-icon.installed {
+  color: var(--color-success, var(--color-success));
+}
+
+.model-status-icon.downloading {
+  color: var(--accent-primary);
+  animation: spin 2s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.essential-badge {
+  margin-left: 8px;
+  background: rgba(255, 193, 7, 0.15);
+  color: #ffc107;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 193, 7, 0.3);
+  font-weight: bold;
+  vertical-align: middle;
+  text-transform: uppercase;
+}
+
+.model-vpn-badge {
+  margin-left: 8px;
+  background: rgba(255, 99, 132, 0.12);
+  color: #ff6384;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 99, 132, 0.3);
+  font-weight: bold;
+  vertical-align: middle;
+}
+
+.rm-download-note {
+  margin: 8px 10px 4px;
+  padding: 6px 10px;
+  font-size: var(--font-size-xs);
+  line-height: 1.5;
+  color: var(--text-secondary);
+  background: rgba(0, 229, 255, 0.05);
+  border: 1px solid rgba(0, 229, 255, 0.12);
+  border-radius: 6px;
+}
+
+.msst-model-card {
+  flex: 1;
+  padding: var(--space-md) var(--space-lg);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  border: none;
+}
+
+.model-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.model-card-name {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.model-card-arch {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  background: rgba(0, 229, 255, 0.05);
+  padding: 0 4px;
+  border-radius: 4px;
+  border: 1px solid rgba(0, 229, 255, 0.1);
+}
+
+.model-newbie-tip {
+  font-size: 11px;
+  color: var(--accent-secondary);
+  background: rgba(255, 184, 108, 0.08);
+  padding: 4px 8px;
+  border-radius: 4px;
+  margin-top: 4px;
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  line-height: 1.4;
+}
+
+.model-newbie-tip .tip-icon {
+  font-size: 12px;
+  filter: drop-shadow(0 0 4px var(--accent-secondary));
+}
+
+.model-rating {
+  color: #ffea00;
+  text-shadow: 0 0 8px rgba(255, 234, 0, 0.4);
+  letter-spacing: 1px;
+}
+
+.model-card-desc {
+  font-size: var(--font-size-xs);
+  color: var(--text-secondary);
+  margin: 0;
+  line-height: 1.4;
+}
+
+.model-card-meta {
+  display: flex;
+  justify-content: space-between;
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+
+.model-card-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+}
+
+.model-status-installed {
+  font-size: var(--font-size-xs);
+  color: var(--color-success, var(--color-success));
+  font-family: var(--font-mono);
+}
+
+.model-status-downloading {
+  font-size: var(--font-size-xs);
+  color: var(--accent-primary);
+  font-family: var(--font-mono);
+}
+
+.model-delete-btn {
+  font-size: var(--font-size-xs);
+  padding: 1px var(--space-sm);
+  background: none;
+  border: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+}
+
+.model-delete-btn:hover {
+  color: var(--color-error, #ff4466);
+  border-color: var(--color-error, #ff4466);
+}
+
+.model-export-btn {
+  font-size: var(--font-size-xs);
+  padding: 1px var(--space-sm);
+  background: none;
+  border: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.model-export-btn:hover:not(:disabled) {
+  color: var(--accent-primary);
+  border-color: var(--accent-primary);
+}
+
+.model-export-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.model-confirm-delete {
+  display: flex;
+  gap: var(--space-sm);
+}
+
+.model-confirm-delete button {
+  font-size: var(--font-size-xs);
+  padding: 1px var(--space-sm);
+}
+
+.model-download-row {
+  display: flex;
+  gap: var(--space-sm);
+  width: 100%;
+}
+
+.model-url-input {
+  flex: 1;
+  font-size: var(--font-size-xs);
+  padding: 2px var(--space-sm);
+  min-width: 0;
+}
+
+.model-download-row button {
+  padding: 2px var(--space-md);
+  font-size: var(--font-size-xs);
+  white-space: nowrap;
+}
+
+.model-download-progress {
+  position: relative;
+  height: 16px;
+  background: var(--bg-base);
+  overflow: hidden;
+}
+
+.model-download-bar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  background: var(--accent-primary-dim);
+  transition: width 0.3s ease;
+}
+
+.model-download-text {
+  position: relative;
+  z-index: 1;
+  font-size: var(--font-size-xs);
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+  padding: 0 var(--space-sm);
+  line-height: 16px;
+}
+
+.msst-installed-section {
+  border-top: 1px solid var(--border-subtle);
+  max-height: 200px;
+  display: flex;
+  flex-direction: column;
+}
+
+.msst-installed-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: var(--space-md) var(--space-lg);
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.msst-installed-header .mono {
+  font-size: 10px;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.msst-empty {
+  padding: var(--space-lg);
+  text-align: center;
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  margin: 0;
+}
+
+.msst-installed-list {
+  overflow-y: auto;
+  padding: var(--space-sm) var(--space-lg);
+}
+
+.msst-installed-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: var(--space-xs) 0;
+  font-size: var(--font-size-xs);
+}
+
+.msst-installed-name {
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 240px;
+}
+
+.msst-installed-meta {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  white-space: nowrap;
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.msst-onnx-ok {
+  color: var(--color-success, var(--color-success));
+  font-size: 10px;
+}
+
+.msst-converting {
+  color: var(--accent-primary);
+  font-size: 10px;
+}
+
+.msst-convert-btn {
+  padding: 0 var(--space-sm);
+  font-size: 10px;
+  font-family: var(--font-mono);
+  background: none;
+  border: 1px solid var(--border-subtle);
+  color: var(--accent-primary);
+}
+
+.msst-convert-btn:hover {
+  border-color: var(--accent-primary);
+}
+
+/* S66: conversions are single-flight app-wide 鈥?other convert buttons gray out while one runs */
+.msst-convert-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.msst-convert-btn:disabled:hover {
+  border-color: var(--border-subtle);
+}
+
+/* Download-time precision choice (roformer entries only) */
+.model-card-precision {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-sm);
+}
+
+.model-precision-label {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.model-precision-seg {
+  display: flex;
+  border: 1px solid var(--border-subtle);
+}
+
+.model-precision-seg button {
+  padding: 0 var(--space-sm);
+  font-size: 10px;
+  font-family: var(--font-mono);
+  background: none;
+  border: none;
+  color: var(--text-muted);
+}
+
+.model-precision-seg button + button {
+  border-left: 1px solid var(--border-subtle);
+}
+
+.model-precision-seg button.active {
+  color: var(--accent-primary);
+  background: var(--accent-primary-glow);
+}
+
+.model-convert-bar {
+  animation: convert-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes convert-pulse {
+  0%, 100% { opacity: 0.6; }
+  50% { opacity: 1; }
+}
+
+.rm-top-tabs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: var(--space-sm) var(--space-lg);
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-panel);
+}
+
+.rm-top-tabs button {
+  padding: 4px var(--space-md);
+  font-size: var(--font-size-xs);
+  background: none;
+  border: 1px solid transparent;
+  color: var(--text-muted);
+}
+
+.rm-top-tabs button:hover {
+  color: var(--text-primary);
+  border-color: var(--border-default);
+}
+
+.rm-top-tabs button.active {
+  color: var(--accent-secondary);
+  border-color: var(--accent-secondary-dim, var(--accent-secondary));
+  background: rgba(255, 184, 108, 0.05);
+}
+
+.rm-voice-placeholder {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-xl);
+  text-align: center;
+}
+
+.rm-voice-placeholder p {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  line-height: 1.6;
+  white-space: pre-line;
+  margin: 0;
+}
+
+.model-card-sdr {
+  color: var(--accent-primary);
+  font-weight: 600;
+}
+
+.model-card-actions button.primary {
+  padding: 2px var(--space-md);
+  font-size: var(--font-size-xs);
+  white-space: nowrap;
+}
+
+.model-card-community {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.rm-voice-tab {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.rm-voice-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--space-md) var(--space-lg);
+}
+
+.rm-voice-list .msst-empty {
+  white-space: pre-line;
+}
+
+/* S82d r3: aligned action columns (搂user). The old space-between spread the slack between
+   EVERY child, so audition/export/delete drifted with each row's content width; now the info
+   column eats all slack (flex: 1) and the actions right-pack at constant offsets. The lg gap
+   doubles as the mis-tap guard between buttons. */
+.rm-voice-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-lg);
+  /* horizontal inset (r4): un-hug both edges so the visual weight sits centered instead of
+     leaning hard left (搂user) */
+  padding: var(--space-md) var(--space-md);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.rm-voice-item-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+/* steady column widths across label variants (瀵煎嚭/Export/鏇搞亶鍑恒仐, 鍒犻櫎/Delete) */
+.rm-voice-item .model-export-btn,
+.rm-voice-item .model-delete-btn {
+  min-width: 44px;
+  text-align: center;
+}
+
+.rm-voice-item-name {
+  font-size: var(--font-size-sm);
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rm-voice-item-meta {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  /* S82d r5: badges are ATOMIC 鈥?when the info column tightens (export/delete columns), the
+     line must not wrap internally (搂user: vocoder rows broke into two lines). The one
+     shrinkable segment is .rm-meta-shrink (ellipsis; full text in its title). */
+  overflow: hidden;
+}
+.rm-voice-item-meta > * {
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.rm-voice-item-meta > .rm-meta-shrink {
+  flex-shrink: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* S40 vocoder tab: the zero-knowledge format/usage banner + the
+   format-mismatch chip (loud counterpart of .msst-onnx-ok) */
+.rm-voice-hint {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  line-height: 1.6;
+  padding: var(--space-sm) var(--space-md);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-panel);
+  margin: 0 0 var(--space-sm) 0;
+}
+
+.rm-voice-item-warn {
+  color: var(--color-warning);
+  border: 1px solid currentColor;
+  padding: 0 4px;
+  font-size: var(--font-size-xs);
+}
+
+/* pinned built-in default-vocoder row: visually a resident, not a user item */
+.rm-voice-item-builtin {
+  background: var(--bg-panel);
+  border-left: 2px solid var(--accent-primary);
+}
+
+.rm-voice-actions {
+  padding: var(--space-md) var(--space-lg);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.rm-voice-actions button {
+  width: 100%;
+  padding: var(--space-sm) var(--space-md);
+  font-size: var(--font-size-xs);
+}
+
+.rm-voice-avatar {
+  width: 36px;
+  height: 36px;
+  flex-shrink: 0;
+  overflow: hidden;
+  cursor: pointer;
+  border: 1px solid var(--border-default);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.rm-voice-avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.rm-voice-avatar-empty {
+  background: var(--bg-base);
+  color: var(--text-muted);
+  font-size: var(--font-size-lg);
+  font-weight: 700;
+}
+
+.rm-voice-avatar:hover {
+  border-color: var(--accent-primary);
+}
+
+.rm-filter-spacer { flex: 1; }
+
+.rm-import-top-btn {
+  padding: 3px var(--space-lg);
+  font-size: var(--font-size-xs);
+  white-space: nowrap;
+}
+
+.rm-import-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.rm-import-dialog {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  width: 380px;
+  padding: var(--space-xl);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-lg);
+}
+
+.rm-import-title {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.rm-import-error {
+  padding: var(--space-sm) var(--space-md);
+  background: color-mix(in srgb, var(--color-error) 12%, var(--bg-panel));
+  color: var(--color-error, #ff4466);
+  font-size: var(--font-size-xs);
+}
+
+.rm-import-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+}
+
+.rm-import-field label {
+  font-size: var(--font-size-xs);
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.rm-required {
+  color: var(--color-error, #ff4466);
+  font-size: 10px;
+}
+
+.rm-import-row {
+  display: flex;
+  gap: var(--space-sm);
+}
+
+.rm-import-path {
+  flex: 1;
+  min-width: 0;
+  padding: var(--space-xs) var(--space-sm);
+  font-size: var(--font-size-xs);
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+}
+
+.rm-import-row button {
+  padding: var(--space-xs) var(--space-md);
+  font-size: var(--font-size-xs);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.rm-import-name {
+  padding: var(--space-xs) var(--space-sm);
+  font-size: var(--font-size-xs);
+}
+
+.rm-import-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-sm);
+  padding-top: var(--space-sm);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.rm-import-actions button {
+  padding: var(--space-sm) var(--space-lg);
+  font-size: var(--font-size-xs);
+}
+
+/* 鈹€鈹€ S81: batch range-test row. Permanent (never a one-shot button), so it has to sit quietly
+      under the filter bar when idle and stay readable for the minutes a run can take. Square
+      corners + existing tokens only 鈥?no new control vocabulary. 鈹€鈹€ */
+.rm-range-batch {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: 4px var(--space-sm);
+  margin-bottom: var(--space-xs);
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  background: var(--bg-base);
+  border: 1px solid var(--border-default);
+  border-radius: 0;
+}
+.rm-range-batch-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.rm-range-batch-bar {
+  width: 120px;
+  height: 4px;
+  flex: none;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+}
+.rm-range-batch-bar > div {
+  height: 100%;
+  background: var(--accent-primary);
+  transition: width 120ms linear;
+}
+
+/* 鈹€鈹€ S60-2: per-model vocal-range row (label + adjust/retest; testing progress) 鈹€鈹€ */
+.rm-range-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  margin-top: 2px;
+  /* S60d3 chips can exceed the card width 鈥?wrap BETWEEN segments (segments are
+     atomic, see .rm-range-text below), never mid-text */
+  flex-wrap: wrap;
+  row-gap: 2px;
+}
+/* atomic row segments: the range/comfort text and caution chips never break internally;
+   pathological widths ellipsize (values repeat in the title tooltip). NO overflow rule
+   on .rm-range-edit 鈥?it would clip slider handles (S59c lesson). */
+.rm-range-text,
+.rm-range-caution {
+  white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* model-quirk chips live on their OWN line under the range row (搂user: inline crowded
+   the row); the info column's 2px gap provides the rhythm, no extra top margin */
+.rm-range-caution-row {
+  margin-top: 0;
+}
+.rm-range-testing {
+  color: var(--accent-primary);
+}
+.rm-range-missing {
+  color: var(--text-muted);
+  opacity: 0.7;
+}
+/* model-quirk chips (artifact zones / in-range weak notes) 鈥?same warn family as
+   .rm-voice-item-warn; informational, not an error */
+.rm-range-caution {
+  color: var(--color-warning);
+  cursor: help;
+}
+.rm-range-btn {
+  padding: 0 var(--space-sm);
+  font-size: var(--font-size-xs);
+  line-height: 16px;
+  height: 16px;
+}
+.rm-range-input {
+  width: 34px;
+  height: 16px;
+  font-size: var(--font-size-xs);
+  font-family: var(--font-mono);
+  text-align: center;
+  padding: 0 2px;
+}
+
+/* 鈹€鈹€ S60-4: per-model audition button + speaker picker 鈹€鈹€ */
+.rm-audition {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+  /* spacing to neighbours comes from .rm-voice-item's gap 鈥?an extra margin here would
+     unbalance the aligned action columns (S82d r3) */
+}
+.rm-audition-btn {
+  min-width: 22px;
+  height: 20px;
+  line-height: 18px;
+}
+/* 璇曞惉瀹屾垚鐨勪笅杞芥寜閽?鈥斺€?涓庤瘯鍚寜閽悓鎺?绱壊绯诲渾瑙掋€?*/
+.rm-audition-dl {
+  min-width: 20px;
+  height: 20px;
+  line-height: 16px;
+  color: var(--text-secondary);
+  border-color: var(--border-strong);
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+}
+.rm-audition-dl:hover {
+  color: var(--accent-secondary);
+  border-color: var(--accent-secondary);
+  background: var(--accent-secondary-glow);
+}
+/* S82d: THE speaker selector (one per model row, range-row start; the audition button
+   follows it via lifted state). 16px chip matching the .rm-range-btn row rhythm 鈥?a
+   full-height select dwarfed the xs lines and read as crowding (搂user, twice). */
+.rm-range-spk {
+  height: 16px;
+  line-height: 14px;
+  padding: 0 4px;
+  font-size: var(--font-size-xs);
+  max-width: 140px;
+}
+
+/* S60c: comfort editor = dual sliders with note-name readouts (F#2, not raw MIDI) */
+.rm-range-edit {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+}
+.rm-range-edit .sep-param-row {
+  margin: 0;
+  min-width: 150px;
+}
+
+/* 鈹€鈹€ 搂user 涓€閿笅杞藉繀澶囩粍浠舵í骞?鈹€鈹€ */
+.amt-oneclick-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 8px 4px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: linear-gradient(135deg, rgba(0, 229, 255, 0.08), rgba(124, 77, 255, 0.10));
+  border: 1px solid rgba(0, 229, 255, 0.35);
+}
+.amt-oneclick-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.amt-oneclick-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+.amt-oneclick-sub {
+  font-size: 11px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+.amt-oneclick-btn {
+  flex-shrink: 0;
+  height: 34px;
+  padding: 0 16px;
+  border-radius: 8px;
+  border: 1px solid rgba(0, 229, 255, 0.5);
+  background: rgba(0, 229, 255, 0.16);
+  color: #00e5ff;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s;
+}
+.amt-oneclick-btn:hover:not(:disabled) {
+  background: rgba(0, 229, 255, 0.28);
+}
+.amt-oneclick-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}

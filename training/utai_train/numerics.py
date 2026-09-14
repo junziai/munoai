@@ -1,0 +1,308 @@
+"""Numerical-divergence guard for the GAN training loops (S114, §F5-3).
+
+Community bug (GitHub issue #2, RTX 2080Ti, RVC *continuation* training, 0.11.0):
+about 600 steps after a resume every loss went nan at once --
+
+    step 12200  loss_disc=3.972, loss_gen=3.167, loss_fm=8.741, loss_mel=15.991, loss_kl=1.899
+    step 12400  loss_disc=nan,   loss_gen=nan,   loss_fm=nan,   loss_mel=nan,    loss_kl=nan
+
+-- the loop kept running for 13+ hours poisoning every later weight, nothing in
+the log said ERROR, and the reporter's previously valid ``<name>_best.pth`` came
+back OVERWRITTEN with nan weights.
+
+That is TWO defects, and they are independent -- fixing either one alone still
+leaves the other:
+
+a) **Nothing ever noticed.** There was no divergence check anywhere in the loop,
+   so a run that was already dead kept burning wall-clock and disk.
+
+b) **``save_best``'s guard read the METRIC, not the WEIGHTS.** Both loops update
+   ``ema_mel`` only on finite steps ("a single non-finite step must not poison
+   the EMA forever"), so once the losses go nan the EMA *freezes* at its last
+   pre-collapse value. A frozen value that is still a new minimum makes the
+   epoch-boundary test ``ema_mel < best_metric`` fire **exactly once**, writing
+   the already-poisoned ``net_g.state_dict()`` under a pre-collapse score. One
+   write is enough to destroy the file, and the score recorded next to it looks
+   healthy afterwards.
+   (b) is the data-destroying half: (a) only costs time.
+
+Both ``rvc/train.py`` and ``sovits/train.py`` carried the same open-coded best
+tracking, so the guard lives here once instead of twice -- two copies of a guard
+are two chances to fix only one of them.
+
+Wiring: ``DivergenceGuard.observe`` raises ``RuntimeError("<CODE>: <detail>")``;
+``runner.py`` turns any exception into a protocol ``error`` line, Rust surfaces
+it, and ``src/lib/backendError.ts`` maps the stable English CODE to the localized
+text (same contract as ``device.require_wanted_accelerator``'s
+``TRAINING_GPU_UNAVAILABLE``). No user-visible prose is hard-coded here.
+"""
+
+import math
+
+import torch
+
+#: Stable CODE the frontend maps to i18n. Never localize it here.
+CODE_DIVERGED = "TRAINING_NUMERICS_DIVERGED"
+
+#: How many CONSECUTIVE steps with a non-finite reported loss it takes before the
+#: run is declared dead.
+#:
+#: It must not be 1. Under fp16 the forward pass can overflow on a single awkward
+#: batch, and ``GradScaler`` exists precisely to absorb that: it skips the
+#: optimizer step and lowers the scale, so the weights are untouched and the next
+#: batch is normally fine. Halting on the first nan would kill runs that recover
+#: by design.
+#:
+#: 20 is far inside the observed failure: issue #2 logs at ``log_interval=200``
+#: and the collapse was already total at the next log line, i.e. it persisted for
+#: at least 200 consecutive steps. A run whose losses are non-finite 20 steps in a
+#: row has not "hit a bad batch" -- either the weights are already nan (checked
+#: below) or the data is producing nan, and both are terminal.
+DEFAULT_PATIENCE = 20
+
+
+def first_nonfinite_tensor(named_tensors):
+    """Name of the first floating tensor holding a nan/inf, else ``None``.
+
+    ``named_tensors`` is any iterable of ``(name, tensor)`` -- typically
+    ``state_dict().items()`` or ``chain(named_parameters(), named_buffers())``.
+
+    ⚠ The two skips are NOT the same strength, and an earlier draft of this
+    docstring got it wrong (S114, caught by a mutation probe that refused to go
+    red). Measured on torch 2.5.1: ``torch.isfinite`` **accepts** int64 / bool /
+    uint8 and returns all-True, so dropping ``is_floating_point()`` changes no
+    answer today -- it is there to avoid materializing a bool mask over large
+    integer buffers and to keep the predicate meaningful if a future dtype
+    stops being accepted. ``torch.is_tensor`` IS load-bearing: this helper is
+    public and takes any ``(name, value)`` iterable, and a non-tensor value would
+    raise instead of being skipped.
+    """
+    for name, t in named_tensors:
+        if not torch.is_tensor(t) or not t.is_floating_point():
+            continue
+        if not bool(torch.isfinite(t).all()):
+            return name
+    return None
+
+
+def first_nonfinite_module(modules):
+    """First ``"<tag>.<param>"`` holding a nan/inf across ``modules``, else ``None``.
+
+    ``modules`` is an iterable of ``(tag, module)``, e.g. ``(("G", net_g), ("D", net_d))``.
+    Both parameters AND buffers are scanned -- a poisoned running statistic is
+    just as unrecoverable as a poisoned weight, and it would not show up in
+    ``named_parameters()``.
+    """
+    for tag, module in modules:
+        entries = list(module.named_parameters()) + list(module.named_buffers())
+        bad = first_nonfinite_tensor(entries)
+        if bad is not None:
+            return "%s.%s" % (tag, bad)
+    return None
+
+
+class DivergenceGuard:
+    """Per-step watchdog: consecutive non-finite losses -> loud, terminal error.
+
+    Cheap by construction. The per-step half only looks at floats the loop has
+    already computed for its own reporting (no extra device sync); the expensive
+    half -- scanning every weight -- runs at most once, on the step that raises.
+    """
+
+    def __init__(self, modules, patience=DEFAULT_PATIENCE, logger=None):
+        self._modules = tuple(modules)
+        self._patience = int(patience)
+        self._logger = logger
+        self._consecutive = 0
+        self._first_step = None
+        self._first_seen = None
+
+    @property
+    def consecutive(self):
+        return self._consecutive
+
+    @property
+    def first_seen(self):
+        """``(step, fields, poisoned_tensor_or_None)`` for the run's FIRST non-finite loss.
+
+        ``None`` until one happens. The third element is the answer to the question the
+        terminal error cannot answer by itself — see :meth:`first_seen_note`.
+        """
+        return self._first_seen
+
+    def first_seen_note(self):
+        """The run's first non-finite loss as one clause; ``""`` before there is one.
+
+        ★S118 (`project_v2_resume_divergence_open` §4-4, the last of that section's four).
+        The terminal error already scans the weights, but only at the moment it gives up —
+        by then the answer is always "the weights are nan", which does not distinguish the
+        two failure shapes the investigation is actually stuck between:
+
+        * the FORWARD produced a non-finite loss while every weight was still finite
+          (a bad batch / an fp16 overflow / a data defect), or
+        * the weights were ALREADY poisoned when the losses first went bad, i.e. something
+          earlier and quieter broke them (issue #2's "five losses finite at 12200, all five
+          nan at 12400" is compatible with both, which is exactly why it stalled).
+
+        The distinction only exists at the FIRST bad step, so it has to be recorded there.
+        """
+        if self._first_seen is None:
+            return ""
+        step, fields, poisoned = self._first_seen
+        where = (
+            "weights were ALREADY non-finite (%s)" % poisoned
+            if poisoned
+            else "weights were all finite"
+        )
+        return "first non-finite of this run: step %s (%s), %s" % (step, ",".join(fields), where)
+
+    def observe(self, step, values):
+        """Record one step. ``values`` maps a loss name to its float value.
+
+        Raises ``RuntimeError(CODE_DIVERGED + ": ...")`` once the run is dead.
+        """
+        bad = sorted(k for k, v in values.items() if not math.isfinite(float(v)))
+        if not bad:
+            self._consecutive = 0
+            self._first_step = None
+            return
+
+        if self._consecutive == 0:
+            self._first_step = step
+            if self._first_seen is None:
+                # ⛔ ONCE PER RUN, not once per episode, and that bound is the whole design.
+                # Under fp16 an isolated overflow is NORMAL and recovers by construction
+                # (that is why DEFAULT_PATIENCE is not 1), so a scan per episode would be an
+                # unbounded, silent slowdown on healthy runs — a loss that alternates
+                # bad/good every other step would pay for it forever.
+                self._first_seen = (step, tuple(bad), first_nonfinite_module(self._modules))
+            if self._logger is not None:
+                # ⛔ DELIBERATELY the log and not `Reporter.warn`: a single recovered fp16
+                # overflow must not put a warning bar on the user's screen. A run that
+                # screams when nothing is wrong trains the real signal into noise (S114/S115),
+                # and this text is diagnostic detail for a bug report, not a stable CODE.
+                self._logger.warning(
+                    "non-finite loss at step %s (%s) - watching for %s consecutive steps; %s",
+                    step,
+                    ",".join(bad),
+                    self._patience,
+                    self.first_seen_note(),
+                )
+        self._consecutive += 1
+        if self._consecutive < self._patience:
+            return
+
+        # Only now is it worth paying for a full weight scan. Which side is dead
+        # changes what the user should do, so say which one it is.
+        poisoned = first_nonfinite_module(self._modules)
+        weights = "weights=%s is non-finite" % poisoned if poisoned else "weights=all finite"
+        raise RuntimeError(
+            "%s: %d consecutive non-finite steps (first at step %s, latest %s; fields %s); %s; %s"
+            % (
+                CODE_DIVERGED,
+                self._consecutive,
+                self._first_step,
+                step,
+                ",".join(bad),
+                weights,
+                self.first_seen_note(),
+            )
+        )
+
+
+def optimizer_state_is_safe(optimizers, logger=None):
+    """Every Adam moment across `optimizers` is finite. `optimizers` = ``(tag, optimizer)`` pairs.
+
+    ⚠ THIS IS NOT COVERED BY ``best_save_is_safe``, and the gap is reachable without a single nan
+    ever appearing in the weights or the losses. Measured (S117, on RVC's real hyper-parameters
+    lr=1e-4 / betas=[0.8, 0.99] / eps=1e-9):
+
+    * the three GAN trainers pass ``clip_value=None``, so `clip_grad_value_` clips nothing — it
+      only computes a norm and throws it away — and `GradScaler.step` skips a step on
+      ``found_inf``, which tests FINITENESS, never magnitude;
+    * a huge but FINITE gradient therefore reaches the optimizer. It does *not* blow the weights
+      up — AdamW's normalisation keeps that step at ~lr — but it poisons ``exp_avg_sq``, which
+      decays only as ``beta2**k``: after one 1e12 gradient the affected parameter moved **2.3% of
+      the control arm's distance over the next 200 steps**;
+    * above ``sqrt(fp32_max / (1 - beta2)) ≈ 1.8e20`` the square overflows to ``inf``,
+      ``denom`` becomes ``inf``, ``addcdiv_`` adds exactly zero, and ``inf * beta2 + …`` stays
+      ``inf``. That parameter **never learns again** — permanently, silently, with finite weights,
+      finite losses, and nothing in any log.
+
+    So a checkpoint can carry a dead optimizer while every weight is finite. That matters most
+    exactly where this is called: a checkpoint offered as "the good one to go back to" must not
+    be one whose momenta are already inf.
+    """
+    for tag, optim in optimizers:
+        for group in optim.state.values():
+            bad = first_nonfinite_tensor(group.items())
+            if bad is not None:
+                if logger is not None:
+                    logger.error(
+                        "REFUSING to write a resumable checkpoint: %s's optimizer state is "
+                        "non-finite (first: %s). Resuming from it would carry a parameter that "
+                        "can never learn again.",
+                        tag,
+                        bad,
+                    )
+                return False
+    return True
+
+
+def resume_point_is_safe(state_dict, optimizers, logger=None):
+    """May this state be PUBLISHED as a resume point? Both halves, in one place.
+
+    ★S118 §F8⒡. Distinct from :func:`best_save_is_safe` in what it protects and in what it says:
+    that one guards an inference-only export and promises "the previous best file is left
+    untouched"; this one guards the ROLLING resume point, which the diffusion chooser actively
+    PREFERS — so publishing a dead one would make it preferred garbage, while refusing leaves the
+    previous snapshot in place as the last healthy point to roll back to.
+
+    ⛔ Module-level so a test can drive it. Inside the trainer it was a closure over `model`,
+    `optimizer` and `saver`, i.e. unreachable without a vocoder, a dataset and a GPU — and
+    "the guard is unreachable from a test" is exactly how S117's regression shipped.
+
+    Both halves are load-bearing and they fail independently: measured (S118), ONE inf loss on the
+    fp32 path leaves the weights nan AND the moments unsafe, while a finite-but-huge gradient
+    (S117) leaves every weight finite and only the moments dead.
+    """
+    bad = first_nonfinite_tensor(state_dict.items())
+    if bad is not None:
+        if logger is not None:
+            logger.error(
+                "REFUSING to publish a resume point: the model holds nan/inf (first: %s). The "
+                "previous snapshot is left untouched — it is the last healthy point this run can "
+                "be continued from.",
+                bad,
+            )
+        return False
+    return optimizer_state_is_safe(optimizers, logger)
+
+
+def best_save_is_safe(state_dict, logger=None):
+    """Last line of defence for ``save_best`` -- see defect (b) in the module doc.
+
+    Returns ``True`` when every floating entry of ``state_dict`` is finite. On
+    ``False`` the caller MUST leave both the existing best file and its recorded
+    metric untouched: the old file still describes the old metric, so advancing
+    the metric without writing the file would make the sidecar lie in the other
+    direction.
+
+    This is deliberately NOT expressed as "the guard above already halted, so a
+    poisoned state cannot reach here". The halting guard needs
+    ``DEFAULT_PATIENCE`` consecutive bad steps, while a single poisoned step
+    landing exactly on an epoch boundary is enough to reach ``save_best`` -- and
+    the frozen-EMA mechanism means the metric it is compared against is a *stale
+    healthy* number, so the comparison cannot catch it either. The two guards
+    protect different failure shapes on purpose.
+    """
+    bad = first_nonfinite_tensor(state_dict.items())
+    if bad is None:
+        return True
+    if logger is not None:
+        logger.error(
+            "REFUSING to overwrite the best checkpoint: model weights contain nan/inf (first: %s). "
+            "The previous best file and its recorded metric are left untouched.",
+            bad,
+        )
+    return False

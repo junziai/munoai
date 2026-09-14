@@ -1,0 +1,852 @@
+.track-list {
+  background: var(--bg-surface);
+  border-right: 1px solid var(--border-subtle);
+  overflow: hidden;
+}
+
+.track-list-scroll {
+  /* NO will-change here (S62): permanently promoting the column to a compositor layer made Chromium
+     rasterize the text ONCE and then merely translate/resample that raster on every scroll — the
+     "header text turns blurry after scrolling" bug. Without the promotion the layer de-composites at
+     rest and the text re-rasterizes crisply on the pixel grid. */
+  position: relative;
+}
+
+/* Hover hint shown at a track boundary in the header column (right-click there to add a track). */
+.track-boundary-hint {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 2px;
+  margin-top: -1px;
+  background: rgba(96, 165, 250, 0.9);
+  box-shadow: 0 0 6px rgba(96, 165, 250, 0.8);
+  pointer-events: none;
+  z-index: 5;
+}
+
+.track-list-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-3xl) var(--space-xl);
+  font-size: var(--font-size-sm);
+}
+
+.track-item-group {
+  border-bottom: 1px solid var(--border-subtle);
+  box-sizing: border-box;
+  /* Smooth expand/collapse: the inline height (computeTrackHeight) animates, and the child lanes are
+     revealed with a stagger fade (lane-reveal below). */
+  transition: height 0.18s ease;
+}
+
+.track-item-group .lane-item,
+.track-item-group .lane-group-bar {
+  animation: lane-reveal 0.2s ease;
+}
+
+@keyframes lane-reveal {
+  from { opacity: 0; transform: translateX(-8px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+/* Placeholder slot shown while dragging a new track in between existing ones (mirrors the
+   canvas gap so the two columns stay aligned during the drag). */
+.track-ghost-slot {
+  box-sizing: border-box;
+  background: rgba(96, 165, 250, 0.07);
+  border-top: 1px dashed rgba(96, 165, 250, 0.5);
+  border-bottom: 1px dashed rgba(96, 165, 250, 0.5);
+}
+
+.track-item-group.active {
+  background: var(--accent-primary-glow);
+  border-left: 2px solid var(--accent-primary);
+}
+
+/* Empty track (no segments) — dim the header so it reads as a placeholder, not active content. */
+.track-item-group.empty .track-item {
+  opacity: 0.55;
+}
+
+.track-item {
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+  height: 48px;
+  cursor: default; /* the .track-light strip on the right is the drag handle, not the whole header */
+  transition: background var(--transition-fast), box-shadow var(--transition-fast);
+  box-sizing: border-box;
+}
+
+/* The two-row content (name row over fader row); the drag handle (.track-light) sits to its right. */
+.track-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 2px 6px;
+}
+
+.track-no-badge {
+  width: 18px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #ef4444;
+  color: white;
+  font-size: 12px;
+  font-weight: 600;
+  flex-shrink: 0;
+  border-radius: 2px;
+  margin-right: 2px;
+}
+
+.track-state-btn {
+  width: 18px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #374151;
+  border: 1px solid #4b5563;
+  color: #9ca3af;
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s;
+  flex-shrink: 0;
+  border-radius: 2px;
+  padding: 0;
+}
+
+.track-state-btn:hover {
+  background: #4b5563;
+  border-color: #6b7280;
+}
+
+.track-state-btn.active-mute {
+  background: #ef4444;
+  border-color: #dc2626;
+  color: white;
+}
+
+.track-state-btn.active-solo {
+  background: #eab308;
+  border-color: #ca8a04;
+  color: white;
+}
+
+.track-record-btn {
+  background: #1f2937;
+  border-color: #374151;
+  color: #ef4444;
+}
+
+.track-record-btn:hover {
+  background: #374151;
+  color: #f87171;
+}
+
+/* 录音中:R 按钮整体变红并呼吸闪烁 */
+.track-record-btn.recording {
+  background: #dc2626;
+  border-color: #ef4444;
+  color: white;
+  animation: rec-blink 1s ease-in-out infinite;
+}
+
+@keyframes rec-blink {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.55); }
+  50% { box-shadow: 0 0 8px 2px rgba(239, 68, 68, 0.55); }
+}
+
+.track-state-btn.active-inspector {
+  background: #3b82f6;
+  border-color: #2563eb;
+  color: white;
+}
+
+/* 声乐轨道歌手选择按钮 */
+.track-avatar-btn {
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+  overflow: hidden;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #1f2937;
+  border: 1px solid #4b5563;
+  border-radius: 4px;
+  color: var(--text-muted, #9ca3af);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.track-avatar-btn img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.track-avatar-btn:hover {
+  border-color: var(--accent-primary, #3b82f6);
+  color: var(--text-primary, #e5e7eb);
+  transform: scale(1.05);
+}
+
+.track-avatar-initial {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-secondary, #d1d5db);
+  line-height: 1;
+}
+
+/* 声乐轨道语言选择按钮 */
+.track-btn {
+  height: 24px;
+  padding: 0 6px;
+  background: transparent;
+  border: 1px solid #374151;
+  border-radius: 4px;
+  color: #9ca3af;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0 2px;
+}
+
+.track-btn:hover {
+  border-color: #3b82f6;
+  color: #d1d5db;
+  background: rgba(59, 130, 246, 0.1);
+}
+
+.track-btn.track-lang {
+  min-width: 24px;
+  letter-spacing: 0.5px;
+}
+
+.track-row-volume {
+  height: 20px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+}
+
+.track-row-volume .vol-fader {
+  flex: 1;
+  min-width: 0;
+}
+
+.track-volume-input {
+  width: 45px;
+  height: 18px;
+  background: #1f2937;
+  border: 1px solid #374151;
+  color: #d1d5db;
+  font-size: 11px;
+  text-align: center;
+  padding: 0 4px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+
+.track-volume-input:hover {
+  border-color: #4b5563;
+}
+
+.track-volume-input:focus {
+  outline: none;
+  border-color: #3b82f6;
+  background: #111827;
+}
+
+/* 第3行"输入源"是假占位(TODO) — 细高轨道头里直接隐藏,输入路由在参数面板里 */
+.track-row-input {
+  display: none;
+}
+
+.track-input-label-btn {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+  transition: all 0.15s;
+}
+
+.track-input-label-btn:hover .track-input-label {
+  color: #d1d5db;
+}
+
+.track-input-label-btn:hover .track-input-icons {
+  color: #d1d5db;
+}
+
+.track-input-label {
+  color: #9ca3af;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.track-input-icons {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  color: #9ca3af;
+  transition: color 0.15s;
+}
+
+/* Track LIGHT = the drag-reorder HANDLE: a full-height strip on the far right, coloured by track type +
+   lit when audible. Grab it to reorder the track (the header is too packed for an empty drag zone). */
+.track-light {
+  width: 5px;
+  flex-shrink: 0;
+  align-self: stretch;
+  cursor: grab;
+}
+.track-light:active {
+  cursor: grabbing;
+}
+
+/* 轨道头电平表区(track-main 与拖拽手柄之间) — 无边框无底色, 播放时只显示两根竖条 */
+.track-waveform-thumb {
+  width: 48px;
+  flex-shrink: 0;
+  align-self: stretch;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+}
+.track-waveform-canvas {
+  display: block;
+}
+
+/* 文件夹分组轨道头部(DAW 式) */
+.track-item-group.folder {
+  background: rgba(148, 163, 184, 0.05);
+}
+.track-item.folder-track {
+  align-items: center;
+  cursor: default;
+  background: rgba(148, 163, 184, 0.04);
+}
+.track-item.folder-track.collapsed {
+  background: rgba(148, 163, 184, 0.09);
+}
+.folder-glyph {
+  flex-shrink: 0;
+  margin-left: 4px;
+  color: #9ca3af;
+}
+.folder-track .track-info {
+  flex: 1;
+  min-width: 0;
+  margin-left: 6px;
+}
+.folder-count {
+  flex-shrink: 0;
+  margin-right: 6px;
+  padding: 1px 6px;
+  font-size: 10px;
+  line-height: 1.4;
+  color: #9ca3af;
+  background: rgba(148, 163, 184, 0.12);
+  border-radius: 8px;
+  user-select: none;
+}
+
+/* Two rows in the fixed 48px header — Row 1: NAME (owns the width) + M/S/O; Row 2: V/P faders + readouts
+   side by side. The single-row layout squeezed the name to nothing on expandable tracks (expand + faders). */
+.track-row-top {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  height: 20px;
+  min-width: 0;
+}
+.track-row-bot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-left: 2px;
+}
+.track-row-bot .fader-row {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Picked-up track while drag-reordering. */
+.track-item-group.dragging {
+  position: relative;
+  z-index: 10;
+  box-shadow: 0 3px 12px rgba(0, 0, 0, 0.5);
+}
+.track-item-group.dragging .track-item {
+  background: var(--bg-hover);
+  cursor: grabbing;
+}
+
+/* Inline rename editor (double-click the name, or right-click → rename). */
+.track-name-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg-panel);
+  border: 1px solid var(--accent-primary);
+  color: var(--text-primary);
+  font-size: var(--font-size-xs);
+  padding: 1px 4px;
+  outline: none;
+  box-sizing: border-box;
+}
+
+.track-item:hover {
+  background: var(--bg-hover);
+}
+
+.track-expand-btn {
+  width: 14px;
+  height: 14px;
+  font-size: 7px;
+  padding: 0;
+  margin-left: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid var(--border-default);
+  color: var(--text-muted);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.track-expand-btn:hover {
+  color: var(--text-primary);
+  border-color: var(--accent-primary);
+}
+
+/* ── Sub-lane GROUP block (P5): a slim group BAR (name + the 组-level volume/pan, drawn once)
+      followed by its member rows. `--lane-rgb` (set inline per group) is the group's LANE_COLORS hue —
+      the same entry the canvas rows use, so header and canvas echo each other. ── */
+.lane-group {
+  position: relative;
+}
+
+.lane-group-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: 0 var(--space-sm) 0 8px;
+  background: rgba(var(--lane-rgb), 0.05);
+  border-top: 1px solid var(--border-default);
+  box-sizing: border-box;
+  overflow: hidden;
+}
+
+.lane-group-swatch {
+  width: 7px;
+  height: 7px;
+  flex-shrink: 0;
+  background: rgb(var(--lane-rgb));
+  box-shadow: 0 0 4px rgba(var(--lane-rgb), 0.5);
+}
+
+.lane-group-name {
+  font-size: 9px;
+  font-family: var(--font-mono);
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: var(--text-secondary);
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.lane-item {
+  display: flex;
+  align-items: center;
+  padding: 0 var(--space-sm) 0 22px;
+  gap: var(--space-sm);
+  background: rgba(255, 255, 255, 0.02);
+  border-top: 1px solid rgba(30, 42, 69, 0.4);
+  box-sizing: border-box;
+  position: relative;
+}
+
+/* Bracket the member rows to their GROUP BAR: a vertical trunk (in the group hue, descending from
+   under the bar's swatch) + an elbow stub into each row — rows read as members of the 组 above. */
+.lane-item::before {
+  content: "";
+  position: absolute;
+  left: 11px;
+  top: -1px;
+  height: 100%;
+  width: 1px;
+  background: rgba(var(--lane-rgb), 0.45);
+  pointer-events: none;
+}
+.lane-item:last-child::before {
+  height: calc(50% + 1px); /* last lane: trunk stops at the elbow (tree corner) */
+}
+.lane-item::after {
+  content: "";
+  position: absolute;
+  left: 11px;
+  top: 50%;
+  width: 6px;
+  height: 1px;
+  background: rgba(var(--lane-rgb), 0.45);
+  pointer-events: none;
+}
+
+.lane-label {
+  font-size: 9px;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.track-color-bar {
+  width: 4px;
+  flex-shrink: 0;
+  align-self: stretch;
+}
+
+.track-avatar {
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  overflow: hidden;
+  margin-left: var(--space-xs);
+}
+
+.track-avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+/* ② S58 singer picker — the avatar slot doubles as the trigger button on vocal tracks (placeholder
+   glyph until a singer is picked). Same 28px footprint as .track-avatar → the row geometry is unchanged. */
+.track-avatar-btn {
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+  overflow: hidden;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-tertiary, #1f2937);
+  border: 1px solid var(--border-color, #4b5563);
+  border-radius: 4px;
+  color: var(--text-muted, #9ca3af);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.track-avatar-btn img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.track-avatar-btn:hover {
+  border-color: var(--accent-primary, #3b82f6);
+  color: var(--text-primary, #e5e7eb);
+  transform: scale(1.05);
+}
+
+/* singer picked but no avatar linked → first letter/char (mirrors the resource manager's
+   rm-voice-avatar-empty look at header scale). */
+.track-avatar-initial {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-secondary, #d1d5db);
+  line-height: 1;
+}
+
+/* ② S58 language badge — two-letter code in a .track-btn shell; slightly wider than the 18px square so
+   "ZH"/"JA" never clip, still one row-height. */
+.track-btn.track-lang {
+  min-width: 24px;
+  height: 20px;
+  padding: 0 4px;
+  letter-spacing: 0.5px;
+  background: #1f2937;
+  border: 1px solid #4b5563;
+  border-radius: 4px;
+  color: #9ca3af;
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+}
+
+.track-btn.track-lang:hover {
+  border-color: #3b82f6;
+  color: #d1d5db;
+  background: rgba(59, 130, 246, 0.1);
+}
+
+/* Muno 阶段1 乐器轨音色选择器——.track-btn 外壳 + 自适应宽度(音色名可长,封顶省略号)。
+   未选状态弱化提示;选中后正常文字色,hover 提亮与其它按钮一致。 */
+.track-btn.track-soundfont {
+  width: auto;
+  max-width: 118px;
+  min-width: 0;
+  flex: none;
+  padding: 0 4px;
+  font-size: 9px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.track-btn.track-soundfont.no-sound {
+  color: var(--text-muted);
+}
+
+/* ② S58 OOV warning — sits in the same conditional-icon slot as the render spinner. */
+.track-oov-badge {
+  flex: none;
+  display: flex;
+  align-items: center;
+  color: var(--color-error);
+}
+
+/* S87: ADVISORY variant — the track's only finding is a note the renderer rescued by borrowing a frame.
+   It sounds, so the badge must not wear the blocking red (§user: 红色现在一律=阻塞性警告). */
+.track-oov-badge.advisory {
+  color: var(--color-warning);
+}
+
+.track-info {
+  flex: 1;
+  min-width: 0;
+  padding-left: 2px;
+  /* MUST be flex so the rename <input> (flex:1) fills exactly this box — without it the input took its
+     ~150px default width and overflowed onto the M/S/O buttons (user-reported). */
+  display: flex;
+  align-items: center;
+}
+
+.track-name {
+  /* Smaller than before — on its own row it needn't be big (user), and must fit the ~18px top row. */
+  font-size: 10px;
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: text; /* hint: double-click to rename (not a drag handle) */
+  line-height: 1.3;
+}
+
+.track-controls {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+/* Main-header volume + pan, stacked vertically — near one fader's footprint, name keeps its width. */
+.fader-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.fader-row {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+/* Micro-label in front of each fader (V = volume, P = pan) — two identical-looking sliders side by
+   side read as an unexplained blob without it (user feedback). */
+.fader-tag {
+  font-size: 7px;
+  font-family: var(--font-mono);
+  font-weight: 700;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+  line-height: 1;
+  user-select: none;
+}
+
+/* Always-on numeric readout after each fader (dB / pan) now lives in ../common/FaderValue.tsx +
+   ../common/FaderValue.css — it's a click-to-edit button, not a span. */
+/* Group bar: a little breathing room BETWEEN the V and P fader pairs — enough to read as two controls,
+   not the long gap it used to be (each pair stays tight via .fader-row). */
+.lane-group-controls {
+  gap: 6px;
+}
+
+.track-btn {
+  width: 18px;
+  height: 18px;
+  font-size: 8px;
+  font-weight: 700;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-mono);
+}
+
+.track-btn.active-mute {
+  background: var(--color-error);
+  border-color: var(--color-error);
+  color: white;
+}
+
+.track-btn.active-solo {
+  background: var(--color-warning);
+  border-color: var(--color-warning);
+  color: var(--text-inverse);
+}
+
+/* SOURCE selector lit — the original audio plays, sub-lanes are out of the output. */
+.track-btn.active-orig {
+  background: var(--accent-primary);
+  border-color: var(--accent-primary);
+  color: var(--text-inverse);
+}
+
+/* While the original plays, the sub-lane blocks are "out of the output" — dim them (controls stay
+   clickable; the canvas rows dim the same way, so both columns tell one story). */
+.track-item-group.play-original .lane-group {
+  opacity: 0.45;
+  transition: opacity 0.15s ease;
+}
+
+/* ── Add-track control (bottom of track column) ── */
+
+.track-add {
+  position: relative;
+}
+
+.track-add-btn {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  width: 100%;
+  height: 32px;
+  padding: 0 var(--space-md);
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.track-add-btn:hover {
+  background: var(--bg-hover);
+  color: var(--accent-primary);
+}
+
+.track-add-icon {
+  font-size: 14px;
+  line-height: 1;
+}
+
+.track-add-menu {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-default);
+  border-top: none;
+}
+
+.track-add-option {
+  text-align: left;
+  padding: 8px var(--space-md);
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+  cursor: pointer;
+}
+
+.track-add-option:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+
+/* ② vocal re-render spinner on the track header (§user: a re-render keeps the old bake, so without this it
+   looks frozen). Reuses the accent colour; a small rotating arc next to the track name. */
+.track-render-spinner {
+  display: inline-flex;
+  align-items: center;
+  color: var(--accent-primary);
+  margin-left: 4px;
+  flex: none;
+}
+.track-render-spinner svg {
+  animation: track-render-spin 0.8s linear infinite;
+}
+@keyframes track-render-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* S59 loudness-lane band header block — pairs 1:1 with the canvas band (same height). */
+.loudness-band-header {
+  display: flex;
+  align-items: center;
+  padding: 0 8px;
+  border-top: 1px solid var(--border-default);
+  background: rgba(13, 18, 32, 0.4);
+  box-sizing: border-box;
+}
+.loudness-band-label {
+  font-size: 9px;
+  font-family: var(--font-mono, monospace);
+  color: var(--text-muted);
+  letter-spacing: 0.5px;
+}
+.track-btn-db {
+  font-size: 8px;
+  letter-spacing: 0;
+}
+
+/* S59b: compact GROUP-bar dB toggle — fits the 18px bar, pinned left of the (shrinkable) name
+   so a full bar can never clip it off the right edge. */
+.lane-db-btn {
+  width: 18px;
+  height: 14px;
+  font-size: 7px;
+  flex-shrink: 0;
+}

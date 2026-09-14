@@ -1,0 +1,295 @@
+# Ported from so-vits-svc 4.1-Stable preprocess_flist_config.py.
+# Semantics preserved: skip <0.3s wavs (wave module), val = first 2 of the
+# shuffled list / train = rest, both re-shuffled; config template + per-encoder
+# dim rules (vec768l12 -> ssl=filter=gin=768; vec256l9 -> ssl=gin=256, filter
+# untouched); --vol_aug couples train.vol_aug with model.vol_embedding.
+# Deviations (deliberate):
+#   - seeded shuffles (upstream is unseeded — irreproducible splits)
+#   - filelists + config are written UTF-8 with absolute forward-slash paths
+#     (upstream wrote with the locale codec and read back as UTF-8 — mojibake on
+#     CJK Windows; and its relative ./dataset/44k paths assume cwd = repo root)
+#   - config.json is REwritten every run so mutable train params (epochs/batch/
+#     fp16_run/intervals) follow the current request; immutable params (version/
+#     encoder/vol_embedding/sample rate) are guarded by the Rust run manifest
+#   - diffusion.yaml is NOT generated here (the shallow-diffusion trainer is a
+#     separate backend and brings its own preprocessing products)
+#   - hard error when a speaker has fewer than 3 slices (upstream would write an
+#     empty train list and crash mid-training)
+#   - S41 augmentation protocol: PSOLA _aug slices NEVER enter val; the val
+#     split is computed on the original (non-aug) pool with the exact RNG
+#     stream of the pre-aug code (copies=0 stays byte-identical; val.txt is
+#     identical across aug settings so val loss stays comparable), surviving
+#     aug slices are then appended to the train side and shuffled with a
+#     SECOND rng (touching the primary stream would shift the val order)
+import json
+import logging
+import os
+import random
+import wave
+
+from ..augment import is_aug_name
+from ..pool import SOLE_SPEAKER_DIR, identity_version
+
+logger = logging.getLogger(__name__)
+
+ENCODER_DIMS = {"vec768l12": 768, "vec256l9": 256}
+
+
+def _wav_duration(path):
+    with wave.open(path, "rb") as wf:
+        return wf.getnframes() / float(wf.getframerate())
+
+
+def _p(path):
+    return path.replace("\\", "/")
+
+
+def resolve_speakers(cfg):
+    """THE single source of speaker identity + id ordering for a run (①c
+    multi-speaker co-training). Returns an ORDERED list of
+    {name(display), slug(ascii dir/config key), dataset_dir(raw audio)}; the
+    list index IS the speaker id, so config.spk / cluster filenames / the
+    exported sidecar all agree by construction. The order is authoritative and
+    the Rust side freezes it in the run manifest (resume-immutable).
+
+    Single-speaker (the overwhelming case, and every existing caller / gate):
+    cfg has no "speakers" key -> a 1-element list built from the flat
+    dataset_dir + model_slug, which made build_config/build_filelists/cluster
+    emit BYTE-IDENTICAL output to the pre-①c code (slug key, id 0).
+
+    ★§F2⒝ ④d — from pool identity v2 a SOLE speaker's `slug` is a CONSTANT
+    (`pool.SOLE_SPEAKER_DIR`) instead of this run's name. `slug` is three things
+    at once — the `dataset_44k` subdirectory, the `config.spk` key, and what the
+    data loader looks that key up by (`data_utils.py`, and sovits_v2's second
+    loader) — and all three are POOL-scoped while the name is RUN-scoped, so a
+    second run of the same slot under a different name used to grow a second
+    complete slice tree inside the shared pool. Deriving all three from this one
+    function is what makes them impossible to change apart.
+
+    ⛔ The switch keys on `len(...) == 1`, the SAME predicate
+    `extract_cache_fp_text` uses to decide whether slugs enter the fingerprint at
+    all — so a sole speaker's slug is never part of any pool's identity and this
+    cannot re-identify anything on disk. A multi-speaker list keeps every slug,
+    because those ARE folded into the fingerprint.
+    ⚠ `name` is untouched: `_write_release_config` keys the exported sidecar by
+    display name, so what the user sees in an installed model does not move."""
+    spks = cfg.get("speakers")
+    if spks:
+        out = [
+            {"name": s["name"], "slug": s["slug"], "dataset_dir": s["dataset_dir"]}
+            for s in spks
+        ]
+    else:
+        out = [{
+            "name": cfg.get("model_name") or cfg["model_slug"],
+            "slug": cfg["model_slug"],
+            "dataset_dir": cfg["dataset_dir"],
+        }]
+    if len(out) == 1 and identity_version(cfg) >= 2:
+        out[0]["slug"] = SOLE_SPEAKER_DIR
+    return out
+
+
+def _split_speaker(dataset_44k_dir, spk_slug, seed, min_dur=0.3):
+    """One speaker's slice pool -> (train, val) with the exact pre-①c seeded
+    split + S41 aug protocol. Extracted verbatim from build_filelists so the
+    single-speaker path stays byte-identical while multi-speaker reuses it per
+    speaker (id ordering / val-per-speaker owned by the caller).
+    min_dur: 0.3 = the upstream floor (default, byte-identical for 4.x);
+    sovits_v2 passes 0.35 — its SingDataset drops mel<30-frame items
+    (~0.337s) at LOAD time, so a [0.300, 0.337) slice passing the 0.3 floor
+    could leave an all-None (empty) batch that crashes the collate."""
+    spk_dir = os.path.join(dataset_44k_dir, spk_slug)
+    wavs = []
+    augs = []
+    for file_name in sorted(os.listdir(spk_dir)):
+        if not file_name.endswith("wav"):
+            continue
+        if file_name.startswith("."):
+            continue
+        file_path = _p(os.path.join(spk_dir, file_name))
+        if _wav_duration(file_path) < min_dur:
+            logger.info("Skip too short audio: %s", file_path)
+            continue
+        (augs if is_aug_name(file_name) else wavs).append(file_path)
+
+    # the 3-slice floor is judged on ORIGINALS — aug copies must not rescue a
+    # dataset that is too small to split honestly (per speaker for multi)
+    if len(wavs) < 3:
+        raise RuntimeError(
+            "说话人 %s 切片后可用样本只有 %d 个（至少需要 3 个：2 个验证 + 1 个训练）。"
+            "请提供更长的干声素材" % (spk_slug, len(wavs))
+        )
+
+    rng = random.Random(seed)
+    rng.shuffle(wavs)
+    train = wavs[2:]
+    val = wavs[:2]
+    rng.shuffle(train)
+    rng.shuffle(val)
+    if augs:
+        # append-then-shuffle with an independent rng: the primary stream above
+        # is byte-compatible with the pre-aug code, so copies=0 output and the
+        # val split/order under ANY copies stay identical to baseline
+        train = train + augs
+        random.Random("%s|aug-train" % seed).shuffle(train)
+    return train, val
+
+
+def build_filelists(exp_dir, spk, dataset_44k_dir, seed, reporter, speakers=None, min_dur=0.3):
+    """Slice collection + seeded train/val split + filelist write — the shared
+    half of build_flist_and_config (the diffusion pipeline rebuilds filelists
+    every run but must NOT rewrite an existing main config.json, so this half
+    stands alone). Returns (train_list, val_list, n_train, n_val).
+
+    ①c: `speakers` (resolve_speakers list) drives multi-speaker co-training —
+    each speaker gets its OWN val slices (a global first-2 split could leave a
+    speaker unvalidated) and the concatenated train pool is interleaved across
+    speakers (the DataLoader runs shuffle=False, so speaker-contiguous batches
+    would starve gradient mixing). `speakers=None` (every existing caller/gate)
+    falls back to the single `spk` slug and skips the cross-speaker shuffle —
+    BYTE-IDENTICAL to the pre-①c output."""
+    # stage name "filelist" matches the RVC trainer's — the UI label is shared
+    reporter.stage("filelist", message="生成训练清单与配置")
+
+    if speakers is None:
+        speakers = [{"slug": spk}]
+
+    all_train = []
+    all_val = []
+    for sp in speakers:
+        train, val = _split_speaker(dataset_44k_dir, sp["slug"], seed, min_dur=min_dur)
+        all_train += train
+        all_val += val
+
+    # cross-speaker interleave — guarded so a single speaker never reaches it
+    # (keeps the single-speaker filelist byte-identical to the pre-①c split)
+    if len(speakers) > 1:
+        random.Random("%s|spk-order" % seed).shuffle(all_train)
+
+    flist_dir = os.path.join(exp_dir, "filelists")
+    os.makedirs(flist_dir, exist_ok=True)
+    train_list = os.path.join(flist_dir, "train.txt")
+    val_list = os.path.join(flist_dir, "val.txt")
+    with open(train_list, "w", encoding="utf-8") as f:
+        for fname in all_train:
+            f.write(fname + "\n")
+    with open(val_list, "w", encoding="utf-8") as f:
+        for fname in all_val:
+            f.write(fname + "\n")
+    logger.info("filelists written: %d train / %d val", len(all_train), len(all_val))
+    return train_list, val_list, len(all_train), len(all_val)
+
+
+def build_config(
+    exp_dir,
+    spk,               # speaker key in the training config = workspace slug (ASCII)
+    encoder,           # "vec768l12" | "vec256l9"
+    vol_embedding,
+    fp16,
+    total_epoch,
+    batch_size,
+    save_every_steps,
+    keep_ckpts,
+    all_in_mem,
+    seed,
+    configs_dir,
+    speakers=None,     # ①c: resolve_speakers list -> multi-speaker spk map / n_speakers
+):
+    """config.json only — the filelist PATHS it references are static
+    (<exp_dir>/filelists/{train,val}.txt), so the config can be written before
+    the filelists exist. S41 split: extract_all needs hps from config.json,
+    while the filelists must be (re)built AFTER the aug quality gate — the
+    pre-S41 build_flist_and_config coupling made that ordering impossible."""
+    if encoder not in ENCODER_DIMS:
+        raise RuntimeError("未知语音编码器: %s" % encoder)
+
+    flist_dir = os.path.join(exp_dir, "filelists")
+    train_list = os.path.join(flist_dir, "train.txt")
+    val_list = os.path.join(flist_dir, "val.txt")
+
+    with open(
+        os.path.join(configs_dir, "config_template.json"), encoding="utf-8"
+    ) as f:
+        config = json.load(f)
+
+    # ①c: config.spk is keyed by the ASCII dir SLUG — the data loader resolves a
+    # slice's speaker from its parent directory name (data_utils.py:70), so the
+    # keys here MUST be the dataset_44k subdir slugs, id = list order. The
+    # release config (train.py) swaps these for display names for the sidecar.
+    if speakers is None:
+        config["spk"] = {spk: 0}
+        config["model"]["n_speakers"] = 1
+    else:
+        config["spk"] = {sp["slug"]: i for i, sp in enumerate(speakers)}
+        config["model"]["n_speakers"] = len(speakers)
+    config["model"]["speech_encoder"] = encoder
+    if encoder == "vec768l12":
+        config["model"]["ssl_dim"] = config["model"]["filter_channels"] = config[
+            "model"
+        ]["gin_channels"] = 768
+    elif encoder == "vec256l9":
+        config["model"]["ssl_dim"] = config["model"]["gin_channels"] = 256
+
+    if vol_embedding:
+        config["train"]["vol_aug"] = config["model"]["vol_embedding"] = True
+
+    config["train"]["seed"] = int(seed)
+    config["train"]["epochs"] = int(total_epoch)
+    config["train"]["batch_size"] = int(batch_size)
+    config["train"]["eval_interval"] = int(save_every_steps)
+    config["train"]["keep_ckpts"] = int(keep_ckpts)
+    config["train"]["fp16_run"] = bool(fp16)
+    config["train"]["all_in_mem"] = bool(all_in_mem)
+    config["data"]["training_files"] = _p(train_list)
+    config["data"]["validation_files"] = _p(val_list)
+
+    # atomic: the diffusion pipeline trusts an EXISTING config.json (it must
+    # not clobber the main model's train section) — a kill mid-write must not
+    # strand a truncated file for it to trip over
+    config_path = os.path.join(exp_dir, "config.json")
+    tmp = config_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, config_path)
+
+
+def build_flist_and_config(
+    exp_dir,
+    spk,
+    dataset_44k_dir,
+    encoder,
+    vol_embedding,
+    fp16,
+    total_epoch,
+    batch_size,
+    save_every_steps,
+    keep_ckpts,
+    all_in_mem,
+    seed,
+    configs_dir,
+    reporter,
+):
+    """Pre-S41 combined entry, kept as a thin wrapper so existing verify/gate
+    scripts (gate0_sovits_run_ours etc.) keep their exact old call face and
+    semantics. The production pipeline now calls build_config and
+    build_filelists separately (gate between them)."""
+    _, _, n_train, n_val = build_filelists(
+        exp_dir, spk, dataset_44k_dir, seed, reporter
+    )
+    build_config(
+        exp_dir,
+        spk,
+        encoder,
+        vol_embedding,
+        fp16,
+        total_epoch,
+        batch_size,
+        save_every_steps,
+        keep_ckpts,
+        all_in_mem,
+        seed,
+        configs_dir,
+    )
+    return n_train, n_val

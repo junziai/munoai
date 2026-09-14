@@ -1,0 +1,109 @@
+# Dependencies
+node_modules/
+target/
+
+# Build output
+dist/
+
+# Models (large files, downloaded separately)
+models/*.onnx
+models/**/*.onnx
+models/**/*.npy
+
+# ORT runtime DLLs (downloaded, not checked in)
+runtime/
+
+# Embedded Python runtime (too large for git)
+python/
+
+# Python virtualenv
+.venv/
+converter/.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+training/**/__pycache__/
+
+# Converter outputs (generated, machine-specific)
+converter/inspections/
+converter/test_output/
+
+# Model files (user data)
+*.pth
+*.index
+
+# Environment
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Tauri
+src-tauri/target/
+WixTools/
+
+# Training output
+training/output/
+training/logs/
+training/datasets/
+
+# Runtime-pack builder output (S42 — interpreter downloads + staged trees + dist archives)
+training/packs/build/
+
+# Temp
+*.tmp
+*.bak
+
+# App data dir (models + caches, configurable data_dir default — S23)
+data/
+
+# Crash-recovery autosave slot (runtime artifact)
+autosave.json
+
+# TypeScript incremental build state
+tsconfig.tsbuildinfo
+
+# Legacy v1 files
+.claude-memory/
+S2H/
+
+# Tauri generated schemas (regenerated on build)
+src-tauri/gen/
+
+# S64 release: pinned ffmpeg essentials build for bundling (downloaded by scripts, not committed)
+bin/
+
+# machine-local runtime config (device preference / data dir / cuda mem limit)
+/config.json
+
+# S76 batch 4: training-project listing cache (sizes + last-known names). Machine-local and
+# rebuildable, and it sits beside config.json rather than in <data>/training on purpose —
+# `training` is a MIGRATED_SUBTREE and `migrate_data_dir` verifies that tree file-by-file by
+# byte length, so a file we rewrite on every listing would abort a data-dir migration.
+# In dev the app dir IS the repo (same reason logging.rs keeps dev logs out of the tree).
+/training-projects.json
+
+# Claude Code:worktrees 是本地状态,settings.json 与 scripts/memory_hook*.* 要进版本库
+.claude/worktrees/
+
+# temp analyze scripts
+.tmp-analyze*.ps1
+
+# build / dev logs
+*.log
+dev.log
+build.log
+
+# local backup snapshot / temp index
+BACKUP_BEFORE_ORIGINAL_SWAP/
+stable_index.txt

@@ -1,0 +1,183 @@
+@import './theme.css';
+
+/* === Reset & Base === */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  font-family: var(--font-ui);
+  font-size: var(--font-size-base);
+  color: var(--text-primary);
+  background: var(--bg-deep);
+  -webkit-font-smoothing: antialiased;
+  /* The app chrome isn't selectable — stray blue highlights on hover/drag hurt the feel.
+     Re-enabled below for form fields and explicitly-marked copyable content (.selectable). */
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* Re-enable text selection where it's genuinely useful: form fields (always — so the BPM input and
+   the track-name rename input select only when focused, not on hover), the `.selectable` escape
+   hatch, and the audited set of copyable CONTENT below (logs / hardware info / paths / model names /
+   error detail / training readouts). user-select inherits, so a container re-enables its children.
+   A renamed/removed selector here is a harmless no-op (selection simply won't re-enable there). */
+input, textarea, [contenteditable="true"], .selectable, .selectable *,
+.log-entries, .log-dir,
+.settings-value, .settings-error,
+.model-card-name, .model-card-arch, .model-card-desc, .model-card-meta,
+.msst-installed-name, .msst-installed-header .mono,
+.rm-voice-item-name, .rm-import-error, .msst-error,
+.progress-header .mono, .stat-value,
+/* S76 batch 4 — the training project pages. These carry the strings a user actually needs to
+   copy into a bug report or a file explorer: project names (often CJK), the「本次训练名」an
+   artifact was built under, and the checkpoint paths in the export ledger. */
+.tproj-name, .tproj-detail-name, .tproj-note, .tproj-slot-run,
+.tproj-export-name, .tproj-export-src,
+/* S76 batch 5a — the dataset's own strings: the original file names and the singer names an
+   emb_g row belongs to. Reproducing a multi-singer layout by hand means retyping these EXACTLY
+   (the slug is a hash of the name), so they have to be copyable. */
+.tproj-ds-file, .tproj-ds-spk-name, .tproj-slot-spk-name,
+.wf-error {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* Retro grid is rendered via Canvas in the arrangement view, not as CSS overlay */
+
+/* === Scrollbar (retro styled) === */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--bg-base);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: var(--radius-sm);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--accent-primary-dim);
+}
+
+/* === Selection === */
+::selection {
+  background: var(--accent-primary);
+  color: var(--text-inverse);
+}
+
+/* === Links === */
+a {
+  color: var(--accent-primary);
+  text-decoration: none;
+}
+
+/* === Utility classes === */
+.mono {
+  font-family: var(--font-mono);
+}
+
+.text-muted {
+  color: var(--text-muted);
+}
+
+.text-secondary {
+  color: var(--text-secondary);
+}
+
+.glow {
+  box-shadow: var(--shadow-glow);
+}
+
+/* Small square tag for model version/asset badges (v1/v2/4.0/4.1, IDX...) — shared by the
+   workflow node meta rows and the resource manager. Square corners per house style. */
+.ver-badge {
+  display: inline-block;
+  font-size: 8px;
+  line-height: 12px;
+  font-family: var(--font-mono);
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  color: var(--accent-primary);
+  border: 1px solid var(--accent-primary);
+  border-radius: 0;
+  padding: 0 3px;
+  flex-shrink: 0;
+}
+
+/* === Common component styles === */
+button {
+  cursor: pointer;
+  font-family: var(--font-ui);
+  font-size: var(--font-size-sm);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  padding: var(--space-sm) var(--space-lg);
+  transition: all var(--transition-fast);
+}
+
+button:hover {
+  background: var(--bg-hover);
+  border-color: var(--accent-primary-dim);
+}
+
+button:active {
+  transform: translateY(1px);
+}
+
+button.primary {
+  background: var(--accent-primary-dim);
+  border-color: var(--accent-primary);
+  color: var(--text-inverse);
+}
+
+button.primary:hover {
+  background: var(--accent-primary);
+  box-shadow: 0 0 8px var(--accent-primary-glow);
+}
+
+button.danger {
+  border-color: var(--color-error);
+  color: var(--color-error);
+}
+
+button.danger:hover {
+  background: rgba(248, 113, 113, 0.1);
+}
+
+/* === Input fields === */
+input, select {
+  font-family: var(--font-ui);
+  font-size: var(--font-size-sm);
+  background: var(--bg-base);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  color: var(--text-primary);
+  padding: var(--space-sm) var(--space-md);
+  outline: none;
+  transition: border-color var(--transition-fast);
+}
+
+input:focus, select:focus {
+  border-color: var(--accent-primary);
+  box-shadow: 0 0 0 1px var(--accent-primary-glow);
+}
+
+/* No global range styling: the old 14px solid-circle thumb here was the banned
+ * "abstract dot" look. Every slider goes through ParamSlider (.sep-overlap in
+ * NodeShell.css — self-contained appearance/track/thumb) or a custom component. */

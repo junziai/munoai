@@ -1,0 +1,746 @@
+// ② Vocal editor — PROPERTY SIDEBAR (S48 Phase 5 step 6, §9.6/§10.3/§10.4). The editor body's THIRD flex
+// child (mirrors NodePalette|canvas): self-contained, hides/shows with the editor, no App.tsx change. A
+// PASSIVE numeric mirror (§9.3) — it never steals a canvas click; it just exposes the pitch model the
+// overlay/preview already evaluate:
+//   ① selected note(s) · Pitch TRANSITION override (SynthV glide/portamento between notes + the open-edge
+//      scoop-in/drift-out §10.5). Each field is optional: absent = inherit the track default; a slider edit
+//      writes an explicit override; ↺ resets it back to inherit. Editing applies to the WHOLE selection in ONE
+//      undo step.
+//   ② selected note(s) · VIBRATO (add/remove + the 6 SynthV fields).
+//   ③ track · default TRANSITION (VocalTrackParams.transition — the concrete base every note inherits).
+// Sliders reuse VolumeFader (the one gesture-bracketed fader — TrackList uses the same begin/commitTransaction
+// pattern); a drag = ONE undo step. effTransition is imported (not re-derived) so the shown effective value ==
+// what f0eval evaluates. All strings go through i18n.
+import { useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { VolumeFader } from "../common/VolumeFader";
+import { useProjectStore } from "../../store/project";
+import { useHistoryStore } from "../../store/history";
+import { useAppStore } from "../../store/app";
+import { useVoiceModelStore, voiceHasDiffusion, voiceHasRangeRecord, vocalTrackSpeakerId, voiceSpeakerOptions, type VoiceModelEntry } from "../../store/voice-models";
+import { speakerRecordOf } from "../../lib/vocal/rangeBounds";
+import { RangeBoundsEditor } from "../vocal/RangeBoundsEditor";
+import { effTransition } from "../../lib/f0eval";
+import { DEFAULT_CONSONANT_EMPHASIS_DB, DEFAULT_CONSONANT_VALLEY, DEFAULT_BREATH_TOKEN, DEFAULT_REST_TOKEN } from "../../lib/vocalNotes";
+import { VOCAL_LANGUAGES, langById } from "../../lib/vocal/languages";
+import type { EsDialectId, PhonemeSetId } from "../../types/project";
+import { backendOf, backendLabel, pickVoiceForTrack } from "../../lib/vocal/voicePick";
+import { DIFFUSION_METHODS, RVC_DEFAULTS, SOVITS_DEFAULTS, type RvcOptions, type SovitsOptions } from "../../lib/workflow/voiceDefaults";
+import { VocoderSelect } from "../workflow/nodes/VoiceModelPicker";
+import type { Note, NoteTransition, VibratoSpec, VocalTrackParams } from "../../types/project";
+import "./VocalSidebar.css";
+
+/** Default vibrato seeded by "Add vibrato" (depthCents>0 so normalizeNote keeps it). ⚠ startMs/ease are SMALL
+ *  on purpose so vibrato is VISIBLE the instant it's added, even on a shorter (tail) note — the old SynthV-ish
+ *  250 ms onset + 200 ms fades suppressed it entirely below ~2 beats (§user "尾音加不了颤音"). The onset delay
+ *  is still a slider, so a swell-in can be dialed back in per note. */
+const DEFAULT_VIBRATO: VibratoSpec = { depthCents: 100, freqHz: 5.5, phase: 0, startMs: 0, easeInMs: 80, easeOutMs: 120 };
+
+// UI ranges are deliberately GENEROUS (§user: bold freedom is the real expressiveness lever). They stay within
+// the data-layer clamps (normalizeTransition: dur 0–2000, depth ±1200; vibrato: depth 0–2400, freq 0.1–40,
+// start 0–60000, ease 0–10000) so a slider value never gets silently re-clamped on write.
+interface FieldCfg { key: keyof Required<NoteTransition>; min: number; max: number; step: number; unit: string; bipolar: boolean; }
+const TRANSITION_FIELDS: FieldCfg[] = [
+  { key: "durLeftMs", min: 0, max: 1000, step: 1, unit: "ms", bipolar: false },
+  { key: "durRightMs", min: 0, max: 1000, step: 1, unit: "ms", bipolar: false },
+  { key: "depthLeftCents", min: -600, max: 600, step: 1, unit: "¢", bipolar: true },
+  { key: "depthRightCents", min: -600, max: 600, step: 1, unit: "¢", bipolar: true },
+  { key: "offsetMs", min: -500, max: 500, step: 1, unit: "ms", bipolar: true },
+  { key: "openEdgeCents", min: 0, max: 600, step: 1, unit: "¢", bipolar: false },
+];
+interface VibCfg { key: keyof VibratoSpec; min: number; max: number; step: number; unit: string; bipolar: boolean; }
+const VIBRATO_FIELDS: VibCfg[] = [
+  { key: "depthCents", min: 0, max: 1200, step: 1, unit: "¢", bipolar: false },
+  { key: "freqHz", min: 0.5, max: 40, step: 0.1, unit: "Hz", bipolar: false },
+  { key: "phase", min: -1, max: 1, step: 0.01, unit: "", bipolar: true },
+  { key: "startMs", min: 0, max: 2000, step: 5, unit: "ms", bipolar: false },
+  { key: "easeInMs", min: 0, max: 2000, step: 5, unit: "ms", bipolar: false },
+  { key: "easeOutMs", min: 0, max: 2000, step: 5, unit: "ms", bipolar: false },
+];
+
+const fmt = (v: number, step: number): string => (step >= 1 ? String(Math.round(v)) : step >= 0.1 ? v.toFixed(1) : v.toFixed(2));
+
+interface Props {
+  trackId: string;
+  segmentId: string;
+  notes: Note[];
+  selectedIds: string[];
+  trackTransition: Required<NoteTransition>;
+  /** Track-level render config (backend / ScoreToCV speaker+lang / transpose). */
+  vocalParams: VocalTrackParams;
+  /** Selected SVC voice (singer) name, from Track.voiceModel. */
+  voiceModel?: string;
+  onRender: () => void;
+  rendering: boolean;
+}
+
+export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTransition, vocalParams, voiceModel, onRender, rendering }: Props) {
+  const { t, i18n } = useTranslation();
+  // SynthV-style tabs: "singer" = voice + tone/quality; "pitch" = pitch tuning. Splits the (previously long)
+  // single scroll into two focused panels; the Render action is a pinned footer visible on both.
+  const [tab, setTab] = useState<"singer" | "pitch">("singer");
+  // ── S73b/c/d 自动调教:全部旋钮持久在 vocalParams,改动 → AutoTuneWatcher 静默重调教 →
+  //    重渲染(一步 undo=Slider 手势事务)。S73d 起区块零按钮零异步:Retake 抽奖被确定性
+  //    Take 旋钮替代;失败 UX(冷却自愈+缺模型对话框)全在 watcher。 ──
+  const applyNoteEdits = useProjectStore((s) => s.applyNoteEdits);
+  const setVocalParams = useProjectStore((s) => s.setVocalParams);
+  const toggleModelManager = useAppStore((s) => s.toggleModelManager);
+  const models = useVoiceModelStore((s) => s.models);
+
+  // ONE unified singer list (SoVITS + RVC). Identity is (model_type, name) — same-name rvc/sovits pairs are
+  // a standard workflow, so never key by name alone; the picked model's type auto-sets the backend.
+  const allVoices = useMemo(() => [...models.sovits, ...models.rvc], [models]);
+  const selectedVoice = useMemo(
+    () => allVoices.find((m) => m.name === voiceModel && backendOf(m) === vocalParams.backend),
+    [allVoices, voiceModel, vocalParams.backend],
+  );
+  // Pick a singer → the SHARED single pick path (voiceModel + backend, one undo step) — the track-header
+  // singer popup uses the same function (S58, NO-dup).
+  const pickVoice = (m: VoiceModelEntry) => pickVoiceForTrack(trackId, m);
+
+  // S146e — which (model, speaker) record the 音域扩展栏's bound knobs edit.
+  // ⛔ The speaker here is `vocalTrackSpeakerId` = the max-weight blend entry, which the user
+  // never explicitly chose; `speakerLabel` is therefore mandatory, not decoration (S146e recon).
+  const [boundsOpen, setBoundsOpen] = useState(false);
+  const rangeRecordForTrack = useMemo(() => {
+    if (!selectedVoice) return null;
+    const speakerId = vocalTrackSpeakerId(vocalParams);
+    const sp = speakerRecordOf(selectedVoice.config, speakerId);
+    if (!sp) return null;
+    const opts = voiceSpeakerOptions(selectedVoice);
+    return {
+      sp,
+      name: selectedVoice.name,
+      backend: backendOf(selectedVoice) as "rvc" | "sovits",
+      speakerId,
+      speakerLabel: opts.length > 1 ? opts.find((s) => s.id === speakerId)?.label : undefined,
+    };
+  }, [selectedVoice, vocalParams]);
+
+  // The selection = the notes to edit; the FIRST is the display anchor (its values fill the sliders; edits
+  // apply to ALL selected). Recomputed only when the ids/notes change.
+  const selected = useMemo(() => {
+    const set = new Set(selectedIds);
+    return notes.filter((n) => set.has(n.id));
+  }, [notes, selectedIds]);
+  const anchor = selected[0];
+  const hasSel = selected.length > 0;
+
+  // ── batch helpers: build a per-id update map → ONE applyNoteEdits (one undo step; the drag transaction
+  //    coalesces the per-frame calls). Each note keeps its OTHER overrides (merge onto its own current).
+  //    ★S73 所有权:手动改 transition/vibrato = 用户接管调教 → 剥 autoTuned 标记(此后自动调教
+  //    绕行这个音符;SynthV「用户设过值则自动过程跳过」同构)。
+  //    ★S73d 多选=DELTA 编辑:滑杆位移作为增量加到【每个音符自己的当前值】上(各自钳位)——
+  //    旧「锚值写给所有人」会把短音符塞进长音符的绝对值(轻推一下,某音符音高线爆炸,§user)。
+  //    每帧 delta = 新值 − 锚当前值,写入后锚同步前进 → 逐帧增量在全员上等量累积;单选时
+  //    锚+delta ≡ 绝对设值,行为不变。 ──
+  const editTransition = (key: keyof Required<NoteTransition>, value: number | undefined) => {
+    const update: Record<string, Partial<Note>> = {};
+    if (value === undefined) {
+      // 重置回继承:保持绝对语义(全员剥该字段)
+      for (const n of selected) update[n.id] = { transition: { ...(n.transition ?? {}), [key]: undefined }, autoTuned: undefined };
+    } else {
+      const delta = value - effTransition(anchor!, trackTransition)[key];
+      for (const n of selected) {
+        const cur = effTransition(n, trackTransition)[key];
+        update[n.id] = { transition: { ...(n.transition ?? {}), [key]: cur + delta }, autoTuned: undefined };
+      }
+    }
+    applyNoteEdits(trackId, segmentId, { update });
+  };
+  const editVibratoField = (key: keyof VibratoSpec, value: number) => {
+    const update: Record<string, Partial<Note>> = {};
+    // Only retune notes that ALREADY vibrate — a slider tweak must NOT silently seed a full audible vibrato on
+    // a selected note that had none (use "Add vibrato" for that). The anchor has one (that's why we render).
+    const anchorCur = anchor?.vibrato?.[key];
+    const delta = anchorCur !== undefined ? value - anchorCur : 0;
+    for (const n of selected) {
+      if (!n.vibrato) continue;
+      let next = n.vibrato[key] + delta;
+      // ★depth 特判(S73d 复核 CONFIRMED):多选 delta 把浅颤音压过 0 → normalizeNote 连整个
+      //   vibrato 容器(freq/phase/…)一起剥成 absent,后续帧 `!n.vibrato` 跳过=拖回也救不回。
+      //   垫 0.01¢ 保容器;只有滑杆本身拖到 0(全员归零=删除语义)才放行剥除。
+      if (key === "depthCents" && value > 0) next = Math.max(0.01, next);
+      update[n.id] = { vibrato: { ...n.vibrato, [key]: next }, autoTuned: undefined };
+    }
+    applyNoteEdits(trackId, segmentId, { update });
+  };
+  const setVibrato = (spec: VibratoSpec | undefined) => {
+    const update: Record<string, Partial<Note>> = {};
+    // ADD (spec) seeds the default ONLY where a note lacks a vibrato — a note that already has a tuned vibrato
+    // KEEPS it (never clobber another selected note's data). REMOVE (spec===undefined) clears all selected.
+    for (const n of selected) update[n.id] = { vibrato: spec ? (n.vibrato ?? { ...spec }) : undefined, autoTuned: undefined };
+    applyNoteEdits(trackId, segmentId, { update }); // depthCents≤0 → normalizeNote strips → absent (= remove)
+  };
+  // S58 per-note language override for the whole selection (ONE undo step); undefined = follow the track.
+  const editNoteLang = (code: string | undefined) => {
+    const update: Record<string, Partial<Note>> = {};
+    for (const n of selected) update[n.id] = { lang: code };
+    applyNoteEdits(trackId, segmentId, { update });
+  };
+
+  const eff = anchor ? effTransition(anchor, trackTransition) : trackTransition;
+  const vib = anchor?.vibrato; // the anchor's vibrato (fills the sliders; edits apply to all selected)
+
+  // ── Item-1 quality knobs: only the CHANGED keys live on vocalParams.sovits/.rvc (absent = contract
+  //    default). A drag/toggle = one setVocalParams (one undo step). Asset-gated rows hide when the singer
+  //    lacks the asset (mirrors the 翻唱 SoVITS/RVC node). ──
+  const sv = (vocalParams.sovits ?? {}) as Partial<SovitsOptions>;
+  const rv = (vocalParams.rvc ?? {}) as Partial<RvcOptions>;
+  const svGet = <K extends keyof SovitsOptions>(k: K): SovitsOptions[K] => (sv[k] ?? SOVITS_DEFAULTS[k]) as SovitsOptions[K];
+  const rvGet = <K extends keyof RvcOptions>(k: K): RvcOptions[K] => (rv[k] ?? RVC_DEFAULTS[k]) as RvcOptions[K];
+  const setSv = (patch: Partial<SovitsOptions>) => setVocalParams(trackId, { sovits: { ...sv, ...patch } });
+  const setRv = (patch: Partial<RvcOptions>) => setVocalParams(trackId, { rvc: { ...rv, ...patch } });
+  const hasRetrieval = !!selectedVoice?.index_path; // cluster (SoVITS) / feature index (RVC) sibling asset
+  const hasDiffusion = voiceHasDiffusion(selectedVoice);
+  const diffusionOn = !!svGet("shallow_diffusion") && hasDiffusion;
+  const ratioCfg = { min: 0, max: 1, step: 0.01, unit: "", bipolar: false };
+
+  return (
+    <div className="vocal-sidebar">
+      {/* Two tabs (SynthV-style): 歌手 = singer + tone/quality; 调教 = pitch tuning. The Render action is a
+          pinned footer, visible on both tabs. */}
+      <div className="vsb-tabs">
+        <button className={tab === "singer" ? "active" : ""} onClick={() => setTab("singer")}>{t("vocalEditor.sidebar.tabSinger")}</button>
+        <button className={tab === "pitch" ? "active" : ""} onClick={() => setTab("pitch")}>{t("vocalEditor.sidebar.tabPitch")}</button>
+      </div>
+      <div className="vsb-body">
+      {tab === "singer" ? (
+      <>
+      {/* ⓪ track · VOICE — ONE unified singer list (SoVITS + RVC); the picked model's TYPE drives the
+          backend automatically. */}
+      <div className="vsb-section">
+        <div className="vsb-head">
+          <span>{t("vocalEditor.sidebar.voice")}</span>
+          {selectedVoice && <span className="vsb-backend-tag">{backendLabel(selectedVoice)}</span>}
+        </div>
+        {allVoices.length === 0 ? (
+          <div className="voice-no-model">
+            <span className="sep-no-model">{t("vocalEditor.sidebar.noVoiceModel")}</span>
+            <button className="voice-manage-btn" onClick={() => toggleModelManager()}>
+              {t("vocalEditor.sidebar.goImport")}
+            </button>
+          </div>
+        ) : (
+          <select
+            className="sep-model-select"
+            value={selectedVoice ? String(allVoices.indexOf(selectedVoice)) : ""}
+            onChange={(e) => {
+              const m = allVoices[Number(e.target.value)];
+              if (m) pickVoice(m);
+            }}
+          >
+            <option value="" disabled>{t("vocalEditor.sidebar.pickVoice")}</option>
+            {allVoices.map((m, i) => (
+              <option key={`${m.model_type}:${m.name}:${i}`} value={i}>
+                {m.name} · {backendLabel(m)}
+              </option>
+            ))}
+          </select>
+        )}
+        <Slider
+          label={t("vocalEditor.sidebar.transpose")}
+          value={vocalParams.transpose}
+          cfg={{ min: -24, max: 24, step: 1, unit: "st", bipolar: true }}
+          onChange={(v) => setVocalParams(trackId, { transpose: v })}
+        />
+        {/* ② 共振腔/formant track-level SCALAR (semitones), ADDED to the bottom formant lane at render. */}
+        <Slider
+          label={t("vocalEditor.sidebar.formant")}
+          value={vocalParams.formant ?? 0}
+          cfg={{ min: -12, max: 12, step: 1, unit: "st", bipolar: true }}
+          overridden={(vocalParams.formant ?? 0) !== 0}
+          resetTitle={t("vocalEditor.sidebar.formantTip")}
+          onReset={() => setVocalParams(trackId, { formant: 0 })}
+          onChange={(v) => setVocalParams(trackId, { formant: v })}
+        />
+        {/* S83 knife 6b: consonant strength (SynthV analogue) — output-domain dB on voiceless onsets. */}
+        <Slider
+          label={t("vocalEditor.sidebar.consonant")}
+          value={vocalParams.consonantEmphasis ?? DEFAULT_CONSONANT_EMPHASIS_DB}
+          cfg={{ min: 0, max: 6, step: 0.5, unit: "dB", bipolar: false }}
+          overridden={(vocalParams.consonantEmphasis ?? DEFAULT_CONSONANT_EMPHASIS_DB) !== DEFAULT_CONSONANT_EMPHASIS_DB}
+          resetTitle={t("vocalEditor.sidebar.consonantTip")}
+          onReset={() => setVocalParams(trackId, { consonantEmphasis: DEFAULT_CONSONANT_EMPHASIS_DB })}
+          onChange={(v) => setVocalParams(trackId, { consonantEmphasis: v })}
+        />
+        {/* S84 C 刀: consonant valley (颗粒感) — output-domain gain valley on chain-internal syllable
+            boundaries (voiced consonants too), restoring the per-syllable energy alternation. */}
+        <Slider
+          label={t("vocalEditor.sidebar.consonantValley")}
+          value={vocalParams.consonantValley ?? DEFAULT_CONSONANT_VALLEY}
+          cfg={{ min: 0, max: 2, step: 0.1, unit: "×", bipolar: false }}
+          overridden={(vocalParams.consonantValley ?? DEFAULT_CONSONANT_VALLEY) !== DEFAULT_CONSONANT_VALLEY}
+          resetTitle={t("vocalEditor.sidebar.consonantValleyTip")}
+          onReset={() => setVocalParams(trackId, { consonantValley: DEFAULT_CONSONANT_VALLEY })}
+          onChange={(v) => setVocalParams(trackId, { consonantValley: v })}
+        />
+        {/* S84 E 刀: vowel-clarity articulation oversampling — fast-run short vowels render at an
+            inflated S2CV duration and resample back (cv-domain; default ON, absent≡true). */}
+        <div title={t("vocalEditor.sidebar.vowelClarityTip")}>
+          <ToggleRow
+            label={t("vocalEditor.sidebar.vowelClarity")}
+            checked={vocalParams.vowelClarity !== false}
+            onChange={(c) => setVocalParams(trackId, { vowelClarity: c })}
+          />
+        </div>
+        {/* S89 自动音素时序: the S83 onset pre-roll (consonants ahead of the beat so the vowel lands ON
+            it). Default ON, absent≡true; the phoneme lane shows the difference immediately.
+            ⚠ S91 correction: S89's advice to turn this OFF for a UTAU CVVC/VCCV score was based on a
+            wrong model of UTAU. Those files carry their pre-utterance in the note's own `PreUtterance`
+            field (or, blank, in the bank's oto.ini), which moves the SAMPLE and never the tick —
+            and against the 1/8-beat unit they are written on, the median start offset is 0 for every
+            onset class with no ordering by consonant length. Our pre-roll is the analogue of
+            preutterance, applied once. Leave it ON. See types/project.ts for the full measurement. */}
+        <div title={t("vocalEditor.sidebar.consonantPrerollTip")}>
+          <ToggleRow
+            label={t("vocalEditor.sidebar.consonantPreroll")}
+            checked={vocalParams.consonantPreroll !== false}
+            onChange={(c) => setVocalParams(trackId, { consonantPreroll: c })}
+          />
+        </div>
+        {/* M3 breath token: the lyric that means "audible inhale" (mapped to AP at render). Editable so a
+            custom trigger never steals a glyph the user needs as a real lyric. */}
+        <div className="vsb-inline">
+          <label className="vsb-label" title={t("vocalEditor.sidebar.breathTokenTip")}>{t("vocalEditor.sidebar.breathToken")}</label>
+          <input
+            className="vsb-text"
+            type="text"
+            spellCheck={false}
+            value={vocalParams.breathToken ?? DEFAULT_BREATH_TOKEN}
+            onChange={(e) => setVocalParams(trackId, { breathToken: e.target.value })}
+          />
+        </div>
+        {/* S88 rest token: the twin of the breath token — the lyric that means "a rest" (mapped to the
+            canonical R at render). S86 narrowed the hard-wired rest set so `rest`/`sil`/`pau` stay singable
+            words; this box is how a user picks a convenient trigger back without stealing one from every
+            language at once. */}
+        <div className="vsb-inline">
+          <label className="vsb-label" title={t("vocalEditor.sidebar.restTokenTip")}>{t("vocalEditor.sidebar.restToken")}</label>
+          <input
+            className="vsb-text"
+            type="text"
+            spellCheck={false}
+            value={vocalParams.restToken ?? DEFAULT_REST_TOKEN}
+            onChange={(e) => setVocalParams(trackId, { restToken: e.target.value })}
+          />
+        </div>
+        {/* S60-2 音域扩展: shift into the singer's tested comfort zone, Signalsmith inverse back.
+            S60c/S62c: shown ONLY when the track's SELECTED SPEAKER carries a usable tested
+            vocal_range record — an untested model/speaker's toggle is a confusing no-op
+            (§user, twice). Default OFF (S62c user decision — recolor tradeoff is opt-in). */}
+        {voiceHasRangeRecord(selectedVoice, vocalTrackSpeakerId(vocalParams)) && (<>
+        <div title={t("vocalEditor.sidebar.rangeExtendTip")}>
+          <ToggleRow
+            label={t("vocalEditor.sidebar.rangeExtend")}
+            checked={vocalParams.rangeExtend !== false}
+            onChange={(c) => setVocalParams(trackId, { rangeExtend: c })}
+          />
+        </div>
+        {/* S82 κ — formant-follow of the shift-back inverse. Stored in BOTH backend option bags
+            (one per-track knob; switching backend must not change the formant policy). Hidden
+            while the extension is off — it only affects actually-shifted phrases. */}
+        {vocalParams.rangeExtend !== false && (
+          <Slider
+            label={t("vocalEditor.sidebar.rangeFormant")}
+            tip={t("vocalEditor.sidebar.rangeFormantTip")}
+            value={(vocalParams.backend === "rvc"
+              ? vocalParams.rvc?.range_formant_follow
+              : vocalParams.sovits?.range_formant_follow) ?? 0}
+            cfg={{ min: 0, max: 1, step: 0.01, unit: "", bipolar: false }}
+            onChange={(v) => setVocalParams(trackId, {
+              sovits: { ...(vocalParams.sovits ?? {}), range_formant_follow: v },
+              rvc: { ...(vocalParams.rvc ?? {}), range_formant_follow: v },
+            })}
+          />
+        )}
+        {/* S146e — 两个边界旋钮在这里镜像一份。用户原话:「这两个旋钮仿佛还挺重要/挺常用的,
+            得做好来回调的准备」,而它们此前只在资源管理器里,每调一次都要开一次浮动面板。
+            ⛔ 三条不许改回去的形状(全在 RangeBoundsEditor 的注释里,连同量出它们的那次侦察):
+              ⒜ 本地暂存 + 显式 OK —— 直接接侧栏的 `Slider` 会每帧写盘 + 开一串空历史事务;
+              ⒝ 两个边界一次写完 —— 否则后端 RANGE_INVALID,而那条错误在 UI 上不可见;
+              ⒞ 必须写出歌手名 —— 这里的歌手是 spk_mix 里权重最大的那位,用户没显式选过。
+            ⚠ 折叠着:这是模型级(全机)设置,放在 per-track 面板里,默认不该看起来像轨道属性。 */}
+        {vocalParams.rangeExtend !== false && rangeRecordForTrack && (
+          <div className="vsb-inline vsb-range-bounds">
+            {!boundsOpen ? (
+              <button
+                className="rm-range-btn"
+                title={t("vocalEditor.sidebar.rangeBoundsTip")}
+                onClick={() => setBoundsOpen(true)}
+              >
+                {t("vocalEditor.sidebar.rangeBounds")}
+              </button>
+            ) : (
+              <RangeBoundsEditor
+                sp={rangeRecordForTrack.sp}
+                modelName={rangeRecordForTrack.name}
+                backend={rangeRecordForTrack.backend}
+                speakerId={rangeRecordForTrack.speakerId}
+                speakerLabel={rangeRecordForTrack.speakerLabel}
+                lang={i18n.language}
+                onClose={() => setBoundsOpen(false)}
+              />
+            )}
+          </div>
+        )}
+        </>)}
+      </div>
+
+      {/* ⓪.3 语言 (S58 §3.7) — lives on the SINGER tab (it configures WHAT is sung, not the pitch; §user).
+          Track default (VocalTrackParams.langId — the whole track's G2P language) + a per-note override
+          for the selection (Note.lang; absent = follow the track). Both feed the render per note. */}
+      <div className="vsb-section">
+        <div className="vsb-head"><span>{t("vocalEditor.sidebar.language")}</span></div>
+        <div className="vsb-inline">
+          <label className="vsb-label" title={t("vocalEditor.sidebar.trackLangTip")}>{t("vocalEditor.sidebar.trackLang")}</label>
+          <select
+            className="sep-model-select vsb-inline-select"
+            value={vocalParams.langId}
+            onChange={(e) => setVocalParams(trackId, { langId: Number(e.target.value) })}
+          >
+            {VOCAL_LANGUAGES.map((l) => (
+              <option key={l.code} value={l.id}>{t(`langs.${l.code}`)} ({l.short})</option>
+            ))}
+          </select>
+        </div>
+        <div className="vsb-inline">
+          <label className="vsb-label" title={t("vocalEditor.sidebar.noteLangTip")}>
+            {t("vocalEditor.sidebar.noteLang")}
+            {hasSel && selected.length > 1 ? ` ×${selected.length}` : ""}
+          </label>
+          {!hasSel ? (
+            <span className="vsb-hint-inline">{t("vocalEditor.sidebar.selectNoteHint")}</span>
+          ) : (
+            <select
+              className="sep-model-select vsb-inline-select"
+              value={anchor?.lang ?? ""}
+              onChange={(e) => editNoteLang(e.target.value || undefined)}
+            >
+              <option value="">
+                {t("vocalEditor.sidebar.langFollow")} ({langById(vocalParams.langId).short})
+              </option>
+              {VOCAL_LANGUAGES.map((l) => (
+                <option key={l.code} value={l.code}>{t(`langs.${l.code}`)} ({l.short})</option>
+              ))}
+            </select>
+          )}
+        </div>
+        {/* S90: the ONE in-app place the English phoneme conventions are stated. Two things here are
+            otherwise silent: that a lyric may carry an OpenUtau phonetic hint at all, and that ARPABET
+            written WITHOUT a stress digit (which is how ARPAsing reclists and OpenUtau hints are always
+            written) is read as UNSTRESSED — so a bare `ah` sings ə. The manual (§5.4/§5.5) carries the
+            long version, including the other six languages' bracket semantics.
+            Shown whenever ENGLISH is in play — track default OR any selected note's override, since a
+            per-note `en` on a JA track is exactly when a user meets ARPABET without expecting it. */}
+        {/* ⚠ `|| vocalParams.phonemeSet` (review S91): the reveal is selection-driven, so a track
+            whose DEFAULT language is ja (which is what an imported English UST lands on) could set a
+            convention with an en note selected and then have the control vanish — a live setting the
+            user can neither see nor reset. A convention that is SET is always visible. */}
+        {(langById(vocalParams.langId).code === "en" ||
+          !!vocalParams.phonemeSet ||
+          selected.some((n) => (n.lang ?? langById(vocalParams.langId).code) === "en")) && (
+          <>
+            {/* S91 「音素约定」: an English UST written for a UTAU voicebank carries sample ALIASES, not
+                words. It sits in the LANGUAGE section (not the knobs) because it is a property of how
+                this track's English lyrics are SPELLED, and it only ever affects English notes. */}
+            <div className="vsb-inline">
+              <label className="vsb-label" title={t("vocalEditor.sidebar.phonemeSetTip")}>
+                {t("vocalEditor.sidebar.phonemeSet")}
+              </label>
+              <select
+                className="sep-model-select vsb-inline-select"
+                value={vocalParams.phonemeSet ?? "words"}
+                onChange={(e) =>
+                  setVocalParams(trackId, {
+                    phonemeSet: e.target.value === "words" ? undefined : (e.target.value as PhonemeSetId),
+                  })
+                }
+              >
+                {(["words", "arpasing", "xsampa", "vccv"] as const).map((k) => (
+                  <option key={k} value={k}>{t(`vocalEditor.sidebar.phonemeSet_${k}`)}</option>
+                ))}
+              </select>
+            </div>
+            <div className="vsb-hint" title={t("vocalEditor.sidebar.phonemeHintTip")}>
+              {vocalParams.phonemeSet
+                ? t("vocalEditor.sidebar.phonemeSetHint")
+                : t("vocalEditor.sidebar.phonemeHint")}
+            </div>
+          </>
+        )}
+        {/* S167 (§E4): Spanish dialect. Same reveal contract as the phoneme convention above
+            (review S91): shown whenever SPANISH is in play — track default OR any selected note's
+            override — and a dialect that is SET is always visible so a live setting can never
+            become unreachable. It sits in the LANGUAGE section because it is a property of how
+            this track's Spanish lyrics turn into phones; only Spanish notes are affected. */}
+        {(langById(vocalParams.langId).code === "es" ||
+          !!vocalParams.esDialect ||
+          selected.some((n) => (n.lang ?? langById(vocalParams.langId).code) === "es")) && (
+          <div className="vsb-inline">
+            <label className="vsb-label" title={t("vocalEditor.sidebar.esDialectTip")}>
+              {t("vocalEditor.sidebar.esDialect")}
+            </label>
+            <select
+              className="sep-model-select vsb-inline-select"
+              value={vocalParams.esDialect ?? "dictionary"}
+              onChange={(e) =>
+                setVocalParams(trackId, {
+                  esDialect: e.target.value === "dictionary" ? undefined : (e.target.value as EsDialectId),
+                })
+              }
+            >
+              {(["dictionary", "castilian", "castilian_yeista", "latam", "andean"] as const).map((k) => (
+                <option key={k} value={k}>{t(`vocalEditor.sidebar.esDialect_${k}`)}</option>
+              ))}
+            </select>
+          </div>
+        )}
+      </div>
+
+      {/* ⓪.5 音质 (Item-1): the singer's quality knobs — SoVITS = cluster + shallow diffusion + NSF
+          enhancer; RVC = feature index + protect (+ noise for both). Only changed keys are stored; asset-
+          gated rows hide when the singer lacks the asset. auto_f0/loudness/f0_shift are force-off Rust-side. */}
+      <div className="vsb-section">
+        <div className="vsb-head">
+          <span>{t("vocalEditor.sidebar.quality")}</span>
+          {selectedVoice && <span className="vsb-backend-tag">{backendLabel(selectedVoice)}</span>}
+        </div>
+        {!selectedVoice ? (
+          <div className="vsb-hint">{t("vocalEditor.sidebar.selectVoiceHint")}</div>
+        ) : vocalParams.backend === "sovits" ? (
+          <>
+            <Slider label={t("vocalEditor.sidebar.q_noise")} value={svGet("noise_scale")} cfg={ratioCfg} onChange={(v) => setSv({ noise_scale: v })} />
+            {hasRetrieval && (
+              <Slider label={t("vocalEditor.sidebar.q_cluster")} value={svGet("cluster_ratio")} cfg={ratioCfg} onChange={(v) => setSv({ cluster_ratio: v })} />
+            )}
+            {hasDiffusion && (
+              <ToggleRow
+                label={t("vocalEditor.sidebar.q_diffusion")}
+                checked={diffusionOn}
+                onChange={(c) => setSv(c ? { shallow_diffusion: true } : { shallow_diffusion: false, only_diffusion: false })}
+              />
+            )}
+            {diffusionOn && (
+              <>
+                <SelectRow label={t("vocalEditor.sidebar.q_sampler")} value={svGet("diffusion_method")} options={DIFFUSION_METHODS} onChange={(v) => setSv({ diffusion_method: v })} />
+                <Slider label={t("vocalEditor.sidebar.q_kstep")} value={svGet("k_step")} cfg={{ min: 10, max: 1000, step: 10, unit: "", bipolar: false }} onChange={(v) => setSv({ k_step: v })} />
+                <Slider label={t("vocalEditor.sidebar.q_speedup")} value={svGet("diffusion_speedup")} cfg={{ min: 1, max: 100, step: 1, unit: "×", bipolar: false }} onChange={(v) => setSv({ diffusion_speedup: v })} />
+              </>
+            )}
+            {/* S147: 这个开关此前**连提示都没有**,而它是整条渲染链上最贵的单项 ——
+                实测每遍全曲 +25.7s(≈ +75%),而且与音域扩展的 (1+K) 遍**相乘**:用户那首曲子
+                K=4 时,323 秒里有 128 秒是它。⇒ 不替用户关掉(它改变每一个采样,是取舍不是缺陷),
+                但把代价摆出来。开着时才显示那行注脚 —— 关着时它不欠解释。 */}
+            {!diffusionOn && (
+              <div title={t("vocalEditor.sidebar.q_enhancerTip")}>
+                <ToggleRow label={t("vocalEditor.sidebar.q_enhancer")} checked={!!svGet("nsf_enhance")} onChange={(c) => setSv({ nsf_enhance: c })} />
+                {!!svGet("nsf_enhance") && (
+                  <div className="vsb-note">{t("vocalEditor.sidebar.q_enhancerCost")}</div>
+                )}
+              </div>
+            )}
+            {/* fine-tuned NSF-HiFiGAN vocoder — meaningful only on the mel→audio paths (shallow diffusion /
+                enhancer). Backend already honors vocoder_name for the ② render (resolve_sovits_quality). */}
+            {(diffusionOn || !!svGet("nsf_enhance")) && (
+              <VocoderSelect
+                value={svGet("vocoder_name") ?? null}
+                lang={i18n.language}
+                onChange={(v) => setSv({ vocoder_name: v })}
+                rowClass="vsb-inline"
+                selectClass="sep-model-select vsb-inline-select"
+                labelClass="vsb-label"
+              />
+            )}
+          </>
+        ) : (
+          <>
+            <Slider label={t("vocalEditor.sidebar.q_noise")} value={rvGet("noise_scale")} cfg={ratioCfg} onChange={(v) => setRv({ noise_scale: v })} />
+            {hasRetrieval && (
+              <Slider label={t("vocalEditor.sidebar.q_index")} value={rvGet("index_ratio")} cfg={ratioCfg} onChange={(v) => setRv({ index_ratio: v })} />
+            )}
+            <Slider label={t("vocalEditor.sidebar.q_protect")} value={rvGet("protect")} cfg={{ min: 0, max: 0.5, step: 0.01, unit: "", bipolar: false }} onChange={(v) => setRv({ protect: v })} />
+          </>
+        )}
+      </div>
+      </>
+      ) : (
+      <>
+      {/* ⓪ 自动调教 (S73→S73d 定稿): 模型预测 per-note θ → transition/vibrato,常开跟随=AutoTuneWatcher,
+          作用域=全部未调教/机器调教音符(所有权见 lib/vocal/autoTune.ts;着色=金竖条+音高线染金)。
+          全部旋钮持久在 vocalParams,改动 → watcher 静默重调教 → 重渲染;相位=phaseForTake(take,id)
+          纯函数,Take 旋钮即「换一版」。 */}
+      <div className="vsb-section">
+        <div className="vsb-head">
+          <span>{t("vocalEditor.sidebar.autotune")}</span>
+          {hasSel && selected.length > 1 && <span className="vsb-count">×{selected.length}</span>}
+        </div>
+        <div title={t("vocalEditor.sidebar.autotuneFollowTip")}>
+          <ToggleRow
+            label={t("vocalEditor.sidebar.autotuneFollow")}
+            checked={vocalParams.autoTuneFollow !== false}
+            onChange={(c) => setVocalParams(trackId, { autoTuneFollow: c })}
+          />
+        </div>
+        {/* Rigidness(S73d 用户拍板,SV 术语):UI 反向百分比 ↔ 数据 autoTuneVib(vib = 1 − r/100):
+            +100% = vib 0 拉平 / 0% = vib 1 默认 / −100% = vib 2 最大摆动。 */}
+        <Slider
+          label={t("vocalEditor.sidebar.autotuneRigid")}
+          tip={t("vocalEditor.sidebar.autotuneRigidTip")}
+          value={Math.round((1 - (vocalParams.autoTuneVib ?? 1)) * 100)}
+          cfg={{ min: -100, max: 100, step: 1, unit: "%", bipolar: true }}
+          onChange={(r) => setVocalParams(trackId, { autoTuneVib: 1 - r / 100 })}
+        />
+        <Slider
+          label={t("vocalEditor.sidebar.autotuneExpr")}
+          tip={t("vocalEditor.sidebar.autotuneExprTip")}
+          value={vocalParams.autoTuneExpr ?? 2}
+          cfg={{ min: 0, max: 4, step: 0.01, unit: "×", bipolar: false }}
+          onChange={(v) => setVocalParams(trackId, { autoTuneExpr: v })}
+        />
+        {/* Take(S73d):确定性「换一版」旋钮,替代 Retake 抽奖——同号=同唱法,可转回可存盘。 */}
+        <Slider
+          label={t("vocalEditor.sidebar.autotuneTake")}
+          tip={t("vocalEditor.sidebar.autotuneTakeTip")}
+          value={vocalParams.autoTuneTake ?? 0}
+          cfg={{ min: 0, max: 99, step: 1, unit: "", bipolar: false }}
+          onChange={(v) => setVocalParams(trackId, { autoTuneTake: Math.round(v) })}
+        />
+      </div>
+
+      {/* ① selected-note transition override (glide / portamento between notes) */}
+      <div className="vsb-section">
+        <div className="vsb-head">
+          <span>{t("vocalEditor.sidebar.noteTransition")}</span>
+          {hasSel && selected.length > 1 && <span className="vsb-count">×{selected.length}</span>}
+        </div>
+        {!hasSel ? (
+          <div className="vsb-hint">{t("vocalEditor.sidebar.selectNoteHint")}</div>
+        ) : (
+          TRANSITION_FIELDS.map((f) => (
+            <Slider
+              key={f.key}
+              label={t(`vocalEditor.sidebar.tr_${f.key}`)}
+              value={eff[f.key]}
+              cfg={f}
+              overridden={anchor?.transition?.[f.key] !== undefined}
+              onReset={() => editTransition(f.key, undefined)}
+              resetTitle={t("vocalEditor.sidebar.resetInherit")}
+              onChange={(v) => editTransition(f.key, v)}
+            />
+          ))
+        )}
+      </div>
+
+      {/* ② selected-note vibrato */}
+      <div className="vsb-section">
+        <div className="vsb-head">
+          <span>{t("vocalEditor.sidebar.vibrato")}</span>
+          {hasSel && selected.length > 1 && <span className="vsb-count">×{selected.length}</span>}
+        </div>
+        {!hasSel ? (
+          <div className="vsb-hint">{t("vocalEditor.sidebar.selectNoteHint")}</div>
+        ) : !vib ? (
+          <button className="snap-toggle vsb-btn" onClick={() => setVibrato(DEFAULT_VIBRATO)}>
+            + {t("vocalEditor.sidebar.addVibrato")}
+          </button>
+        ) : (
+          <>
+            <button className="snap-toggle vsb-btn vsb-btn-danger" onClick={() => setVibrato(undefined)}>
+              {t("vocalEditor.sidebar.removeVibrato")}
+            </button>
+            {VIBRATO_FIELDS.map((f) => (
+              <Slider
+                key={f.key}
+                label={t(`vocalEditor.sidebar.vib_${f.key}`)}
+                value={vib[f.key]}
+                cfg={f}
+                onChange={(v) => editVibratoField(f.key, v)}
+              />
+            ))}
+          </>
+        )}
+      </div>
+
+      {/* S73b:「轨道默认过渡」区块已删(用户拍板)——常开自动音高后所有音符都持有显式 θ,
+          轨道默认没有 UI 消费面;数据层(VocalTrackParams.transition/DEFAULT_TRANSITION)保留
+          作为 eval 兜底与存量工程兼容。 */}
+      </>
+      )}
+      </div>
+      {/* pinned footer — the Render action is needed regardless of tab (bake without playing / re-bake). */}
+      <div className="vsb-foot">
+        <button
+          className="snap-toggle vsb-render"
+          disabled={rendering || !selectedVoice || notes.length === 0}
+          onClick={onRender}
+        >
+          {rendering ? t("vocalEditor.render.rendering") : t("vocalEditor.render.render")}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── one labeled fader row (VolumeFader = the gesture-bracketed fader; a drag = one undo step) ──
+function Slider({ label, tip, value, cfg, overridden, onReset, resetTitle, onChange }: {
+  label: string;
+  /** 说明性 tip——经 VolumeFader 的单一 title 源合成显示(外包 div 会被遮蔽,S73b 审查)。 */
+  tip?: string;
+  value: number;
+  cfg: { min: number; max: number; step: number; unit: string; bipolar: boolean };
+  overridden?: boolean;
+  onReset?: () => void;
+  resetTitle?: string;
+  onChange: (v: number) => void;
+}) {
+  const showReset = onReset !== undefined;
+  return (
+    <div className="vsb-row">
+      <div className="vsb-row-top">
+        <label className={`vsb-label${overridden ? " ovr" : ""}`} title={overridden ? resetTitle : tip}>{label}</label>
+        <span className="vsb-val">{fmt(value, cfg.step)}{cfg.unit}</span>
+      </div>
+      <div className="vsb-row-bot">
+        <VolumeFader
+          value={value}
+          min={cfg.min}
+          max={cfg.max}
+          step={cfg.step}
+          width={showReset ? 176 : 200}
+          fillFrom={cfg.bipolar ? "center" : "left"}
+          onChange={onChange}
+          onGestureStart={() => useHistoryStore.getState().beginTransaction()}
+          onGestureEnd={() => useHistoryStore.getState().commitTransaction()}
+          format={(v) => `${fmt(v, cfg.step)}${cfg.unit}`}
+          tip={tip}
+        />
+        {showReset && (
+          <button className="vsb-reset" disabled={!overridden} title={resetTitle} onClick={onReset}>↺</button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── a labeled checkbox row (a toggle = one setVocalParams = one undo step; no fader gesture) ──
+function ToggleRow({ label, checked, onChange }: { label: string; checked: boolean; onChange: (c: boolean) => void }) {
+  return (
+    <div className="vsb-inline">
+      <label className="vsb-label">{label}</label>
+      <input type="checkbox" className="vsb-check" checked={checked} onChange={(e) => onChange(e.target.checked)} />
+    </div>
+  );
+}
+
+// ── a labeled <select> row (diffusion sampler pick) ──
+function SelectRow({ label, value, options, onChange }: { label: string; value: string; options: readonly string[]; onChange: (v: string) => void }) {
+  return (
+    <div className="vsb-inline">
+      <label className="vsb-label">{label}</label>
+      <select className="sep-model-select vsb-inline-select" value={value} onChange={(e) => onChange(e.target.value)}>
+        {options.map((o) => <option key={o} value={o}>{o}</option>)}
+      </select>
+    </div>
+  );
+}

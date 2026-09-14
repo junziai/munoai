@@ -1,0 +1,34 @@
+# Training sidecar venv (training/.venv). Dev machine: python 3.10.
+# torch/torchaudio are installed separately with the CUDA index:
+#   python -m pip install torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+# (torchaudio: the vendored so-vits rmvpe f0 predictor resamples with
+#  torchaudio.transforms.Resample — same-version pair with torch is mandatory)
+#
+# ---- S42: the SHIPPED environment is no longer a venv ----
+# Distribution = embedded runtime packs (training/packs/): ONE unified dependency
+# set (this file + the converter runtime additions onnx/onnxconverter-common/
+# faiss-cpu) built per torch backend (cpu / nv-cu130 / xpu / amd — torch 2.11 axis).
+# Lockfiles in training/packs/locks/ are generated from the VALIDATED staging env;
+# regenerate ONLY after re-running the gates (converter A/B + envtest + Phase B
+# training gates). THIS dev venv stays on torch 2.5.1+cu121 until the Phase B axis
+# migration lands (weights_only / nvSTFT return_complex / torch.amp shim).
+numpy<2
+scipy
+librosa>=0.10
+soundfile
+scikit-learn
+tensorboard
+matplotlib
+tqdm
+onnxruntime
+pyyaml
+# ---- vocoder finetune backend (S40, vendored SingingVocoders) ----
+# lightning is PINNED (==): the vendored get_strategy walks lightning-private
+# accelerator_connector APIs that shift between 2.x minors, and gate1's loss-
+# trajectory parity was established on exactly this version — upgrading
+# lightning is a "re-run gate1" event (like torch/ORT axis bumps).
+lightning==2.6.5
+torchmetrics==1.9.0
+praat-parselmouth==0.4.7
+pyworld==0.3.5
+click==8.4.2

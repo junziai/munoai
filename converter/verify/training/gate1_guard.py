@@ -1,0 +1,982 @@
+# -*- coding: utf-8 -*-
+"""gate1 判据护栏 —— 让 gate1 那一层的【绿有意义、红能归因】。
+
+S139(§F7 笔 E)新建。它是 `gate0_guard` 的**同层兄弟**:那台机器 S135 已经为 gate0 造好,
+而 **gate1 这一层四个月里一条都没拿到** —— `gate0_guard.py:24-27` 的头注逐字写着这条罪状
+(「跑不起来与被测的东西不对共用同一个非零退出码」),而它只在 gate0 修了。
+八个 `gate0_*` 脚本全部 import `gate0_guard`,五个 `gate1_*_compare.py` **一个都没有**。
+
+⛔ 为什么另起一个模块而不是直接用 `gate0_guard`:
+   ① t0 的环境变量必须**分层**(见 `T0_ENV` 那一段);
+   ② gate1 的产物形状是 **TB event 文件 + 协议 JSONL**,不是 gate0 那种目录里一堆 .npy
+      ⇒ 「够数 / 新鲜 / 同源」这三问在这一层有不同的落点;
+   ③ 这一层有三条 gate0 没有的事故形状(多 events 文件、步集不等、None 分量被筛掉)。
+   ⛔ 但**共用的部分一律转调 `gate0_guard`,不许抄第二份**(_say / GateUnrunnable /
+      require_fresh / declare_frozen / note_uncovered / finish / run 全部转调)。
+
+────────────────────────────────────────────────────────────────────────────
+S139 实测、这个模块要挡住的六种事故(全部在真代码上复现过)
+────────────────────────────────────────────────────────────────────────────
+⑴ ⛔⛔⛔ **零新鲜度**。把一份 **2026-07-07** 的 `gate1_ours_steps.jsonl` 喂给八月的参照侧,
+   `gate1_compare.py` 打出 `GATE1: ALL PASS (30 steps compared)` —— 与 S134 那次的转录
+   **逐字符相同**。gate1 的全部价值是「我方侧**今天**跑出来的轨迹与原版一致」,而五条
+   compare 在结构上**分不出「跑了」和「根本没跑、读的是一个月前的文件」**。
+   ⚠ 更阴的一层:正因为移植是逐位确定的,陈货与新货的数字**完全一样** ——
+   同一件事既是「移植正确」的证明,也是「闸看不见自己有没有跑」的证明。
+⑵ ⛔⛔ **归因**。五条 compare 在缺产物时全部走**未捕获异常**(`EventAccumulator.Scalars`
+   对不存在的 tag 抛 KeyError;`open(jsonl)` 抛 FileNotFoundError),而 Python 未捕获异常的
+   退出码**正好也是 1** = 真红的码。⇒ S129 铁律第一条在这一层结构上成立。
+⑶ ⛔⛔ **空集/半集假 PASS**。`gate1_vocoder_compare` 两侧 logdir 存在但空 ⇒
+   `PASS tag sets identical (0 tags)` → `=== gate1_vocoder: PASS ===` 退 0
+   (⚠ 而且**不需要空**:两侧各写满 15 点、数值差 1000 倍,只要 tag 前缀不叫
+   `training/`/`validation/` 就同样退 0 —— 而两侧吃同一份 yaml,改名天生对称);
+   `gate1_diff_compare` 在「train/loss 两侧都空、validation 三点齐全」时打 `PASS` 退 0。
+⑷ ⛔⛔ **地板量的不是这条链的真值**。rvc/sovits/sovits_v2 的下限都是与真值无关的**常数 10**,
+   而真值是 **30/16/14** ⇒ 我方只跑出三分之一,照打 `ALL PASS (10 steps compared)` 退 0。
+   ⇒ 判据必须是**步集相等 + 等于登记的真值**,不是「交集 ≥ 某个数」。
+   ⚠ 而且「我方没跑完」是**闸没跑成**,不是被测的东西不对 ⇒ 退 3 不是退 1。
+⑸ ⛔⛔ **None 分量被筛掉**。`gate1_sovits_v2_compare.py:50` 用
+   `losses.get("g_total") is not None` 筛步 ⇒ **发散(非有限 ⇒ protocol 写 None)的那几步
+   整个不进 ours**,`aligned: 12` 打 [PASS] —— 而 **NaN 正是 gate1 存在的理由**。
+   ⇒ 筛步一律用「键在不在」,值为 None **立刻红并点名 step/分量**。
+⑹ ⛔ **多个 events 文件**。十个 gate1 跑器里只有一个自清输出目录,而唯一清 TB 目录的是
+   被硬禁的 `*_prepare.py` ⇒ 在禁令之下,「再跑一次原版侧」的唯一路径就是往同一个 logdir
+   **再加一个 events 文件**,而 `EventAccumulator` 按文件名序**拼接、不去重**,
+   compare 的 `{e.step: e.value}` 让**后写的赢** —— 打印的步数一点异常都没有。
+   实测:陈货在前/新货在后 ⇒ 全绿;新货在前/陈货在后 ⇒ 全红。**同一份数据,两种结论。**
+
+⛔ 边界(写清楚,别把这台机器当成它不是的东西):
+   * 它**不**回答数值对不对 —— 那是各条 compare 自己的阈值。
+   * 它**不**证明参照侧的上游代码没被改过(那是另一条线,见 `_ref_identity`)。
+   * `--skip-orig` 那一跑里,参照侧是**冻结**的 ⇒ 走 `declare_frozen` + `note_uncovered`,
+     结论是 PASS-WITH-GAPS 或 exit 3,**不许是干净的绿**。
+
+自检:`python gate1_guard.py --selftest`
+"""
+import math
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gate0_guard as G                                        # noqa: E402
+
+# —— 共用的一律转调,不抄第二份
+GateUnrunnable = G.GateUnrunnable
+EXIT_PASS, EXIT_RED = G.EXIT_PASS, G.EXIT_RED
+EXIT_UNRUNNABLE, EXIT_SELFTEST = G.EXIT_UNRUNNABLE, G.EXIT_SELFTEST
+_say = G._say
+declare_frozen = G.declare_frozen
+note_uncovered = G.note_uncovered
+finish = G.finish
+run = G.run
+dirhash = G.dirhash
+require_fresh = G.require_fresh          # S140:此前只在本模块内部用 `G.require_fresh`,
+collect = G.collect                      # 没有转调出去 ⇒ 新的消费者会去 import 第二份
+
+# ⛔ **另起 `GATE1_T0`,不复用 `GATE0_T0`**:同一个 shell 里先跑 gate0 会话(它把 t0 落盘
+#    并 export)再跑 gate1,复用同一个变量名会让 gate1 读到**几小时前**的 t0
+#    ⇒ 这期间产生的任何陈货都被判 FRESH。而这种失效**静默、且只会让判据变宽**。
+T0_ENV = "GATE1_T0"
+# 跑器把「这一跑故意跳过了哪几段」透传进来 ⇒ 被跳过那一侧的产物**本来就不是本轮的**,
+# 它该走 declare_frozen + note_uncovered,而不是被判成一条陈货红。
+SKIPPED_ENV = "GATE1_SKIPPED"
+
+
+def read_t0(gate_name):
+    return G.read_t0(gate_name, env=T0_ENV)
+
+
+def skipped_stages():
+    raw = os.environ.get(SKIPPED_ENV, "")
+    return [s for s in (x.strip() for x in raw.split(",")) if s]
+
+
+# ────────────────────────────────────────────────────────────────── 登记的真值
+#
+# ⛔ 地板必须是**这条链的真值**,不是一个与真值无关的常数(见头注 ⑷)。
+#    每一条都写出它是怎么来的 —— 「README 上写着」不算依据(S134:README 的数字不算依据,
+#    照旧文字核点数会把对的判成错的)。
+#    ⚠ 改夹具就必须改这里,而且要在 commit 里说为什么 —— 这正是它存在的意义。
+EXPECT = {
+    # gate1_run_ours.py:27 total_epoch=2 × loader_len=15(resume_state.json 实测)= 30
+    # `clamped` = **今天这份夹具上已知、已量、被接受的致盲面**(见 note_clamped 的头注):
+    #   原版侧 kl 在 step 0 与 2 顶满 9.0 ⇒ 那两步在数值上不可证伪;mel 从没到过 75。
+    # ⛔ 它是**登记值**不是容忍值:实测数与它不等 ⇒ 判 UNRUNNABLE(致盲面变了 = 新消息),
+    #   相等 ⇒ 每一跑打一行 [NOTE] 把它说出来。这条纪律与 declare_frozen 的 expect_sha 同形。
+    "rvc": dict(steps=30, components=5, clamped={"loss/g/kl": 2, "loss/g/mel": 0}),
+    # gate1_sovits_run_ours.py 的 total_epoch × loader_len;S134/S37-40 实测 16
+    "sovits": dict(steps=16, components=6),
+    # 同上;S134 与 S68批4 两次实测 14
+    "sovits_v2": dict(steps=14, components=9),
+    # gate1_diff_prepare.py:7-11 的 ceil(31/4)*3 = 8*3 = 24;validation 边界 8/16/24
+    "diff": dict(steps=24, val_boundaries=3),
+    # vocoder/pipeline.py:577 max_updates = 2*total_real,驱动 total_steps=15
+    # ⇒ training 每分量 15 点、validation 每分量 4 点 @global [0,10,20,30];共 11 个 tag
+    # ⛔ S140:`tally` = 我方侧 **reporter 通道**收到了多少条读数(与 TB 点数是两个数)。
+    #    此前这条链的 `_Rep` 三个方法全 `pass` ⇒ 这一面**零判据**。
+    #    `None` = **还没登记**:那一跑只报数并响亮说明自己没判(照 `declare_frozen`
+    #    在没给 expect_sha 时的做法)。⛔ 别拿一个推算出来的数去填它 —— 登记值必须是量出来的。
+    # `tally` 由 **S140 那一跑第一次量出来**(2026-08-12 19:28,五条链 all --rebuild-fixtures):
+    #   n_step=16(15 个 train batch + `pipeline.py:980` 那次 forced 收尾)·
+    #   ckpt 六次,序列 periodic/best/periodic/periodic/best/final ·
+    #   n_stage=0(xpu 与 resume 两条 stage 路径在 gate 条件下**结构上不可达**:
+    #             cfg 没有 `device_backend` 且 CUDA 被屏蔽 ⇒ 恒为 "cpu";start.source 是 fresh)·
+    #   summary_steps=15(= `real_final`,global 30 折半)。
+    # ⛔ 这些数**是量出来的不是推的** —— 推算值(交接给的「n_step≈16 / ckpt≥5」)不许写进登记。
+    "vocoder": dict(train_points=15, val_points=4, tags=11,
+                    tally={"n_step": 16, "n_stage": 0, "n_ckpt": 6,
+                           "ckpt_kinds": ["periodic", "best", "periodic", "periodic",
+                                          "best", "final"],
+                           "n_warn": 0, "n_error": 0, "summary_steps": 15}),
+}
+
+
+# ────────────────────────────────────────────────────────────────── TB 侧
+def _events_files(logdir):
+    if not os.path.isdir(logdir):
+        return None
+    return sorted(f for f in os.listdir(logdir) if "tfevents" in f)
+
+
+def tb_scalars(label, logdir, tags, t0, frozen_why=None):
+    """读一侧的 TB 标量,并在读之前把三件事判掉。
+
+    ⛔ 顺序是承重的:目录 → **events 文件恰好一个** → 新鲜度/冻结 → tag 齐全 → 取值。
+       任何一步不成立都是 `GateUnrunnable`(exit 3),**不是**判负。
+    """
+    files = _events_files(logdir)
+    if files is None:
+        raise GateUnrunnable("%s: logdir 不在:%s\n"
+                             "       ⇒ 参照物/产物缺席不是「被测的东西不对」。" % (label, logdir))
+    if not files:
+        raise GateUnrunnable(
+            "%s: logdir 在,但里面**一个 events 文件都没有**:%s\n"
+            "       ⛔ 这正是 S135 在 gate0 钉过的那条:删掉目录 = 正确地红,"
+            "清空目录 = 假 PASS,两种清法后果相反。" % (label, logdir))
+    if len(files) > 1:
+        raise GateUnrunnable(
+            "%s: logdir 里有 **%d 个** events 文件,应当只有 1 个:%s\n"
+            "       ⛔ EventAccumulator 按文件名序【拼接、不去重】,而 compare 用 {step: value}\n"
+            "         ⇒ **后写的赢**,而打印出来的步数一点异常都没有(实测:陈货在前全绿,\n"
+            "           新货在前全红 —— 同一份数据两种结论)。\n"
+            "       ⇒ 跑原版侧之前要先删掉旧的 events(⛔ 别用跑 prepare 来解决,它会 rmtree 掉\n"
+            "         不可再生的历史证据)。文件:%s"
+            % (label, len(files), logdir, files))
+
+    # ⛔ 过滤器用**那一个文件的确切名字**,不是 `suffixes=["tfevents"]`:
+    #    TB 的文件名是 `events.out.tfevents.<ts>.<host>.<pid>.<n>` —— **`tfevents` 在中间**,
+    #    而 `gate0_guard.collect` 的 suffixes 是 `endswith` ⇒ 那样写永远匹配 0 件,
+    #    于是新鲜度判据**每次都以「只有 0 件」的理由**抛 GateUnrunnable。
+    #    ⚠ S139 我自己就这么写过一版,而 `gate1_guard --selftest` 的「陈货」那一条**因此而绿**
+    #      —— 红对了,但它在回答另一个问题(S134 §5.1 的形状:「红了、组也对、断言也对,
+    #      但它在回答另一个问题」)。是 `gate1_negctl` 抓住的,不是我看出来的。
+    only = files[0]
+    if frozen_why:
+        declare_frozen(label, logdir, [""], minimum=1, why=frozen_why, suffixes=[only])
+    else:
+        G.require_fresh(label, logdir, [""], t0, minimum=1, suffixes=[only])
+
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+    # ⛔ size_guidance 必须钉死:默认值(scalars 上限 10000)会在放大 gate 时
+    #    **两侧各自随机抽样**丢点,而 tag 集合判据对这种丢失是瞎的。
+    #    五条里 `gate1_vocoder_compare.py:41` 是唯一没钉的那个。
+    acc = EventAccumulator(logdir, size_guidance={"scalars": 0})
+    acc.Reload()
+    have = set(acc.Tags()["scalars"])
+    want = set(tags)
+    missing = sorted(want - have)
+    if missing:
+        raise GateUnrunnable(
+            "%s: 少了 %d 个标量 tag:%s\n       在场的是:%s\n"
+            "       ⇒ 这一侧没写出该写的东西(配置改了 / 跑到一半死了),**不是**数值不一致。"
+            % (label, len(missing), missing, sorted(have)))
+    return {t: {e.step: e.value for e in acc.Scalars(t)} for t in tags}
+
+
+def tb_tag_set(logdir):
+    """这一侧 TB 里**全部**标量 tag 的集合(不是被登记名单过滤之后的那一份)。
+
+    ⛔ S140:S139 重写 `gate1_vocoder_compare` 时**把「两臂 tag 集合相等」那条判据删掉了,
+       而没有人记账**。老版判的是两侧集合相等;今天 `tb_scalars:169-174` 只算
+       `missing = want - have`,即**每一臂各自 ⊇ 登记名单**,两臂之间再也不比
+       ⇒ 「一侧多出一个标量」(= 我方多 log 了一个量 / 上游新增了一个)现在**零信号**。
+       净账:对「同源同改名」的覆盖上去了(那是 S139 买的),对「单侧新增」的覆盖下去了,
+       而**只有前半句被写进了文件头**。两条并存才是全的,这个函数补的是后半句。
+    """
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+    acc = EventAccumulator(logdir, size_guidance={"scalars": 0})
+    acc.Reload()
+    return set(acc.Tags()["scalars"])
+
+
+def tb_all_scalars(label, logdir, t0, prefixes, frozen_why=None):
+    """声码器那条用:tag 名不预先知道,按前缀取。⛔ 但**前缀本身要当判据**(见头注 ⑶)。"""
+    scal = tb_scalars(label, logdir, [], t0, frozen_why=frozen_why)  # 先过前四道
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+    acc = EventAccumulator(logdir, size_guidance={"scalars": 0})
+    acc.Reload()
+    out = {t: [(e.step, e.value) for e in acc.Scalars(t)]
+           for t in acc.Tags()["scalars"] if t.startswith(tuple(prefixes))}
+    del scal
+    return out
+
+
+# ────────────────────────────────────────────────────────────────── JSONL 侧
+def jsonl_steps(label, path, need_key, t0):
+    """读我方侧的协议 JSONL 步流。
+
+    ⛔ 两条与原来不同的地方,各自对着一条实测事故:
+      ① **新鲜度**:这个文件是 gate1 唯一的我方侧读数载体,而它可以是一个月前的
+         (跑器在 ours 段失败时**故意不落位**,于是上一轮的内容原地保留)。
+      ② **筛步一律用「键在不在」,不是「值非 None」** —— 后者会让发散的那几步
+         整个从判据里消失,而那正是这台闸要抓的东西。
+    """
+    import json
+    if not os.path.isfile(path):
+        raise GateUnrunnable("%s: 我方侧步流不在:%s\n"
+                             "       ⇒ 我方侧没跑起来 ≠ 我们的数学不对。" % (label, path))
+    G.require_fresh(label, os.path.dirname(path), [""], t0, minimum=1,
+                    suffixes=[os.path.basename(path)])
+    steps, nones = {}, []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            if obj.get("type") != "step":
+                continue
+            losses = obj.get("losses") or {}
+            if need_key not in losses:
+                continue
+            if losses.get(need_key) is None:
+                nones.append(obj.get("step"))
+            steps[obj["step"]] = losses
+    return steps, nones
+
+
+def require_no_none(label, steps, keys):
+    """任何被比较的分量出现 None ⇒ **立刻红并点名**。
+
+    ⛔ `protocol.py` 的 `_clean` 把非有限值(nan/inf)写成 None ⇒ None 就是**发散**。
+       原来三条链的做法各不相同,而最坏的那条(sovits_v2)把它整步筛掉、打 [PASS]。
+    """
+    bad = []
+    for s in sorted(steps):
+        for k in keys:
+            if k in steps[s] and steps[s][k] is None:
+                bad.append((s, k))
+    if bad:
+        head = ", ".join("step %s / %s" % (s, k) for s, k in bad[:8])
+        return ["%s: %d 个分量是 None(= 非有限值,protocol 的 _clean 写成 None)⇒ **发散**:%s"
+                % (label, len(bad), head)]
+    return []
+
+
+def compare_pairs(label, items, line, floor=1e-6, symmetric=False, min_cmp=1):
+    """逐对求相对差 —— 五条 compare 唯一的比较实现。
+
+    `items` = [(step, tag, a, b)],a = 参照侧,b = 我方侧。
+    返回 dict(worst, worst_tag, worst_step, mean, n_cmp, n_bad, failures)。
+
+    ⛔⛔ 立项理由(S140 实测,三条各对着一次真事故):
+    ⑴ **非有限值必须红并点名,绝不许消失进一个绿色的 max_rel。**
+       python 的 `max()` 与 `if rel > worst` 对 NaN 的**一切**比较都是 False ⇒
+       前者在 NaN 不落在首位时静默丢掉它,后者**连首位都丢**。实测:
+         · `gate1_sovits_v2_compare.py:89-96` 的滚动式 —— 九个分量在所有步全是 NaN 时,
+           打 `max_rel=0.000e+00 ( @ step -1)` 并 **PASS**;
+         · `gate1_diff_compare.py:90/:110` 的内置 `max(生成器)` —— NaN 在中间就 PASS,
+           在首位才 FAIL ⇒ **同一份数据,结论取决于步的顺序**。
+       而 **NaN 正是这台闸的立项理由**(头注 ⑸)。
+       ⚠ 这条 `gate1_vocoder_compare.py:111-112` 早在 **S40** 就修好并写下了原话
+         (「python max() 会静默丢掉 NaN 操作数」)—— 修在孪生脚本、**四个月零回移**。
+         与 `gate0_guard` 头注 ⑴ 记的 S68 那段(判 major、在孪生脚本修好、从没回移、开了
+         25 天)是**同一个形状的第三次**。这次收成一处,别再分叉。
+    ⑵ **判据一律写成否定式** `not (rel <= line)`:NaN 落在 failures 那一侧,
+       而不是靠 `rel > line` 恰好为 False 混过去。
+    ⑶ **打印的点数必须是真正比过的对数**,不是 `len(pa)`。实测:某个 tag 全非有限时,
+       `gate1_vocoder_compare.py:118` 会打 `[PASS] … 15 点, max_rel 0.000e+00`,
+       而 failures 里同时躺着 15 条 —— 码是对的,**那一行在说谎**(S134 §5.1 的镜像版)。
+
+    `symmetric=False` ⇒ 分母 `max(|a|, floor)`(以**参照侧**为基准,四条链的口径);
+    `symmetric=True`  ⇒ 分母 `max(|a|, |b|, floor)`(声码器那条的口径)。
+    """
+    failures = []
+    worst, worst_tag, worst_step = 0.0, None, None
+    total, n_cmp = 0.0, 0
+    for step, tag, a, b in items:
+        if not (isinstance(a, (int, float)) and isinstance(b, (int, float))
+                and math.isfinite(a) and math.isfinite(b)):
+            # ⛔ 点名两侧各是什么 —— 「哪一侧发散了」决定归因(参照物坏了 vs 被测的东西不对)
+            failures.append("%s %s@step %s **非有限**(orig=%r ours=%r)" % (label, tag, step, a, b))
+            continue
+        den = max(abs(a), abs(b), floor) if symmetric else max(abs(a), floor)
+        rel = abs(a - b) / den
+        n_cmp += 1
+        total += rel
+        if rel > worst:
+            worst, worst_tag, worst_step = rel, tag, step
+    # ⛔⛔ **地板写在循环体外** —— 本仓已连续三场买到「地板写在循环体内 ⇒ 零轮时没有地板」
+    #    (S136 / S137 / S139)。这里是第四次出现同一个位置的机会,提前堵上:
+    #    如果一条路上一个可比的对都没有(全被 clamp 吃掉 / 两侧都空),
+    #    那是**这一路本轮零覆盖**,不是「max_rel = 0.0 所以通过」。
+    # ⛔⛔ 但**顺序是承重的**:非有限值也会把 n_cmp 压到 0,而那时的真相是
+    #    「被测的东西发散了」(exit 1),不是「零覆盖」(exit 3)。先判 failures 再判地板 ——
+    #    反过来写就会用一条 exit 3 掩盖掉一条真红,而 NaN 正是这台闸的立项理由。
+    #    (S139 §6-2 记过同族:发现 None 之后没立刻收尾 ⇒ TypeError 被归成「闸炸了」。)
+    if (not failures) and n_cmp < min_cmp:
+        raise GateUnrunnable(
+            "%s: 真正比过的对数是 %d,下限 %d(送进来 %d 对)\n"
+            "       ⇒ 这一路本轮**零覆盖 / 覆盖不足**,不构成一次判定。\n"
+            "       ⚠ 别读成「max_rel=0 所以通过」—— 零轮的 max 恒等于初值。"
+            % (label, n_cmp, min_cmp, len(items)))
+    # ⛔ 否定式:NaN 永远进不到这里(上面已拦),但同一条纪律要写在判据本身上
+    if not (worst <= line):
+        failures.append("%s %s@step %s max_rel=%.3e > 线 %.0e" % (label, worst_tag, worst_step, worst, line))
+    return {"worst": worst, "worst_tag": worst_tag, "worst_step": worst_step,
+            "mean": (total / n_cmp) if n_cmp else 0.0,
+            "n_cmp": n_cmp, "n_bad": len(failures), "failures": failures}
+
+
+def check_tally(label, path, expect):
+    """我方侧 reporter 通道的记账对拍(声码器那条链专用,形状照 `check_clamped`)。
+
+    ⛔ 立项理由:`gate1_vocoder_run_ours._Rep` 的三个方法此前**全是 `pass`** ⇒
+       reporter 被调十几次、一条都没落地,而这条链的点数下限量的是 **TB writer**
+       写了几个点,不是**尺子收到几条** ⇒ 协议层整层不在被比较的面上。
+    ⛔ `expect is None` ⇒ **还没登记**:只报数 + 响亮说明这一处没判
+       (照 `gate0_guard.declare_frozen` 在没给 expect_sha 时的做法)。
+       此时仍然要判一条**最低限度**的:通道必须真的活着(n_step > 0),
+       否则「三个方法全 pass」这个原始状态会原样通过。
+    """
+    import json
+    if not os.path.isfile(path):
+        raise GateUnrunnable(
+            "%s: reporter 记账不在:%s\n"
+            "       ⇒ 我方侧没有把它收到的读数条数写下来(本轮没跑 ours?)——\n"
+            "         而这一面此前是零判据,别让它悄悄退回去。" % (label, path))
+    got = json.load(open(path, encoding="utf-8"))
+    if expect is None:
+        if not got.get("n_step"):
+            raise GateUnrunnable(
+                "%s: reporter 通道收到 **0** 条 step —— 桩把它们全吞了(这正是 S140 之前的状态)。"
+                "\n       实测记账:%s" % (label, got))
+        _say("[NOTE] %s: reporter 记账 = %s" % (label, json.dumps(got, ensure_ascii=False,
+                                                                 sort_keys=True)))
+        _say("       ⚠ 这一处**没有登记期望值** ⇒ 它只判了「通道是活的」,"
+             "**没判「收到的条数对不对」**。把上面这个 dict 填进 "
+             "`gate1_guard.EXPECT[...]['tally']` 之后它才有牙。")
+        return got
+    bad = {k: (expect[k], got.get(k)) for k in expect if got.get(k) != expect[k]}
+    if bad:
+        raise GateUnrunnable(
+            "%s: reporter 记账与登记值不同:%s\n"
+            "       ⇒ 我方侧上报的读数条数变了 —— 这不是「数值不一致」,是**这一跑到底报了什么**变了。\n"
+            "         核实之后去改 `gate1_guard.EXPECT[...]['tally']`,并在 commit 里说明为什么。"
+            % (label, {k: "登记 %r / 实测 %r" % v for k, v in bad.items()}))
+    _say("[COVERAGE] %s: reporter 记账与登记值逐项相等(%s)"
+         % (label, json.dumps(expect, ensure_ascii=False, sort_keys=True)))
+    return got
+
+
+def require_components(chain, n, what="PAIRS"):
+    """把 `EXPECT[chain]["components"]` 从一个**零读者的登记数**变成一条判据。
+
+    ⛔ S140 实测:`components`(rvc 5 / sovits 6 / sovits_v2 9)全仓**只有定义处、没有读出处**
+       ⇒ 「这一跑比了几个分量」这件事今天由 `PAIRS` 自己说了算 = 自证。
+       从 `gate1_compare.PAIRS` 里删掉 `loss/g/kl`,这一跑只比 4 个分量,
+       每行照打 `[PASS]`、`finish` 照打 `ALL PASS` 退 0,**转录上没有任何数字会变**。
+    ⭐ 正确形状本来就在同一层:`gate1_vocoder_compare.py:79-82` 的
+       「两份登记必须自洽」交叉判死。这里把它推广到另外三条。
+    """
+    want = EXPECT[chain].get("components")
+    if want is None:
+        raise GateUnrunnable("EXPECT[%s] 没有登记 components ⇒ 这条链说不出它该比几个分量" % chain)
+    if n != want:
+        raise GateUnrunnable(
+            "闸自己的两份登记对不上:%s 有 %d 条,而 EXPECT[%s][components]=%d\n"
+            "       ⇒ 有人加/删了一个被比较的分量,而没有同时改登记值。\n"
+            "         这不是「数值不一致」,是**这一跑到底比了什么**变了。" % (what, n, chain, want))
+    _say("[COVERAGE] %s: 比 %d 个分量,与登记值相等" % (chain, n))
+
+
+def require_same_step_set(label, mapping, steps, tag):
+    """每个 tag 的步集都要与主判据的步集相同。
+
+    ⛔ S140 实测:三条链**只有一个 tag** 的步集被 `require_exact_steps` 覆盖,
+       其余 4/5/8 个 tag 一个都没判 —— 少点时是 `KeyError` 兜底(被 `run()` 归成
+       「闸自己炸了」exit 3,**码对措辞错**),**多点时完全静默**。
+       ⚠ 别用 try/except KeyError 兜:那只会把「多点」那一半继续藏着。
+    """
+    got = set(mapping)
+    want = set(steps)
+    if got != want:
+        raise GateUnrunnable(
+            "%s / %s 的步集与主判据不同(各 %d/%d 步):只在它 %s;只在主判据 %s\n"
+            "       ⇒ 这一路与主 tag 对不齐 ⇒ 不构成一次对拍(⚠ 少点会被读成闸炸了,多点今天完全静默)。"
+            % (label, tag, len(got), len(want), sorted(got - want)[:8], sorted(want - got)[:8]))
+
+
+# ────────────────────────────────────────────────────────────────── 覆盖判据
+def require_exact_steps(label, chain, got_steps, expect_n, other=None, other_label=""):
+    """⛔ 步集**相等且等于登记的真值** —— 不是「交集 ≥ 10」。
+
+    三种今天都会静默通过的事故,这一条一次挡住:
+      ① 我方跑到一半死了(Ctrl-C / OOM / 早退)⇒ 交集缩到 12,照打 ALL PASS;
+      ② 参照侧跑到一半死了 ⇒ 同上,而上游「正常完训」是 os._exit(2333333),
+         rc 也说不出话;
+      ③ 两侧都少,但少的地方一样 ⇒ 交集判据完全看不见。
+    ⚠ 「跑到一半」是**闸没跑成**,不是被测的东西不对 ⇒ GateUnrunnable(exit 3)。
+    """
+    got = set(got_steps)
+    if len(got) != expect_n:
+        raise GateUnrunnable(
+            "%s: %d 步,登记的真值是 %d 步(链 %s)。\n"
+            "       ⇒ 有一侧没跑完 / 配置变了。这不是「数值不一致」,是这一轮**没有构成一次对拍**。\n"
+            "       ⚠ 如果是**夹具本身**变了,去改 gate1_guard.EXPECT 并在 commit 里说明为什么 ——\n"
+            "         那个数就是为这一刻存在的。实际步号:%s"
+            % (label, len(got), expect_n, chain, sorted(got)[:40]))
+    if other is not None:
+        o = set(other)
+        if got != o:
+            only_a, only_b = sorted(got - o)[:10], sorted(o - got)[:10]
+            raise GateUnrunnable(
+                "%s 与 %s 的**步集不同**(各 %d/%d 步):只在前者 %s;只在后者 %s\n"
+                "       ⇒ 两侧对齐不上,交集再大也不构成对拍。"
+                % (label, other_label, len(got), len(o), only_a, only_b))
+    _say("[COVERAGE] %s: %d 步,与登记的真值(%d)相等%s"
+         % (label, len(got), expect_n,
+            ",且与 %s 步集逐个相同" % other_label if other is not None else ""))
+    return sorted(got)
+
+
+def check_clamped(label, clamped, total, expect_n):
+    """夹取记账的**登记式**版本 —— 见 EXPECT["rvc"]["clamped"] 的注释。
+
+    ⛔ 为什么不能一律 `note_uncovered`(⇒ exit 3):这份夹具上 kl 恒有 2/30 步顶满,
+       那样的话 rvc 这条链**每一跑都要 --allow-uncovered**,而一个每次都要加的开关
+       三天之内就会变成肌肉记忆,等于没有。
+    ⇒ 正确形状是**登记 + 对拍**:数对得上 ⇒ 每跑打一行 `[NOTE]` 把致盲面说出来;
+       数变了 ⇒ 那是新消息,判 UNRUNNABLE 并要求人来更新登记值。
+    """
+    n = len(clamped)
+    if n != expect_n:
+        raise GateUnrunnable(
+            "%s: 被夹取致盲的步数是 %d,而登记值是 %d(总 %d 步)。\n"
+            "       ⇒ 致盲面变了 —— 要么夹具变了,要么被测代码在这一路的量级变了。\n"
+            "         这不是「数值不一致」,是**这一路能证伪多少**这件事本身变了。\n"
+            "       ⇒ 核实之后去改 gate1_guard.EXPECT[...]['clamped'],并在 commit 里说明。\n"
+            "         实际被夹的步号:%s" % (label, n, expect_n, total, sorted(clamped)[:10]))
+    if n:
+        _say("[NOTE] %s: %d/%d 步被夹取致盲(登记值 %d)—— 原版侧在这些 step 已顶到上限 ⇒ "
+             "判据退化成 min(ours,上限) vs 上限,我方值只要 ≥ 上限就恒等 ⇒ "
+             "**这几步在数值上不可证伪**。步号:%s" % (label, n, total, expect_n, sorted(clamped)))
+    if n >= total:
+        raise GateUnrunnable(
+            "%s: %d/%d 步**全部**被夹取致盲 ⇒ 这一路本轮零覆盖,不构成一次判定"
+            % (label, n, total))
+
+
+def note_clamped(label, clamped, total, limit_frac=0.5):
+    """夹取记账。⛔ RVC 那条对我方值施加与上游相同的 clamp(mel>75 / kl>9)——
+    凡是**原版侧已顶到上限**的 step,判据退化成 `min(ours, 9.0) vs 9.0`
+    ⇒ 只要我方值 ≥9,相对差**恒等于 0**,无论真值是 9.001 还是 1e9(实测:改成 1e9 仍 ALL PASS)。
+    而今天盘上的真夹具里 **kl 有 2/30 步顶满,含 step 0** —— 而 step 0 恰恰是
+    初始化/底模装载/第一次前向这类结构性移植错误表现得最赤裸的一步。
+    ⛔ 不许「去掉 clamp」:两个神谕(TB 与 stdout)存的都是**夹过的值**,去掉会变成一条必红的假判据。
+    ⇒ 唯一诚实的做法是**记账**:说出这一路实际比过几步。
+    """
+    if not clamped:
+        return
+    note_uncovered("%s 的 %d/%d 步被夹取致盲" % (label, len(clamped), total),
+                   "原版侧在这些 step 已顶到上限 ⇒ 判据退化成 min(ours,上限) vs 上限,"
+                   "我方值只要 ≥ 上限就恒等 ⇒ 这几步**在数值上不可证伪**。步号:%s"
+                   % (sorted(clamped)[:10],))
+    if len(clamped) > total * limit_frac:
+        raise GateUnrunnable(
+            "%s: %d/%d 步被夹取致盲,超过 %.0f%% ⇒ 这一路已经不构成一次判定"
+            % (label, len(clamped), total, limit_frac * 100))
+
+
+# ────────────────────────────────────────────────────────────── 输入身份
+#
+# ⛔⛔ 立项理由(S139 实测,不是推的):`gate1_prepare.py:22` 的 `SRC = rvc_ours` 是
+#    **gate0 的产物目录**,而它在 **2026-08-11 20:23** 被 S135 的 gate0 整棵重写过
+#    (263 个文件全部落在 20:23:44–20:23:53 的 9 秒里);而 S134 那次 gate1 是当天
+#    **09:04** 跑的 —— 拷进 `gate1_ours` 的 `2a_f0/2b-f0nsf/3_feature768` 至今还带着
+#    **07-05** 的 mtime。⇒ **S134 那次 gate1 PASS 背后的树今天不在盘上了,
+#    而没有任何东西记录或检查过这一点。**
+#    ⚠ 交接把这条写成「树不在了」;严格说**内容可能没变**(S135 逐件对拍报过
+#      rvc_ours 262/262 IDENTICAL)——但那次对拍属于 **17:57 那笔**,管不到 20:23 这一次。
+#      ⇒ 准确措辞是「**今天没有任何证据说 20:23 那次只改了 mtime**」。这正是要记身份的理由。
+#
+# ⛔ 载体**不许**复用 `dataset.fingerprint` 这个文件名:它是**跨语言契约** ——
+#    `tpool.rs:70 FINGERPRINT` 被三处池选择读、`mod.rs:756-773` 按 `|` 分词解析、
+#    而 `mod.rs:844-856` 把「这个文件在不在」当成**擦除同意判据**(preprocessing counts as work)
+#    ⇒ 往 gate 夹具里放一个同名文件,会让 Rust 扫描器把它读成一个有活的训练槽。
+# ⛔ 公式也**不许**用 `cache.dataset_fingerprint`:它是 blake2b(名+size+头尾 64KB),
+#    S139 实测**对中段改动是瞎的**(在 565376 字节的特征文件 offset 282688 翻一位 ⇒ 指纹不变),
+#    而且对 rvc_ours 直接抛 `DATASET_SHAPE_UNEXPECTED`。⇒ 走 `gate0_guard.dirhash`(全字节)。
+IDENTITY_FILE = "gate1_input.identity.json"
+
+
+def src_identity(label, root, subs, min_files, suffixes=None):
+    """在**任何破坏性动作之前**验证源树完整,并算出它的身份。
+
+    ⛔ 顺序是承重的(S139 实测):五个 `*_prepare.py` 里有四个是 **rmtree 在断言之前** ——
+       只缺一个子目录,就会留下「参照侧 1.39 GB 已经没了 + 只重建了一半」的残局,
+       而跑器报的是 PREPARE-FAILED(归因是对的,东西已经没了)。
+       ⇒ 这个函数就是那条要被前移的断言,顺带白拿一份身份。
+    """
+    import json                                        # noqa: F401  (给 write 用)
+    items = G.collect(root, subs, suffixes)
+    if len(items) < min_files:
+        raise GateUnrunnable(
+            "%s: 源树只有 %d 件(下限 %d),root=%s subs=%s\n"
+            "       ⛔ 这条断言**必须**跑在第一句 rmtree 之前 —— 否则失败留下的是"
+            "「参照侧已经删了、只重建了一半」的残局。" % (label, len(items), min_files, root, subs))
+    missing = [s for s in subs if s and not os.path.isdir(os.path.join(root, s))]
+    if missing:
+        raise GateUnrunnable("%s: 源树缺子目录 %s(root=%s)" % (label, missing, root))
+    # ⛔ 合计件数下限**挡不住整整一个子目录变空**(S135 的 M12 在 gate0 上量过同一件事:
+    #    sovits 那条写 MIN_SLICES*4=120 而目录里是 33×5=165 ⇒ 少一整类仍达标)。⇒ 逐个判。
+    empty_subs = [s for s in subs
+                  if len(G.collect(root, [s], suffixes)) == 0]
+    if empty_subs:
+        raise GateUnrunnable(
+            "%s: 源树的这些子目录**是空的**:%s(root=%s)\n"
+            "       ⇒ 合计件数够不代表每一类都在。\n"
+            "       ⚠ 若那个子目录其实是**目录套目录**(里面只有下一层),那不是「空」——\n"
+            "         `gate0_guard.collect` 是**非递归**的(:186-190 `if not isfile: continue`),\n"
+            "         而拷贝端 `shutil.copytree` 是递归的 ⇒ 两边口径不一致。\n"
+            "         正确修法是在**调用点**把那一层展开成 `父/子` 形式的 subs,\n"
+            "         ⛔ 不许改 `collect` 本身(它同时是 gate0 的 dirhash / require_fresh 的地基)。"
+            % (label, empty_subs, root))
+    # ⛔ S140:`suffixes=None` 时 `collect` **不过滤任何东西** ⇒ 一个下载了一半的 `.part`
+    #    会同时顶满件数下限、并静默进 dirhash(变成一条「身份变了但没人说得出为什么」的红)。
+    #    gate0 那一层有对应断言(`run_gate0_chain.py:156-182`),gate1 此前一条都没有。
+    junk = sorted(p for p, _m in items if p.endswith((".part", ".tmp", ".crdownload")))
+    if junk:
+        raise GateUnrunnable(
+            "%s: 源树里有 %d 个未完成/临时文件(.part/.tmp):%s\n"
+            "       ⇒ 它们会同时顶满件数下限并进入身份指纹 ⇒ 先清理再跑。"
+            % (label, len(junk), junk[:5]))
+    import time as _t
+    sha = dirhash(root, subs, suffixes)
+    total = sum(os.path.getsize(p) for p, _m in items)
+    newest = max(m for _p, m in items)
+    ident = {
+        "root": root, "subs": list(subs), "files": len(items), "bytes": total,
+        "dirhash_sha256": sha,
+        "src_newest_mtime": _t.strftime("%Y-%m-%dT%H:%M:%S", _t.localtime(newest)),
+        "recorded_at": _t.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    _say("[INPUT] %s: %d 件 / %.1f MB / sha %s / 源最新 mtime %s"
+         % (label, len(items), total / 1e6, sha[:16], ident["src_newest_mtime"]))
+    return ident
+
+
+def src_identity_files(label, paths, min_files):
+    """同上,但源是一份**显式文件清单**(sovits 那两条链的输入是 filelist 里的绝对路径)。
+
+    ⛔ 顺带就是那条「filelist 里的路径必须都在」的断言 —— 而它在 `gate1_sovits_prepare.py`
+       原来排在 `rmtree` **之后**(:53 vs :39)。
+    """
+    import hashlib
+    import time as _t
+    missing = [p for p in paths if not os.path.isfile(p)]
+    if missing:
+        raise GateUnrunnable(
+            "%s: filelist 里有 %d 条路径不在盘上,例如 %s\n"
+            "       ⛔ 这条断言**必须**跑在第一句 rmtree 之前。" % (label, len(missing), missing[:3]))
+    if len(paths) < min_files:
+        raise GateUnrunnable("%s: 只有 %d 条(下限 %d)" % (label, len(paths), min_files))
+    h = hashlib.sha256()
+    total = newest = 0
+    for p in sorted(paths):
+        h.update(os.path.basename(p).encode("utf-8"))
+        total += os.path.getsize(p)
+        newest = max(newest, os.path.getmtime(p))
+        with open(p, "rb") as f:
+            for c in iter(lambda: f.read(1 << 20), b""):
+                h.update(c)
+    ident = {
+        "root": "(filelist)", "subs": [], "files": len(paths), "bytes": total,
+        "dirhash_sha256": h.hexdigest(),
+        "src_newest_mtime": _t.strftime("%Y-%m-%dT%H:%M:%S", _t.localtime(newest)),
+        "recorded_at": _t.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    _say("[INPUT] %s: %d 件 / %.1f MB / sha %s / 源最新 mtime %s"
+         % (label, len(paths), total / 1e6, ident["dirhash_sha256"][:16],
+            ident["src_newest_mtime"]))
+    return ident
+
+
+def write_input_identity(exp_dir, ident):
+    """把身份落进这一侧的 expdir。⛔ 用 tmp + os.replace(照 `pool.py:281-287` 的理由:
+    半个文件比没有文件更坏)。"""
+    import json
+    os.makedirs(exp_dir, exist_ok=True)
+    p = os.path.join(exp_dir, IDENTITY_FILE)
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(ident, f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, p)
+
+
+def read_input_identity(exp_dir):
+    import json
+    p = os.path.join(exp_dir, IDENTITY_FILE)
+    if not os.path.isfile(p):
+        return None
+    try:
+        return json.load(open(p, encoding="utf-8"))
+    except Exception:                                  # noqa: BLE001
+        return None
+
+
+def say_input_identity(exp_dirs):
+    """把「这一轮的输入是哪一次 gate0 产的」打进读数头。
+
+    ⛔ 缺席时**响亮说明**,不许安静 —— 「没有记录」和「记录说一切正常」必须长得不一样。
+
+    ⛔⛔ **这条判据今天能回答的比它的名字小,写清楚别当成它不是的东西**(S140 实测):
+       五个 prepare 都是**算一次 `ident`、再在同一个 for 循环里写给两侧**
+       (`gate1_prepare.py:69`→`:75-82` 与另外四处同形)⇒ 下面那条
+       「两侧 sha 不同 ⇒ 红」在生产链上**结构上不可能成立**,只有 prepare 半途崩掉才可能。
+       ⇒ 它今天回答的是「**同一次 prepare 有没有完整跑完**」,
+         **不是**「今天这棵树还是不是 S134 吃的那棵」。后者要的是
+         `gate0_guard.declare_frozen(expect_sha=...)` 那个形状,而登记值只能由
+         第一次真跑写下来 —— 在那之前,**缺席必须记账,不许只打一行字**。
+    ⇒ S140 起:任何一侧缺席都走 `note_uncovered` ⇒ 默认落在 exit 3 / PASS-WITH-GAPS,
+       要干净的绿必须显式 `--allow-uncovered`。⛔「打印是汇报不是判据」
+       (`gate0_guard.py:269-273` 的原话)。
+    """
+    seen, absent = [], []
+    for label, d in exp_dirs:
+        ident = read_input_identity(d)
+        if ident is None:
+            absent.append(label)
+            _say("  [NO-INPUT-ID] %-10s 这一侧没有输入身份记录(它由 prepare 写;"
+                 "本轮或上一轮没跑 prepare)⇒ **说不出这份产物是哪一棵 gate0 树喂出来的**"
+                 % label)
+        else:
+            _say("  [INPUT-ID] %-10s sha %s / %d 件 / 源最新 mtime %s / 记于 %s"
+                 % (label, ident.get("dirhash_sha256", "?")[:16], ident.get("files", -1),
+                    ident.get("src_newest_mtime", "?"), ident.get("recorded_at", "?")))
+            seen.append((label, ident.get("dirhash_sha256")))
+    if absent:
+        # ⛔ 不是一行打印就算数:走记账 ⇒ finish 默认 exit 3(gate0_guard.py:332-341)
+        note_uncovered(
+            "输入身份缺席(%s)" % ", ".join(absent),
+            "这一轮说不出这些产物是哪一棵 gate0 树喂出来的 ⇒ 一条数值红分不清"
+            "「代码变了」还是「夹具变了」。⚠ 七月那批基线产出时这套机制还不存在(S139 才建),"
+            "所以历史侧的身份在物理上不可知。")
+    if len(seen) == 2 and seen[0][1] != seen[1][1]:
+        raise GateUnrunnable(
+            "两侧的输入身份**不同**:%s=%s vs %s=%s\n"
+            "       ⇒ 两侧吃的不是同一棵树 ⇒ 这一轮的对拍没有意义(而它会长得像数值不一致)。"
+            % (seen[0][0], seen[0][1][:16], seen[1][0], seen[1][1][:16]))
+
+
+def assert_cpu_only(where):
+    """⛔ **运行期**确认这一跑真的落在 CPU 上。
+
+    S134 的对抗核验者写下过这条的要害:「确定性前提悄悄消失,而**红伪装成数值不一致**」——
+    但那副药只喂给了**参照臂**:十个 gate1 跑器里,只有 `gate1_run_orig.py` 有运行期的
+    `torch.cuda.is_available()` 硬拒绝;另外九个(**包括全部五条 `*_run_ours.py`**)
+    只设了 `os.environ["CUDA_VISIBLE_DEVICES"] = "-1"` 就往下走。
+    ⇒ 药落在了唯一一个**不是被测对象**的臂上。这里补给被测臂。
+
+    ⛔ **只写 stderr**:`*_run_ours.py` 的 **stdout 是协议 JSONL 流的独占通道**
+       (`protocol.py` 头注;S138 实测往它里面多打一行会让父进程那侧解析崩掉)。
+    """
+    try:
+        import torch
+    except Exception as e:                              # noqa: BLE001
+        # ⛔ S140:原来这里是**静默 `return`** —— 一条 CPU 判据在「torch 导不进来」时
+        #    一个字都不说,而它的调用方会以为它判过了。判据可以放弃,但**不许安静地放弃**。
+        sys.stderr.write("[NO-COVERAGE] %s: torch 导不进来(%r)⇒ 这条 CPU 判据本轮**没有执行**\n"
+                         % (where, e))
+        sys.stderr.flush()
+        return
+    vis = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if torch.cuda.is_available():
+        sys.stderr.write(
+            "%s: 闸跑不起来 / 读数不可归因(exit %d)\n"
+            "  CUDA 仍然可见(CUDA_VISIBLE_DEVICES=%r,device_count=%d)——\n"
+            "  gate1 的两侧必须都在 fp32 CPU 上跑,否则逐 step 对拍的确定性前提不成立,\n"
+            "  而那种红会**伪装成数值不一致**。\n"
+            % (where, EXIT_UNRUNNABLE, vis, torch.cuda.device_count()))
+        sys.stderr.flush()
+        sys.exit(EXIT_UNRUNNABLE)
+    sys.stderr.write("[CPU-ONLY] %s: CUDA_VISIBLE_DEVICES=%r,torch.cuda.is_available()=False\n"
+                     % (where, vis))
+    sys.stderr.flush()
+
+
+def header(gate_name, chain, sides):
+    """读数头 —— ⛔ 绿必须自陈它这一轮到底量了什么(gate0_guard.finish 的同一条纪律)。"""
+    _say("=" * 72)
+    _say("%s(链 %s)· 解释器 %s" % (gate_name, chain, sys.executable))
+    _say("  torch 轴:%s" % _torch_version())
+    for k, v in sides:
+        _say("  %-10s %s" % (k, v))
+    sk = skipped_stages()
+    if sk:
+        _say("  ⚠ 这一跑跳过了:%s ⇒ 相关那一侧**不是本轮产物**,按冻结参照记账" % ", ".join(sk))
+    _say("=" * 72)
+
+
+def _torch_version():
+    """⚠ 四个 compare 的文件头与 README 都写着「双方同 torch(2.5.1)」,而跑器把其中四条
+    路由到 **2.11.0+cu130**(S134 §3 就记过,四个月没改)。这条链的全部价值建立在
+    「两侧同 torch」上,而**今天没有任何判据在看它** ⇒ 至少先把它打进转录。"""
+    try:
+        import torch
+        return torch.__version__
+    except Exception:                                # noqa: BLE001
+        return "(未安装 / 这条 compare 不吃 torch)"
+
+
+# --------------------------------------------------------------------------- 自检
+def _selftest():
+    import shutil
+    import tempfile
+    fails = []
+
+    def expect_unrunnable(name, fn, because=None):
+        """⛔ `because` 不是装饰:S139 实测,这个自检的「陈货」那一条曾经**因为另一个原因**
+        (过滤器写错 ⇒ 匹配到 0 件)而绿 —— 红了、类型也对,但它在回答另一个问题。
+        ⇒ 断言必须钉到**理由**上。"""
+        try:
+            fn()
+        except GateUnrunnable as e:
+            if because and because not in str(e):
+                fails.append("%s 红了,但**理由不对**:期望提到 %r,实际说的是:%s"
+                             % (name, because, str(e).splitlines()[0][:120]))
+                return
+            _say("  ok   %s -> GateUnrunnable%s" % (name, "(%s)" % because if because else ""))
+            return
+        except Exception as e:                       # noqa: BLE001
+            fails.append("%s 抛的是 %r,不是 GateUnrunnable" % (name, e))
+            return
+        fails.append("%s 应该抛 GateUnrunnable,却过了" % name)
+
+    def expect_ok(name, fn):
+        try:
+            fn()
+            _say("  ok   %s -> 正常通过" % name)
+        except Exception as e:                       # noqa: BLE001
+            fails.append("%s 不该抛,却抛了 %r" % (name, e))
+
+    import time
+    tmp = tempfile.mkdtemp(prefix="gate1_guard_selftest_")
+    old_t0 = os.environ.pop(T0_ENV, None)
+    try:
+        now = time.time()
+        # 1) t0 分层:GATE0_T0 不许被 gate1 读到
+        os.environ["GATE0_T0"] = "%.3f" % now
+        expect_unrunnable("read_t0(只有 GATE0_T0,没有 GATE1_T0)", lambda: read_t0("st"))
+        os.environ[T0_ENV] = "%.3f" % now
+        expect_ok("read_t0(有 GATE1_T0)", lambda: read_t0("st"))
+
+        # 2) events 文件数:0 / 2 / 目录不在 —— 三种都必须 UNRUNNABLE 且措辞不同
+        # ⚠ 文件名照真实形状造:`events.out.tfevents.<ts>.<host>.<pid>.<n>`
+        #   —— **`tfevents` 在中间**,这正是过滤器写错时会被掩盖掉的那一点。
+        d = os.path.join(tmp, "logs")
+        expect_unrunnable("tb_scalars(目录不在)", lambda: tb_scalars("st", d, ["a"], now),
+                          because="logdir 不在")
+        os.makedirs(d)
+        expect_unrunnable("tb_scalars(目录在但空)", lambda: tb_scalars("st", d, ["a"], now),
+                          because="一个 events 文件都没有")
+        f1 = "events.out.tfevents.1786400000.HOST.111.0"
+        f2 = "events.out.tfevents.1786400001.HOST.222.0"
+        for n in (f1, f2):
+            with open(os.path.join(d, n), "wb") as f:
+                f.write(b"x")
+            os.utime(os.path.join(d, n), (now + 5, now + 5))
+        expect_unrunnable("tb_scalars(两个 events 文件)",
+                          lambda: tb_scalars("st", d, ["a"], now), because="应当只有 1 个")
+        os.remove(os.path.join(d, f2))
+        # 只剩一个,但内容不是真 events ⇒ tag 缺失(仍然是 UNRUNNABLE 不是判负)
+        expect_unrunnable("tb_scalars(tag 缺失)", lambda: tb_scalars("st", d, ["a"], now),
+                          because="少了")
+        # 陈货 —— ⛔ 这一条必须以「不是本轮产物」为理由红,不许以「只有 0 件」为理由红
+        os.utime(os.path.join(d, f1), (now - 86400, now - 86400))
+        expect_unrunnable("tb_scalars(陈货)", lambda: tb_scalars("st", d, ["a"], now),
+                          because="不是本轮产物")
+
+        # 3) 步集
+        expect_ok("require_exact_steps(相等)",
+                  lambda: require_exact_steps("st", "rvc", range(30), 30,
+                                              other=range(30), other_label="orig"))
+        expect_unrunnable("require_exact_steps(只跑了 10 步,而真值 30)",
+                          lambda: require_exact_steps("st", "rvc", range(10), 30))
+        expect_unrunnable("require_exact_steps(两侧步集不同)",
+                          lambda: require_exact_steps("st", "rvc", range(30), 30,
+                                                      other=range(1, 31), other_label="orig"))
+
+        # 4) None 分量
+        if require_no_none("st", {1: {"g": 1.0}, 2: {"g": None}}, ["g"]):
+            _say("  ok   require_no_none(有 None) -> 点名")
+        else:
+            fails.append("require_no_none 没抓住 None")
+        if require_no_none("st", {1: {"g": 1.0}}, ["g"]):
+            fails.append("require_no_none 对干净数据误报")
+        else:
+            _say("  ok   require_no_none(干净) -> 不报")
+
+        # 5) 夹取记账
+        G._reset_uncovered()
+        note_clamped("st/kl", [0, 2], 30)
+        if len(G._uncovered) != 1:
+            fails.append("note_clamped 没记账")
+        G._reset_uncovered()
+        expect_unrunnable("note_clamped(夹取过半 ⇒ 不构成判定)",
+                          lambda: note_clamped("st/kl", list(range(20)), 30))
+        G._reset_uncovered()
+
+        # 6) jsonl:不在 / 陈货 / None 不许被筛掉
+        jp = os.path.join(tmp, "steps.jsonl")
+        expect_unrunnable("jsonl_steps(文件不在)",
+                          lambda: jsonl_steps("st", jp, "g_total", now))
+        with open(jp, "w", encoding="utf-8") as f:
+            f.write('{"type":"step","step":0,"losses":{"g_total":1.0}}\n')
+            f.write('{"type":"step","step":1,"losses":{"g_total":null}}\n')
+        os.utime(jp, (now + 5, now + 5))
+        got, nones = jsonl_steps("st", jp, "g_total", now)
+        if sorted(got) == [0, 1] and nones == [1]:
+            _say("  ok   jsonl_steps(None 那一步**留在集合里**并被点名)")
+        else:
+            fails.append("jsonl_steps 把 None 那步筛掉了:steps=%s nones=%s"
+                         % (sorted(got), nones))
+        os.utime(jp, (now - 86400, now - 86400))
+        expect_unrunnable("jsonl_steps(陈货)",
+                          lambda: jsonl_steps("st", jp, "g_total", now))
+
+        # 7) 输入身份:算 / 落盘 / 读回 / 两侧不同 / 缺席时响亮但不抛
+        src = os.path.join(tmp, "src")
+        for sub in ("a", "b"):
+            os.makedirs(os.path.join(src, sub), exist_ok=True)
+            for i in range(3):
+                with open(os.path.join(src, sub, "f%d.npy" % i), "wb") as f:
+                    f.write(b"payload-%d" % i)
+        ident = src_identity("st/输入", src, ["a", "b"], min_files=6)
+        expect_unrunnable("src_identity(件数不够)",
+                          lambda: src_identity("st/少", src, ["a", "b"], min_files=99),
+                          because="下限")
+        expect_unrunnable("src_identity(缺子目录)",
+                          lambda: src_identity("st/缺", src, ["a", "zzz"], min_files=1),
+                          because="缺子目录")
+        os.makedirs(os.path.join(src, "empty"), exist_ok=True)
+        expect_unrunnable("src_identity(某个子目录是空的)",
+                          lambda: src_identity("st/空子目录", src, ["a", "empty"], min_files=1),
+                          because="是空的")
+        d1, d2 = os.path.join(tmp, "exp1"), os.path.join(tmp, "exp2")
+        write_input_identity(d1, ident)
+        write_input_identity(d2, ident)
+        back = read_input_identity(d1)
+        if not back or back["dirhash_sha256"] != ident["dirhash_sha256"]:
+            fails.append("输入身份落盘/读回对不上")
+        else:
+            _say("  ok   输入身份(落盘 -> 读回)-> sha 一致")
+        expect_ok("say_input_identity(两侧相同)",
+                  lambda: say_input_identity([("orig", d1), ("ours", d2)]))
+        other = dict(ident, dirhash_sha256="deadbeef" * 8)
+        write_input_identity(d2, other)
+        expect_unrunnable("say_input_identity(两侧输入身份不同)",
+                          lambda: say_input_identity([("orig", d1), ("ours", d2)]),
+                          because="不同")
+        # ⛔ 缺席必须**响亮但不抛**:它是「今天没有记录」而不是「记录说出了问题」
+        expect_ok("say_input_identity(缺席 ⇒ 响亮说明,不抛)",
+                  lambda: say_input_identity([("orig", os.path.join(tmp, "nope"))]))
+
+        # 8) assert_cpu_only 的两条分支 —— ⛔ 必须在**子进程**里测:它是 sys.exit 的,
+        #    而「退出码真的传出去了」正是这条判据的全部内容。
+        import subprocess
+        here = os.path.dirname(os.path.abspath(__file__))
+        probe = (
+            "import sys, os\n"
+            "sys.path.insert(0, r'%s')\n"
+            "import gate1_guard as G\n"
+            "import torch\n"
+            "if %s:\n"
+            "    torch.cuda.is_available = lambda: True\n"
+            "    torch.cuda.device_count = lambda: 1\n"
+            "G.assert_cpu_only('selftest')\n"
+            "sys.stdout.write('WENT-THROUGH\\n')\n"
+        )
+        for name, force_gpu, want, needle in (
+                ("assert_cpu_only(CPU ⇒ 放行且只写 stderr)", "False", 0, "WENT-THROUGH"),
+                ("assert_cpu_only(CUDA 可见 ⇒ exit 3)", "True", EXIT_UNRUNNABLE, "伪装成数值不一致"),
+        ):
+            env = {**os.environ, "PYTHONIOENCODING": "utf-8", "CUDA_VISIBLE_DEVICES": "-1"}
+            p = subprocess.run([sys.executable, "-c", probe % (here, force_gpu)],
+                               capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", env=env, timeout=300)
+            body = (p.stdout or "") + (p.stderr or "")
+            if p.returncode == want and needle in body:
+                # ⛔ 顺带钉住「只写 stderr」:stdout 是协议 JSONL 的独占通道
+                if want == 0 and "[CPU-ONLY]" in (p.stdout or ""):
+                    fails.append("assert_cpu_only 把说明写进了 stdout —— 那是协议流的独占通道")
+                else:
+                    _say("  ok   %s -> exit %d" % (name, p.returncode))
+            else:
+                fails.append("%s:exit=%d(期望 %d),转录:%s"
+                             % (name, p.returncode, want, body.strip()[-200:]))
+    finally:
+        os.environ.pop("GATE0_T0", None)
+        if old_t0 is not None:
+            os.environ[T0_ENV] = old_t0
+        else:
+            os.environ.pop(T0_ENV, None)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ── check_tally 的五条(⛔ 其中「未登记」那两条在 `gate1_negctl` 里**结构上不可达**
+    #    —— EXPECT["vocoder"]["tally"] 一旦被填上,那条分支就再也走不到了。
+    #    ⇒ 它只能在这里被真触发,否则将来给第二条链接这套机制时它是一条空判据。)
+    import json as _json
+    tmp2 = tempfile.mkdtemp(prefix="gate1_guard_tally_")
+    try:
+        good = {"n_step": 16, "n_stage": 0, "n_ckpt": 6,
+                "ckpt_kinds": ["periodic", "best", "periodic", "periodic", "best", "final"],
+                "n_warn": 0, "n_error": 0, "summary_steps": 15}
+        p_missing = os.path.join(tmp2, "nope.json")
+        p_good = os.path.join(tmp2, "good.json")
+        p_dead = os.path.join(tmp2, "dead.json")
+        for p, body in ((p_good, good), (p_dead, dict(good, n_step=0))):
+            with open(p, "w", encoding="utf-8") as f:
+                _json.dump(body, f)
+        expect_unrunnable("check_tally(记账文件不在)",
+                          lambda: check_tally("st", p_missing, None),
+                          because="reporter 记账不在")
+        expect_unrunnable("check_tally(未登记 + 通道是死的 ⇒ 仍然要红)",
+                          lambda: check_tally("st", p_dead, None),
+                          because="桩把它们全吞了")
+        expect_ok("check_tally(未登记 + 通道活着 ⇒ 只报数并自陈没判)",
+                  lambda: check_tally("st", p_good, None))
+        expect_ok("check_tally(已登记 + 逐项相等)",
+                  lambda: check_tally("st", p_good, good))
+        expect_unrunnable("check_tally(已登记 + 少了一次 ckpt)",
+                          lambda: check_tally("st", p_good, dict(good, n_ckpt=5)),
+                          because="reporter 记账与登记值不同")
+    finally:
+        shutil.rmtree(tmp2, ignore_errors=True)
+
+    _say()
+    if fails:
+        for f in fails:
+            _say("  FAIL %s" % f)
+        _say("gate1_guard 自检: FAILED(%d)" % len(fails))
+        return EXIT_SELFTEST
+    _say("gate1_guard 自检: ALL OK")
+    return EXIT_PASS
+
+
+if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        sys.exit(_selftest())
+    _say(__doc__)
+    sys.exit(EXIT_PASS)

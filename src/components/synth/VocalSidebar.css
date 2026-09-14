@@ -1,0 +1,288 @@
+/* ② Vocal editor — property sidebar (S48 Phase 5, §9.6). Editor body's third flex child: fixed width, own
+   scroll. Square-cornered / reused theme tokens / custom scrollbar (house style). */
+
+.vocal-sidebar {
+  flex: 0 0 250px;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg-surface);
+  border-left: 1px solid var(--border-default);
+  user-select: none;
+}
+
+/* SynthV-style tab bar (pinned above the scroll body). Square-cornered, flat, accent on the active tab —
+   the app's established flat-tab idiom (cf. .rm-top-tabs), scoped to the sidebar. */
+.vsb-tabs {
+  flex: none;
+  display: flex;
+  gap: 2px;
+  padding: 6px 10px 0;
+}
+.vsb-tabs button {
+  flex: 1 1 0;
+  height: 26px;
+  padding: 0 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid var(--border-default);
+  border-radius: 0;
+  cursor: pointer;
+}
+.vsb-tabs button:hover:not(.active) {
+  color: var(--text-primary);
+  border-color: var(--text-muted);
+}
+.vsb-tabs button.active {
+  color: var(--accent-primary);
+  border-color: var(--accent-primary);
+  background: color-mix(in srgb, var(--accent-primary) 12%, transparent);
+}
+
+/* scrolling body (the only scroll region) — custom scrollbar (no default browser bar, house style) */
+.vsb-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 4px 10px 10px;
+}
+.vsb-body::-webkit-scrollbar { width: 10px; }
+.vsb-body::-webkit-scrollbar-track { background: transparent; }
+.vsb-body::-webkit-scrollbar-thumb { background: var(--border-default); border: 2px solid var(--bg-surface); }
+.vsb-body::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+/* pinned footer — the Render button stays visible on both tabs */
+.vsb-foot {
+  flex: none;
+  padding: 8px 10px 10px;
+  border-top: 1px solid var(--border-default);
+}
+
+.vsb-section {
+  padding: 8px 0 10px;
+  border-bottom: 1px solid var(--border-default);
+}
+.vsb-section:last-child { border-bottom: none; }
+
+.vsb-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-secondary, var(--text-primary));
+}
+.vsb-count {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--accent-primary);
+}
+
+.vsb-hint {
+  padding: 4px 0;
+  font-size: 11px;
+  font-style: italic;
+  color: var(--text-muted);
+}
+
+/* ② S58: the same muted hint, inline in a .vsb-inline row (per-note language with no selection). */
+.vsb-hint-inline {
+  font-size: 11px;
+  font-style: italic;
+  color: var(--text-muted);
+}
+
+.vsb-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 3px 0;
+}
+.vsb-row-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px;
+}
+.vsb-label {
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+/* A stated no-op: a toggle whose precondition is missing explains itself here instead of the
+   row silently disappearing (S81). Wraps — it carries a sentence, not a value. */
+.vsb-note {
+  margin: 2px 0 4px;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--text-muted);
+}
+/* an overridden per-note field is accented (vs inheriting the track default) */
+.vsb-label.ovr {
+  color: var(--accent-primary);
+  font-weight: 600;
+}
+.vsb-val {
+  font-size: 11px;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+.vsb-row-bot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* reset-to-inherit ↺ (only on per-note override rows; disabled when the field already inherits) */
+.vsb-reset {
+  flex: 0 0 18px;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid var(--border-default);
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+.vsb-reset:hover:not(:disabled) {
+  color: var(--accent-primary);
+  border-color: var(--accent-primary);
+}
+.vsb-reset:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+/* full-width action buttons (add / remove vibrato) reuse the .snap-toggle look */
+.vsb-btn {
+  width: 100%;
+  height: 24px;
+  margin: 2px 0 6px;
+  font-size: 11px;
+  border-radius: 0;
+}
+/* S73b 主动作变体(自动调教):accent 描边+微底色——灰底 vsb-btn 像禁用态(§user)。 */
+.vsb-btn-accent.snap-toggle {
+  color: var(--accent-primary);
+  border-color: var(--accent-primary);
+  background: color-mix(in srgb, var(--accent-primary) 10%, transparent);
+  font-weight: 600;
+}
+.vsb-btn-accent.snap-toggle:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent-primary) 20%, transparent);
+}
+.vsb-btn-accent.snap-toggle:disabled {
+  opacity: 0.4;
+  color: var(--text-muted);
+  border-color: var(--border-default);
+  background: transparent;
+}
+
+.vsb-btn-danger.snap-toggle {
+  color: var(--color-error);
+  border-color: color-mix(in srgb, var(--color-error) 45%, var(--border-default));
+}
+.vsb-btn-danger.snap-toggle:hover {
+  border-color: var(--color-error);
+  background: color-mix(in srgb, var(--color-error) 12%, transparent);
+}
+
+/* ⓪ voice/render section — a small model-type tag (SoVITS/RVC, auto-detected) + a prominent render button */
+.vsb-backend-tag {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  padding: 1px 5px;
+  border: 1px solid var(--accent-primary);
+  color: var(--accent-primary);
+}
+.vsb-section .sep-model-select {
+  width: 100%;
+  margin-bottom: 2px;
+}
+.vsb-render.snap-toggle {
+  width: 100%;
+  height: 28px;
+  font-size: 12px;
+  font-weight: 600;
+  border-radius: 0;
+  color: var(--accent-primary);
+  border-color: var(--accent-primary);
+  background: color-mix(in srgb, var(--accent-primary) 12%, transparent);
+}
+.vsb-render.snap-toggle:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent-primary) 22%, transparent);
+}
+.vsb-render.snap-toggle:disabled {
+  opacity: 0.4;
+  cursor: default;
+  color: var(--text-muted);
+  border-color: var(--border-default);
+  background: transparent;
+}
+
+/* Item-1 quality knobs: an inline label + control (checkbox toggle / sampler select) on one row. */
+.vsb-inline {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 0;
+}
+.vsb-check {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  flex: none;
+  accent-color: var(--accent-primary);
+  cursor: pointer;
+}
+/* higher specificity than `.vsb-section .sep-model-select { width: 100% }` so the inline vocoder select
+   stays a compact box (a long vocoder name is shown full in the dropdown, truncated in the closed box). */
+.vsb-section .vsb-inline-select {
+  width: auto;
+  min-width: 0;
+  max-width: 130px;
+  flex: 0 1 auto;
+  margin-bottom: 0;
+  text-overflow: ellipsis;
+}
+.vsb-text {
+  width: 96px;
+  flex: none;
+  padding: 3px 6px;
+  font-size: 11px;
+  color: var(--text-primary);
+  background: var(--bg-base);
+  border: 1px solid var(--border-default);
+  border-radius: 0;
+}
+.vsb-text:focus {
+  outline: none;
+  border-color: var(--accent-primary);
+}
+
+/* S146e — 音域边界编辑器(可用域 / 舒适区)在侧栏里的容器。RangeBoundsEditor 自身的四条
+   滑条复用 NodeShell.css 的 `sep-*` 类(与资源管理器里的那一份逐字相同,NO-dup),这里只
+   负责让它在窄侧栏里排得下:纵向堆叠、缩小行距,并给那行「这是模型级设置」的说明一个
+   低对比度的注脚样式。 */
+.vsb-range-bounds { display: block; }
+.vsb-range-bounds .rbe .sep-param-row { display: flex; align-items: center; gap: 4px; margin: 2px 0; }
+.vsb-range-bounds .rbe .sep-param-row > label { flex: 0 0 62px; font-size: 11px; }
+.vsb-range-bounds .rbe .sep-overlap { flex: 1 1 auto; min-width: 0; }
+.rbe-actions { display: flex; gap: 4px; margin-top: 4px; }
+.rbe-note { margin-top: 4px; font-size: 10px; line-height: 1.35; opacity: 0.62; }

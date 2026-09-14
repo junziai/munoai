@@ -1,0 +1,117 @@
+# runtime-amd lock — the unified dependency set (design §2.1) with the torch backend
+# segment swapped to AMD/TheRock ROCm. Frozen from the S44 staging venv
+# (envs/s44_staging_amd), validated on the dev machine's Radeon 780M (gfx1103, RDNA3):
+# import + torch.cuda.is_available()==True + full envtest --device cuda 20/20 PASS + a full
+# RVC training dogfood (converges, mel 36→23). TheRock's torch on whl-multi-arch is a THIN
+# HOST wheel; the ROCm runtime + device kernels ship as SEPARATE packages — all 9 pinned
+# EXPLICITLY (incl. the rocm-bootstrap DLL-loader shim + the tiny `rocm` sdist metapackage;
+# omitting either is untested). No system ROCm/HIP SDK required (confirmed on 780M).
+#
+# REPRODUCIBILITY (S44): TheRock has NO stable release channel on Windows — only a ROLLING
+# nightly index whose dated builds age off in ~weeks (unlike runtime-cpu/nv-cu130, which pin
+# the PERMANENT download.pytorch.org release channel and therefore rebuild forever). So the
+# 9 rocm wheels for THIS pinned nightly (rocm7.15.0a20260707) are MIRRORED to our own HF
+# dataset (wheels/amd/) and referenced below by DIRECT URL — `build_pack.py --variant amd`
+# now rebuilds from HF with NO nightly index, exactly as reproducible as cpu/nv. (The
+# distributed PACK was always self-contained; end users never touch any index — this only
+# restores OUR ability to rebuild/patch the pack.) All 9 share the identical date tag
+# (mixing dates = ABI-mismatched runtime). numpy stays 1.26.4 (cp310, same ABI as N axis).
+torch @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/torch-2.11.0%2Brocm7.15.0a20260707-cp310-cp310-win_amd64.whl
+torchaudio @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/torchaudio-2.11.0%2Brocm7.15.0a20260707-cp310-cp310-win_amd64.whl
+amd-torch-device-gfx1103 @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/amd_torch_device_gfx1103-2.11.0%2Brocm7.15.0a20260707-cp310-cp310-win_amd64.whl
+amd-torch-device-gfx110x @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/amd_torch_device_gfx110x-2.11.0%2Brocm7.15.0a20260707-cp310-cp310-win_amd64.whl
+# ── S167 (§F6, pack v2): RDNA3 dGPU device kernels, SAME nightly tag (zero ABI risk). The six
+# wheels below were still live on the FROZEN whl-multi-arch index (rocm.nightlies.amd.com) on
+# 2026-08-31 and were mirrored to our HF wheels/amd/ the same night — that index carries an
+# explicit retention warning, so the mirror is the only durable copy. gfx1100 = Navi31 (RX 7900
+# XTX/XT/GRE/7900M, PRO W7800/W7900), gfx1101 = Navi32 (RX 7800 XT/7700 XT, PRO W7700),
+# gfx1102 = Navi33 (RX 7600 family, PRO W7500/W7600). RDNA2 (gfx1030) and RDNA4 (gfx120x) are
+# deliberately NOT here: this tag has no Windows sanity backing for them (the Iris-Xe lesson —
+# never ship a kernel set no one has watched run); they wait for the ROCm 10.0.0-stable rebuild.
+amd-torch-device-gfx1100 @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/amd_torch_device_gfx1100-2.11.0%2Brocm7.15.0a20260707-cp310-cp310-win_amd64.whl
+amd-torch-device-gfx1101 @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/amd_torch_device_gfx1101-2.11.0%2Brocm7.15.0a20260707-cp310-cp310-win_amd64.whl
+amd-torch-device-gfx1102 @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/amd_torch_device_gfx1102-2.11.0%2Brocm7.15.0a20260707-cp310-cp310-win_amd64.whl
+rocm @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/rocm-7.15.0a20260707.tar.gz
+rocm-bootstrap @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/rocm_bootstrap-0.1.0-py3-none-any.whl
+rocm-sdk-core @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/rocm_sdk_core-7.15.0a20260707-py3-none-win_amd64.whl
+rocm-sdk-device-gfx1103 @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/rocm_sdk_device_gfx1103-7.15.0a20260707-py3-none-win_amd64.whl
+rocm-sdk-device-gfx1100 @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/rocm_sdk_device_gfx1100-7.15.0a20260707-py3-none-win_amd64.whl
+rocm-sdk-device-gfx1101 @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/rocm_sdk_device_gfx1101-7.15.0a20260707-py3-none-win_amd64.whl
+rocm-sdk-device-gfx1102 @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/rocm_sdk_device_gfx1102-7.15.0a20260707-py3-none-win_amd64.whl
+rocm-sdk-libraries @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/rocm_sdk_libraries-7.15.0a20260707-py3-none-win_amd64.whl
+absl-py==2.5.0
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.1
+aiosignal==1.4.0
+async-timeout==5.0.1
+attrs==26.1.0
+audioread==3.1.0
+certifi==2026.6.17
+cffi==2.1.0
+charset-normalizer==3.4.8
+click==8.4.2
+colorama==0.4.6
+coloredlogs==15.0.1
+contourpy==1.3.2
+cycler==0.12.1
+decorator==5.3.1
+faiss-cpu==1.14.3
+filelock==3.29.0
+flatbuffers==25.12.19
+fonttools==4.63.0
+frozenlist==1.8.0
+fsspec==2026.4.0
+grpcio==1.82.0
+humanfriendly==10.0
+idna==3.18
+Jinja2==3.1.6
+joblib==1.5.3
+kiwisolver==1.5.0
+lazy-loader==0.5
+librosa==0.11.0
+lightning==2.6.5
+lightning-utilities==0.15.3
+llvmlite==0.48.0
+Markdown==3.10.2
+MarkupSafe==3.0.3
+matplotlib==3.7.5
+ml_dtypes==0.5.4
+mpmath==1.3.0
+msgpack==1.2.1
+multidict==6.7.1
+networkx==3.4.2
+numba==0.66.0
+numpy==1.26.4
+onnx==1.21.0
+onnxconverter-common==1.16.0
+onnxruntime==1.23.2
+packaging==26.2
+pillow==12.3.0
+platformdirs==4.10.0
+pooch==1.9.0
+praat-parselmouth==0.4.7
+propcache==0.5.2
+protobuf==7.35.1
+pycparser==3.0
+pyparsing==3.3.2
+pyreadline3==3.5.6
+python-dateutil==2.9.0.post0
+pytorch-lightning==2.6.5
+pyworld==0.3.5
+PyYAML==6.0.3
+requests==2.34.2
+scikit-learn==1.7.2
+scipy==1.15.3
+six==1.17.0
+soundfile==0.14.0
+soxr==1.1.0
+sympy==1.14.0
+tensorboard==2.21.0
+tensorboard-data-server==0.7.2
+threadpoolctl==3.6.0
+torchmetrics==1.9.0
+tqdm==4.68.3
+typing_extensions==4.15.0
+urllib3==2.7.0
+Werkzeug==3.1.8
+yarl==1.24.2
