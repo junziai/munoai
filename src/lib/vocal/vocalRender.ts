@@ -172,8 +172,15 @@ export interface VocalRenderOptions {
   consonant_valley: number;
   /** S84 E 刀: vowel-clarity articulation oversampling (absent-in-params ≡ true). */
   vowel_clarity: boolean;
-  /** S89 「自动咬字时序」: onset consonants pre-roll ahead of the beat (absent-in-params ≡ true). */
+  /** S89 「自动音素时序」: onset consonants pre-roll ahead of the beat (absent-in-params ≡ true). */
   consonant_preroll: boolean;
+  /** Phase 7 ①: HF-excitation mix — a soft-saturated ≥8 kHz band mixed back in (breath/air).
+   *  Fraction 0-0.15 (the UI stores percent and divides here); 0 = bit-exact no-op. */
+  voice_realism_mix: number;
+  /** Phase 7 ②: allpass formant-jitter depth (slow-LFO timbre drift). Fraction 0-0.08; 0 = no-op. */
+  formant_jitter_depth: number;
+  /** Phase 7 ③: procedural inhale synthesized inside ≥520 ms SP-only gaps (absent-in-params ≡ true). */
+  breath_layer: boolean;
   /** S91 「音素约定」: which UTAU alias convention this track's ENGLISH lyrics use. Omitted/`null` =
    *  words through the dictionary (Rust's `#[serde(default)]` lands there, so an older caller — e.g.
    *  the range-scan literal in rangeTest.ts — is unaffected by construction). */
@@ -1166,6 +1173,9 @@ export function vocalRenderOptions(vp: VocalTrackParams): VocalRenderOptions {
     consonant_valley: vp.consonantValley ?? DEFAULT_CONSONANT_VALLEY,
     vowel_clarity: vp.vowelClarity !== false,
     consonant_preroll: vp.consonantPreroll !== false,
+    voice_realism_mix: (vp.voiceRealism ?? 0) / 100,
+    formant_jitter_depth: (vp.formantJitter ?? 0) / 100,
+    breath_layer: vp.breathLayer !== false,
     phoneme_set: vp.phonemeSet ?? null,
     es_dialect: vp.esDialect ?? null,
     sovits: { ...SOVITS_DEFAULTS, ...(vp.sovits ?? {}) },

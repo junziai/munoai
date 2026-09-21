@@ -58,7 +58,7 @@ let tempoScaleBase: { tempo: number; tracks: Track[]; playheadTick: number } | n
 // ─── ② Vocal-note editing (S48 Phase 3) — data-layer store actions (no editor UI yet) ─────────────
 
 /** Seed for a track's first vocal-param write (partial updates merge onto this). */
-export const DEFAULT_VOCAL_PARAMS: VocalTrackParams = { backend: "sovits", speakerId: 49, langId: 0, transpose: 0, formant: 0, transition: { ...DEFAULT_TRANSITION }, breathToken: DEFAULT_BREATH_TOKEN, restToken: DEFAULT_REST_TOKEN, autoTuneExpr: 2, autoTuneVib: 1, autoTuneTake: 0, consonantEmphasis: DEFAULT_CONSONANT_EMPHASIS_DB, consonantValley: DEFAULT_CONSONANT_VALLEY };
+export const DEFAULT_VOCAL_PARAMS: VocalTrackParams = { backend: "sovits", speakerId: 49, langId: 0, transpose: 0, formant: 0, transition: { ...DEFAULT_TRANSITION }, breathToken: DEFAULT_BREATH_TOKEN, restToken: DEFAULT_REST_TOKEN, autoTuneExpr: 2, autoTuneVib: 1, autoTuneTake: 0, consonantEmphasis: DEFAULT_CONSONANT_EMPHASIS_DB, consonantValley: DEFAULT_CONSONANT_VALLEY, voiceRealism: 0, formantJitter: 0 };
 
 // `normalizeNote` / `normalizeNotesArray` / `normalizeCurve` — the canonical write-hygiene funnel — now
 // live in `../lib/vocalNotes` (the SINGLE source shared by the store, the .usp loader, and the editor;
@@ -586,6 +586,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         }),
       };
     });
+    setTimeout(() => useAudioStore.getState().pruneUnusedAudioCache(), 0);
   },
 
   setTempo: (bpm) => {
@@ -1004,6 +1005,8 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         if (vp.vowelClarity === true) delete vp.vowelClarity;
         // S89 consonantPreroll 同款极性(默认=开):true 折为 ABSENCE。
         if (vp.consonantPreroll === true) delete vp.consonantPreroll;
+        // Phase 7 ③ 气息层(默认=开):true 折为 ABSENCE(vowelClarity/consonantPreroll 同款)。
+        if (vp.breathLayer !== false) delete vp.breathLayer;
         // S91 「音素约定」:默认 = 按单词查词典,存为 ABSENCE(与 rangeExtend 同款正极性折叠)。
         if (!vp.phonemeSet || (vp.phonemeSet as string) === "words") delete vp.phonemeSet;
         return { ...t, vocalParams: vp };

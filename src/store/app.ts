@@ -1,5 +1,25 @@
 import { create } from "zustand";
 import { loadSetting, saveSetting } from "../lib/settings";
+import type { SongTaskId } from "../lib/models/song-tasks";
+import type { SongSource } from "../lib/song/types";
+
+/** 规划 13.2：全局"待启动歌曲任务"——DAW 右键发起，歌曲制作弹窗挂载时消费（带参打开）。 */
+export interface PendingSongTask {
+  task: SongTaskId;
+  source: SongSource;
+  sourceLabel?: string;
+  /** repaint 选区（源音频秒区间） */
+  range?: [number, number];
+  /** lego/extract 单轨种 */
+  trackClass?: string;
+  /** complete/extract 多选轨种 */
+  trackClasses?: string[];
+  presetPrompt?: string;
+  presetLyrics?: string;
+  /** 回流目标：任务完成后结果可"发送回原轨道位置" */
+  returnTarget?: { kind: "track"; trackId: string; segmentId?: string; align: boolean };
+  tool?: "multiTrack" | "creative" | "cover" | "midi";
+}
 
 interface SegmentSelection {
   trackId: string;
@@ -101,6 +121,10 @@ interface AppState {
   soundfontManagerOpen: boolean;
   /** Song Studio (歌曲制作)主面板开关。 */
   songStudioOpen: boolean;
+  /** 规划 13.2：待启动歌曲任务（DAW 右键 → 歌曲弹窗带参打开），弹窗消费即清。 */
+  pendingSongTask: PendingSongTask | null;
+  setPendingSongTask: (p: PendingSongTask) => void;
+  clearPendingSongTask: () => void;
   logViewerOpen: boolean;
   settingsOpen: boolean;
   toggleSettings: () => void;
@@ -414,6 +438,9 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((s) => ({ soundfontManagerOpen: !s.soundfontManagerOpen })),
   toggleSongStudio: () =>
     set((s) => ({ songStudioOpen: !s.songStudioOpen })),
+  pendingSongTask: null,
+  setPendingSongTask: (p) => set({ pendingSongTask: p }),
+  clearPendingSongTask: () => set({ pendingSongTask: null }),
   toggleLogViewer: () =>
     set((s) => ({ logViewerOpen: !s.logViewerOpen })),
   toggleSettings: () =>

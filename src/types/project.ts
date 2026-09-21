@@ -13,6 +13,20 @@ export interface TrackSoundfont {
   fontId: string;
   presetId: string;
   presetName?: string;
+  /** 3-9 渲染引擎:absent = "builtin"(内置合成器);"fluidsynth" = CLI 对照组。 */
+  backend?: "builtin" | "fluidsynth";
+}
+
+/** 3-1 多音源分层:同一份 notes 喂 N 层,各层独立音源,输出按 gain/pan 混合。
+ *  absent = 单音源常规渲染(有 UI 编辑入口前的接线由工程文件手工提供)。 */
+export interface TrackSoundfontLayer {
+  fontId: string;
+  presetId: string;
+  presetName?: string;
+  /** 层增益(0..8,1 = 原声,后端钳位)。 */
+  gain: number;
+  /** 声像(-1 左 .. +1 右)。 */
+  pan: number;
 }
 
 export interface Track {
@@ -76,6 +90,9 @@ export interface Track {
   /** 乐器轨音源(soundfont)选择——仅 instrument 轨使用。缺省 = 未选(轨道头显示占位,
    *  播放/试听时提示先选音色)。可撤销(进 meaningfulSig),随 .usp 持久化。 */
   soundfont?: TrackSoundfont;
+  /** 3-1 分层音源:非空时乐器渲染走 N 层 gain/pan 混合(soundfont 降级为显示/试听主层)。
+   *  可撤销(进 meaningfulSig),随 .usp 持久化。 */
+  soundfontLayers?: TrackSoundfontLayer[];
   /** AMT 节点自动生成的 MIDI 音符轨道标记：记录产出它的 amtMidi 工作流节点 id。用于该节点
    *  再次运行时"替换式"去重（移除旧轨道再重新生成）。仅节点自动生成时为非空；普通手动/导入
    *  轨道不含此字段。仅作标记，不参与 meaningfulSig 内容比较。 */
@@ -409,6 +426,16 @@ export interface VocalTrackParams {
    *  ~11% of ⟨z/ce/ci⟩ keys are seseo-primary). Spanish notes only; a per-note phoneme override or
    *  [bracket hint] still wins untouched. Rust: `g2p::EsDialect`. */
   esDialect?: EsDialectId;
+  /** Phase 7 ①(人声真实化)「高频激励」: ≥8 kHz 软饱和带按比例混回(气声/空气感)。
+   *  UI/存储存**百分数**(0-15),vocalRender 映射时 /100 → Rust 的 0-0.15。
+   *  0/absent = 位精确 no-op(ce/cv 同款数值家族:具体存储,sig 只在非 0 时进入)。 */
+  voiceRealism?: number;
+  /** Phase 7 ②「共振峰微颤」: 慢速 LFO 驱动的全通级联深度 —— 音色随时间自然游移。
+   *  同款百分数存储(0-8)/100 → Rust 0-0.08;0/absent = no-op。 */
+  formantJitter?: number;
+  /** Phase 7 ③「气息层」: 在 ≥520 ms 的纯 SP 间隙中段合成一口程序化吸气(不贴前后句的
+   *  尾音/起音)。默认 = 开(vowelClarity/consonantPreroll 同款极性:absent≡true,只存 false)。 */
+  breathLayer?: boolean;
   /** S60-2 音域扩展: out-of-comfort parts render translated into the singer's tested comfort zone and are
    *  shifted back (TD-PSOLA inverse; needs a vocal_range record on the model — else a no-op).
    *
@@ -451,6 +478,10 @@ export interface WorkflowNode {
   nodeType: WorkflowNodeType;
   position: { x: number; y: number };
   params: Record<string, unknown>;
+  /** 规划 6-3 旁通（A/B 冻结）: true 时引擎跳过该节点, 输入原样透传到所有输出端口。 */
+  bypass?: boolean;
+  /** 用户注释（节点便签）: 纯文档用途, 引擎不读。随工程存盘 —— 关掉编辑器再回来注释还在。 */
+  annotation?: { content: string; color?: "yellow" | "blue" | "green" | "red" | "purple" };
 }
 
 export type WorkflowNodeType =
@@ -464,6 +495,26 @@ export type WorkflowNodeType =
   | "transpose"
   | "msstSeparation"
   | "split"
+  // Phase 1 母带合规: 多路混音 / 合规体检 / 响度归一 / 抖动量化
+  | "merge"
+  | "complianceCheck"
+  | "lufsNormalize"
+  | "dither"
+  // Phase 4 母带补全: 总线 EQ / 立体声宽度 / 饱和激励 / 相位旋转 / 直流去除
+  | "busEq"
+  | "stereoWidth"
+  | "saturate"
+  | "phaseRotate"
+  | "dcRemove"
+  // Phase 5 分析可视化: 零损伤分析 — 音频原样透传, 报告 JSON / PNG 走旁路端口
+  | "spectrogram"
+  | "f0Curve"
+  | "timbreMetrics"
+  | "harmonicityCheck"
+  | "spectralCompare"
+  | "dtwAlign"
+  | "abCompare"
+  | "lufsAnalyze"
   | "amtMidi"
   // 新增: 纯前端/AI 自动编曲节点 (不需要 Tauri 后端即可在浏览器预览里跑)
   | "speedShift"
@@ -474,10 +525,37 @@ export type WorkflowNodeType =
   // 注: 效果器节点 (EQ/Reverb/Compressor/Limiter) 已移除 — 轨道级效果链更实时直观
   | "midiFileIn"
   | "chordBlockIn"
-  // Song Studio: 外部推理服务驱动的歌曲生成节点 — 两种后端协议
-  // YuE2 (字节/MMAP) 与 ACE-Step (字节/ACE) 的字段差异较大, 拆成两个节点让 UI 精准渲染
+  | "harmonizer"
+  | "melodyGen"
+  // 符号域 → 声音域桥梁: MIDI/音符 JSON 经 SoundFont 离线渲染为 WAV
+  | "soundfontRender"
+  | "melodySimilarity"
+  // Song Studio: 旧版外部服务直连节点 — 已 deprecated, 旧工程在 LOAD 时迁移到 songGen
   | "songGenYue2"
-  | "songGenAceStep";
+  | "songGenAceStep"
+  // P2-14: 歌曲制作节点族 (统一走 runSongTask)
+  | "songLyrics"
+  | "songPrompt"
+  | "songGen"
+  | "songCover"
+  | "songRepaint"
+  | "songComplete"
+  | "songExtract"
+  | "songLego"
+  | "songStems"
+  | "songSheet"
+  // P2 符号域原创化节点族 (确定性 MIDI 变换 / 旋律重构 / 和声重配 / 曲式编辑 / 换气规划)
+  | "midiHumanize"
+  | "velocityCurve"
+  | "swingQuantize"
+  | "melodyReharm"
+  | "rhythmRestructure"
+  | "contourMorph"
+  | "motifDevelop"
+  | "reharmonize"
+  | "rhythmVariation"
+  | "structureEdit"
+  | "breathPlanner";
 
 export interface WorkflowConnection {
   fromNode: string;

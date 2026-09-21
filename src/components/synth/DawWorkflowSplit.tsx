@@ -4,6 +4,7 @@ import { WorkflowEditor } from "../workflow/WorkflowEditor";
 import { VocalEditor } from "./VocalEditor";
 import { TrackInspectorPanel } from "./TrackInspectorPanel";
 import { VirtualPiano } from "./VirtualPiano";
+import { ErrorBoundary } from "../common/ErrorBoundary";
 import { useAppStore } from "../../store/app";
 import { useProjectStore } from "../../store/project";
 import { saveSetting } from "../../lib/settings";
@@ -124,13 +125,19 @@ export function DawWorkflowSplit() {
           />
           {/* key={segmentId/amtResult.trackId}: switching targets REMOUNTS the editor so its view/undo/save scope resets. */}
           {isVocal ? (
-            <VocalEditor key={vocalSegmentId} segmentId={vocalSegmentId!} onClose={closeVocalEditor} style={{ height: effectiveHeight }} />
+            <ErrorBoundary key={`vocal-eb-${vocalSegmentId}`}>
+              <VocalEditor key={vocalSegmentId} segmentId={vocalSegmentId!} onClose={closeVocalEditor} style={{ height: effectiveHeight }} />
+            </ErrorBoundary>
           ) : isAmt && amtResult ? (
-            <Suspense fallback={null}>
-              <AmtResultPanel key={`amt-${amtResult.trackId}`} result={amtResult} onClose={closeAmtResult} style={{ height: effectiveHeight }} />
-            </Suspense>
+            <ErrorBoundary key={`amt-eb-${amtResult.trackId}`}>
+              <Suspense fallback={null}>
+                <AmtResultPanel key={`amt-${amtResult.trackId}`} result={amtResult} onClose={closeAmtResult} style={{ height: effectiveHeight }} />
+              </Suspense>
+            </ErrorBoundary>
           ) : (
-            <WorkflowEditor key={workflowSegmentId} segmentId={workflowSegmentId!} onClose={closeWorkflow} style={{ height: effectiveHeight }} />
+            <ErrorBoundary key={`workflow-eb-${workflowSegmentId}`}>
+              <WorkflowEditor key={workflowSegmentId} segmentId={workflowSegmentId!} onClose={closeWorkflow} style={{ height: effectiveHeight }} />
+            </ErrorBoundary>
           )}
         </>
       )}

@@ -1219,15 +1219,15 @@ pub fn run() {
             {
                 let build_main = |data_dir: Option<std::path::PathBuf>| {
                     let wb =
-                        tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::default())
-                            .title("MunoAI · 造乐之地")
-                            .inner_size(1400.0, 900.0)
-                            .min_inner_size(1024.0, 700.0)
-                            .resizable(true)
-                            .decorations(false)
-                            .transparent(true)
-                            .visible(false)
-                            .devtools(true);
+                    tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::default())
+                        .title("MunoAI · 造乐之地")
+                        .inner_size(1400.0, 900.0)
+                        .min_inner_size(1024.0, 700.0)
+                        .resizable(true)
+                        .decorations(false)
+                        .transparent(true)
+                        .visible(false)
+                        .devtools(true);
                     let wb = match data_dir {
                         Some(dir) => wb.data_directory(dir),
                         None => wb,
@@ -1333,6 +1333,22 @@ pub fn run() {
             commands::export_audio::export_audio_pcm_chunk,
             commands::export_audio::export_audio_encode,
             commands::export_audio::export_audio_discard,
+            commands::loudness::measure_loudness,
+            commands::loudness::normalize_to_lufs,
+            commands::compliance::compliance_check,
+            commands::compliance::mix_audio_files,
+            commands::compliance::apply_dither,
+            commands::mastering::apply_bus_eq,
+            commands::mastering::apply_stereo_width,
+            commands::mastering::apply_saturate,
+            commands::mastering::apply_phase_rotate,
+            commands::mastering::remove_dc,
+            commands::analysis::analyze_harmonicity,
+            commands::analysis::track_f0,
+            commands::analysis::analyze_spectrogram,
+            commands::analysis::analyze_timbre,
+            commands::analysis::compare_spectra,
+            commands::analysis::dtw_compare,
             commands::project::save_project_archive,
             commands::project::open_project_archive,
             commands::project::prune_usp_work,
@@ -1405,6 +1421,8 @@ pub fn run() {
             commands::storage::cleanup_logs,
             commands::storage::load_workflow_presets,
             commands::storage::save_workflow_preset,
+            commands::storage::export_workflow_presets,
+            commands::storage::import_workflow_presets,
             commands::midi_extract::extract_midi_from_audio,
             commands::midi_extract::cancel_midi_extract,
             commands::midi_extract::midi_extract_status,
@@ -1431,7 +1449,10 @@ pub fn run() {
             commands::song::save_song_history,
             commands::song::song_service_probe,
             commands::song::song_generate,
+            commands::song::song_cancel,
             commands::song::abc_to_midi,
+            commands::song::zip_files,
+            commands::song_service::auto_start_service,
             commands::logs::get_recent_logs,
             commands::logs::get_logs_since,
             commands::logs::log_message,
@@ -1451,6 +1472,12 @@ pub fn run() {
             commands::settings::set_cuda_mem_limit,
             commands::settings::get_diagnostic_mode,
             commands::settings::set_diagnostic_mode,
+            commands::settings::get_song_resident_mode,
+            commands::settings::set_song_resident_mode,
+            commands::settings::get_song_resident_idle_timeout,
+            commands::settings::set_song_resident_idle_timeout,
+            commands::song::song_resident_status,
+            commands::song::song_resident_shutdown,
             commands::settings::install_cuda_runtime_local,
             commands::settings::cuda_runtime_paths,
             commands::settings::delete_cuda_runtime,

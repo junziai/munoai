@@ -95,6 +95,42 @@ export const RECOMMENDED_SOUNDFONTS: RecommendedSoundfont[] = [
     license: "CC BY-NC-SA",
     matchKeywords: ["jrhodes"],
   },
+  {
+    purposeKey: "soundfont.recPurposes.orchestra",
+    name: "Sonatina Symphonic Orchestra 1.0",
+    format: "sfz",
+    size: "~440MB",
+    url: "https://musical-artifacts.com/artifacts/81",
+    license: "CC Sampling+ 1.0",
+    matchKeywords: ["sonatina", "sso"],
+  },
+  {
+    purposeKey: "soundfont.recPurposes.orchestra",
+    name: "Virtual Playing Orchestra",
+    format: "sfz",
+    size: "~600MB+",
+    url: "https://virtualplaying.com/virtual-playing-orchestra/",
+    license: "免费(CC 系列许可)",
+    matchKeywords: ["vpo", "virtualplaying", "virtual_playing"],
+  },
+  {
+    purposeKey: "soundfont.recPurposes.drums",
+    name: "SM Drums",
+    format: "sfz",
+    size: "~2.2GB+",
+    url: "https://smmdrums.wordpress.com/for-sfz-sforzando/",
+    license: "Public Domain",
+    matchKeywords: ["sm_drums", "smmdrums"],
+  },
+  {
+    purposeKey: "soundfont.recPurposes.guitar",
+    name: "Black and Green Guitars",
+    format: "sfz",
+    size: "~500MB",
+    url: "https://github.com/sfzinstruments/karoryfer.black-and-green-guitars",
+    license: "CC0",
+    matchKeywords: ["black_and_green", "black-and-green", "guitar"],
+  },
 ];
 
 /** 自动编曲的乐器轨种类(与 autoArrange 的 PartKind 对齐)。 */

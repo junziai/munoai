@@ -428,10 +428,16 @@ export function sanitizeVocalParams(p: VocalTrackParams | undefined): VocalTrack
     consonantEmphasis: clampNum(p.consonantEmphasis ?? NaN, 0, 12, DEFAULT_CONSONANT_EMPHASIS_DB),
     // S84 C 刀: consonant-valley scale knob (×per-class depth on chain-internal boundaries; 0 = off).
     consonantValley: clampNum(p.consonantValley ?? NaN, 0, 2, DEFAULT_CONSONANT_VALLEY),
+    // Phase 7 ① 高频激励(UI 存百分数 0-15 → Rust 吃 0-0.15,映射侧 /100;0 = off)。
+    voiceRealism: clampNum(p.voiceRealism ?? NaN, 0, 15, 0),
+    // Phase 7 ② 共振峰微颤(0-8 → 0-0.08;0 = off)。
+    formantJitter: clampNum(p.formantJitter ?? NaN, 0, 8, 0),
     // S84 E 刀: vowel clarity toggle — only false is stored (absent≡true, autoTuneFollow pattern).
     ...(p.vowelClarity === false ? { vowelClarity: false } : {}),
     // S89 「自动音素时序」 — same fold: only false is stored (absent≡true = the S83 onset pre-roll).
     ...(p.consonantPreroll === false ? { consonantPreroll: false } : {}),
+    // Phase 7 ③ 气息层 — same fold: only false is stored (absent≡true = ≥520 ms SP 间隙合成吸气)。
+    ...(p.breathLayer === false ? { breathLayer: false } : {}),
     // S91 「音素约定」 — an UNKNOWN value from a newer build must land on the DEFAULT (words), never
     // be carried through: an unrecognised convention would reach Rust, fall back there too, and the
     // project would silently round-trip a setting that does nothing. Whitelist, not passthrough.

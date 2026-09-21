@@ -1,7 +1,7 @@
-﻿/**
+/**
  * AutoArrangeNode — AI 自动编曲 (纯前端, 不需要 Tauri 后端).
  * 输入: 旋律 MIDI 轨 (或音频, 自动先 AMT 转谱 — 需要 Tauri).
- * 输出: 4 条伴奏轨 (Drums / Bass / Piano / Pad).
+ * 输出: 11 条伴奏轨 + 末端口和弦摘要 (顺序与引擎 tracks 表、NODE_PORTS 三处严格对齐).
  */
 import { type NodeProps } from "@xyflow/react";
 import { NodeShell } from "./NodeShell";
@@ -21,6 +21,11 @@ const MOODS = ["neutral", "happy", "sad", "energetic", "chill", "dark"];
 const MOOD_ZH: Record<string, string> = {
   neutral: "中性", happy: "开心", sad: "悲伤", energetic: "活力", chill: "放松", dark: "暗黑",
 };
+// 与引擎 autoArrange 的 tracks 表逐位对齐；末位是和弦摘要（chords 端口，内联 JSON）。
+const OUT_LABELS = [
+  "🥁 Drums", "🎸 Bass", "🎹 Piano", "🪕 GuitarArp", "🎶 Strum", "🎼 E.Piano",
+  "🎻 Strings", "🪟 Pad", "🎛 SynthPad", "💠 Pluck", "✨ Lead", "🎵 Chords",
+];
 
 export function AutoArrangeNode(props: NodeProps) {
   const [params, updateParams] = useNodeParams(props);
@@ -29,7 +34,7 @@ export function AutoArrangeNode(props: NodeProps) {
   const autoReplace = (params.autoReplace as boolean) ?? true;
 
   return (
-    <NodeShell nodeId={props.id} label="AI 自动编曲" icon="🥁" color="#ec4899" inputs={1} outputs={5}>
+    <NodeShell nodeId={props.id} label="AI 自动编曲" icon="🥁" color="#ec4899" inputs={1} outputLabels={OUT_LABELS}>
       <div className="sep-node-body">
         <div className="sep-params">
           <div className="sep-label-row">

@@ -444,7 +444,7 @@ pub fn cancel_amt_all(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     Ok(())
 }
 
-fn kill_pid(pid: u32) -> std::io::Result<()> {
+pub(crate) fn kill_pid(pid: u32) -> std::io::Result<()> {
     // Windows: taskkill /F /T terminates the process tree (the sidecar may spawn
     // its own Python worker children). Unix: SIGKILL the process group would be
     // ideal but a plain SIGKILL on the sidecar's own pid is enough.

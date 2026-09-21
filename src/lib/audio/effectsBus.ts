@@ -39,6 +39,8 @@ export const DEFAULT_FX_BUS: FxBusConfig = {
 
 interface FxChain {
   dry: GainNode;
+  /** 主输出音量 (仅实时 AudioContext 生效; 导出用的 OfflineAudioContext 恒为 1, 不影响导出电平) */
+  masterGain: GainNode;
   analyser: AnalyserNode;
   reverbInput: GainNode;
   delayInput: GainNode;
@@ -51,6 +53,8 @@ interface FxChain {
 
 type BaseCtx = BaseAudioContext;
 const chains = new WeakMap<BaseCtx, FxChain>();
+/** 每轨分析器 (仅实时 AudioContext) — trackId → AnalyserNode, 供控制台分轨电平表读取 */
+const trackAnalysers = new WeakMap<BaseCtx, Map<string, AnalyserNode>>();
 
 /** Deterministic stereo reverb impulse — a fixed-seed LCG (NOT Math.random) so the live and offline
  *  render hear the SAME room. 2.2s, slow exponential decay. */
@@ -95,10 +99,14 @@ function getFxChain(ctx: BaseCtx, cfg: FxBusConfig): FxChain {
 
   const dry = ctx.createGain();
   dry.gain.value = 1;
+  // 主输出音量: 实时上下文读取模块级 masterVolumeDb, 离线 (导出) 恒为 1 — 导出不受监听音量影响
+  const masterGain = ctx.createGain();
+  masterGain.gain.value = ctx instanceof AudioContext ? Math.pow(10, masterVolumeDb / 20) : 1;
   const analyser = ctx.createAnalyser();
   analyser.fftSize = 512;
   analyser.smoothingTimeConstant = 0.7;
-  dry.connect(analyser);
+  dry.connect(masterGain);
+  masterGain.connect(analyser);
   analyser.connect(ctx.destination);
 
   const reverb = ctx.createConvolver();
@@ -119,7 +127,7 @@ function getFxChain(ctx: BaseCtx, cfg: FxBusConfig): FxChain {
   delayNode.connect(delayReturn).connect(dry);
   delayNode.connect(delayFb).connect(delayInput);
 
-  const chain: FxChain = { dry, analyser, reverbInput, delayInput, delayNode, delayFb, delayReturn, reverbReturn, cfgKey: key };
+  const chain: FxChain = { dry, masterGain, analyser, reverbInput, delayInput, delayNode, delayFb, delayReturn, reverbReturn, cfgKey: key };
   chains.set(ctx, chain);
   return chain;
 }
@@ -140,9 +148,24 @@ export function connectTrackOutput(
   panner: StereoPannerNode,
   sends: TrackFxSend,
   cfg: FxBusConfig,
+  /** 传入 trackId 时 (仅 playback 传入), 该轨输出会并行接一只每轨分析器供分轨电平表读取 */
+  trackId?: string,
 ): void {
   const chain = getFxChain(ctx, cfg);
   panner.connect(chain.dry);
+  // 分轨电平表抽头: 一条轨的多个来源都并接到同一只分析器上 (求和), OfflineAudioContext 不接
+  if (trackId && ctx instanceof AudioContext) {
+    let map = trackAnalysers.get(ctx);
+    if (!map) { map = new Map(); trackAnalysers.set(ctx, map); }
+    let an = map.get(trackId);
+    if (!an) {
+      an = ctx.createAnalyser();
+      an.fftSize = 512;
+      an.smoothingTimeConstant = 0.5;
+      map.set(trackId, an);
+    }
+    panner.connect(an);
+  }
   const rv = clamp01(sends.reverb);
   if (rv > 0) {
     const g = ctx.createGain();
@@ -188,4 +211,27 @@ export function setFxBusConfig(c: Partial<FxBusConfig>): void {
 export function getAnalyserFor(ctx: BaseCtx): AnalyserNode | null {
   const chain = chains.get(ctx);
   return chain?.analyser ?? null;
+}
+
+/** 获取一条轨道的专用分析器 (分轨电平表用)。
+ *  仅在该轨以 trackId 播放过 (playback 调 connectTrackOutput 时传入) 后才存在。 */
+export function getTrackAnalyser(ctx: BaseCtx, trackId: string): AnalyserNode | null {
+  return trackAnalysers.get(ctx)?.get(trackId) ?? null;
+}
+
+// ── 主输出音量 (总输出推子)。模块级单例 + 实时上下文的 masterGain;导出恒为 1 不受影响。 ──
+let masterVolumeDb = 0;
+
+/** 当前主输出音量 (dB)。 */
+export function getMasterVolumeDb(): number {
+  return masterVolumeDb;
+}
+
+/** 设置主输出音量 (dB, 钳制 -60..+6)。只影响实时监听, 离线导出不受影响。 */
+export function setMasterVolume(ctx: BaseCtx, db: number): void {
+  masterVolumeDb = Math.max(-60, Math.min(6, db));
+  const chain = chains.get(ctx);
+  if (chain && ctx instanceof AudioContext) {
+    chain.masterGain.gain.setValueAtTime(Math.pow(10, masterVolumeDb / 20), ctx.currentTime);
+  }
 }

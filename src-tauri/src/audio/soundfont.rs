@@ -16,7 +16,7 @@ use serde::Serialize;
 
 use super::sf2;
 use super::sfz;
-use super::synth::{LoadedInstrument, MidiEvent, Region, SampleData, Synth};
+use super::synth::{LoadedInstrument, MidiEvent, pan_gains, Region, SampleData, Synth};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SoundfontPresetEntry {
@@ -185,7 +185,7 @@ pub fn import_soundfont(dir: &Path, src: &Path) -> Result<SoundfontEntry, String
     })
 }
 
-fn sanitize(name: &str) -> String {
+pub(crate) fn sanitize(name: &str) -> String {
     name.chars()
         .map(|c| match c {
             '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
@@ -410,27 +410,60 @@ pub struct RenderNote {
     pub vel: u8,
 }
 
-/// 离线渲染乐器 → WAV(16-bit 立体声),返回文件路径。
-pub fn render_to_wav(
-    dir: &Path,
-    font_id: &str,
-    preset_id: &str,
-    notes: &[RenderNote],
-    sample_rate: u32,
-    out_path: &Path,
-) -> Result<(), String> {
-    let instr = load_instrument(dir, font_id, preset_id)?;
-    let sr = if (44100..=192000).contains(&sample_rate) {
+/// 渲染请求里的控制器事件(CC1 颤音 / CC11 表情 / CC64 踏板)。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RenderCc {
+    /// 时刻(秒)。
+    pub start: f64,
+    /// 控制器号。
+    pub cc: u8,
+    /// 值 0..127。
+    pub value: u8,
+}
+
+/// 渲染请求里的弯音事件(value ∈ [-8192, 8191],0 = 居中)。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RenderBend {
+    /// 时刻(秒)。
+    pub start: f64,
+    pub value: i16,
+}
+
+/// 分层渲染的音源层(3-1):同一份 notes 喂 N 层,各层独立音源,输出按 gain/pan 混合。
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenderLayer {
+    pub font_id: String,
+    pub preset_id: String,
+    /// 层增益(0..8,1 = 原声,渲染时钳位)。
+    pub gain: f32,
+    /// 声像(-1 左 .. +1 右)。
+    pub pan: f32,
+}
+
+/// 采样率白名单(44.1k..192k),越界回退 44.1k。
+fn clamp_sr(sample_rate: u32) -> f32 {
+    if (44100..=192000).contains(&sample_rate) {
         sample_rate as f32
     } else {
         44100.0
-    };
-    let mut events: Vec<MidiEvent> = Vec::with_capacity(notes.len() * 2);
-    let mut has_off = false;
+    }
+}
+
+/// notes/cc/bend → 事件序列(非法项丢弃)。空音符返回 Err。
+fn build_events(
+    notes: &[RenderNote],
+    cc: &[RenderCc],
+    bend: &[RenderBend],
+    sr: f32,
+) -> Result<Vec<MidiEvent>, String> {
+    let mut events: Vec<MidiEvent> = Vec::with_capacity(notes.len() * 2 + cc.len() + bend.len());
+    let mut has_note = false;
     for n in notes {
         if n.key > 127 || n.start < 0.0 || n.dur <= 0.0 {
             continue;
         }
+        has_note = true;
         let on = (n.start * sr as f64).round() as u64;
         events.push(MidiEvent::NoteOn {
             frame: on,
@@ -441,20 +474,105 @@ pub fn render_to_wav(
             let off = ((n.start + n.dur) * sr as f64).round() as u64;
             if off > on {
                 events.push(MidiEvent::NoteOff { frame: off, key: n.key });
-                has_off = true;
             }
         }
     }
-    if events.is_empty() {
+    for c in cc {
+        if c.start < 0.0 || c.value > 127 {
+            continue;
+        }
+        events.push(MidiEvent::ControlChange {
+            frame: (c.start * sr as f64).round() as u64,
+            cc: c.cc,
+            value: c.value,
+        });
+    }
+    for b in bend {
+        if b.start < 0.0 {
+            continue;
+        }
+        events.push(MidiEvent::PitchBend {
+            frame: (b.start * sr as f64).round() as u64,
+            value: b.value.clamp(-8192, 8191),
+        });
+    }
+    if !has_note {
         return Err("没有可渲染的音符".into());
     }
-    let synth = Synth::new(&instr, sr);
+    Ok(events)
+}
+
+/// 渲染一份乐器 → 立体声 f32(不落盘)。单渲染与分层混合的公共核心。
+pub fn render_notes_stereo(
+    instr: &LoadedInstrument,
+    notes: &[RenderNote],
+    cc: &[RenderCc],
+    bend: &[RenderBend],
+    sr: f32,
+) -> Result<Vec<f32>, String> {
+    let mut events = build_events(notes, cc, bend, sr)?;
+    let synth = Synth::new(instr, sr);
     let stereo = synth.render_offline(&mut events, 0.5);
     if stereo.is_empty() {
         return Err("渲染结果为空".into());
     }
-    let _ = has_off;
+    Ok(stereo)
+}
+
+/// 离线渲染乐器 → WAV(16-bit 立体声),返回文件路径。
+pub fn render_to_wav(
+    dir: &Path,
+    font_id: &str,
+    preset_id: &str,
+    notes: &[RenderNote],
+    cc: &[RenderCc],
+    bend: &[RenderBend],
+    sample_rate: u32,
+    out_path: &Path,
+) -> Result<(), String> {
+    let instr = load_instrument(dir, font_id, preset_id)?;
+    let sr = clamp_sr(sample_rate);
+    let stereo = render_notes_stereo(&instr, notes, cc, bend, sr)?;
     write_wav16(out_path, &stereo, sr as u32).map_err(|e| format!("写 WAV 失败: {}", e))
+}
+
+/// 分层混合:stereo(L/R 交替)按 gain/pan 叠加进 mixed,不足处补零对齐。
+fn mix_into(mixed: &mut Vec<f32>, stereo: &[f32], gain: f32, pan: f32) {
+    let (lg, rg) = pan_gains(pan);
+    let g = gain.clamp(0.0, 8.0);
+    if mixed.len() < stereo.len() {
+        mixed.resize(stereo.len(), 0.0);
+    }
+    for (i, s) in stereo.iter().enumerate() {
+        let w = if i % 2 == 0 { lg * g } else { rg * g };
+        mixed[i] += s * w;
+    }
+}
+
+/// 分层渲染:同一份 notes 依次喂 N 个音源层,输出按各层 gain/pan 混合 → WAV。
+/// 任一层加载/渲染失败 → 整体报错(带层序号上下文)。
+pub fn render_layers_to_wav(
+    dir: &Path,
+    layers: &[RenderLayer],
+    notes: &[RenderNote],
+    cc: &[RenderCc],
+    bend: &[RenderBend],
+    sample_rate: u32,
+    out_path: &Path,
+) -> Result<(), String> {
+    if layers.is_empty() {
+        return Err("没有可渲染的音源层".into());
+    }
+    let sr = clamp_sr(sample_rate);
+    let mut mixed: Vec<f32> = Vec::new();
+    for (idx, layer) in layers.iter().enumerate() {
+        let instr = load_instrument(dir, &layer.font_id, &layer.preset_id).map_err(|e| {
+            format!("第 {} 层加载音源失败({}/{}): {}", idx + 1, layer.font_id, layer.preset_id, e)
+        })?;
+        let stereo = render_notes_stereo(&instr, notes, cc, bend, sr)?;
+        mix_into(&mut mixed, &stereo, layer.gain, layer.pan);
+    }
+    write_wav16(out_path, &mixed, sr as u32).map_err(|e| format!("写 WAV 失败: {}", e))
 }
 
 /// 写 16-bit 立体声 WAV。
@@ -490,5 +608,25 @@ mod tests {
     fn sanitize_blocks_traversal() {
         assert_eq!(sanitize("a/b\\c:d"), "a_b_c_d");
         assert!(!sanitize("../evil").contains('/'));
+    }
+
+    #[test]
+    fn mix_into_applies_gain_and_pan() {
+        // pan_gains(+1) = (0.25, 1.0):右声道满增益,左声道 -12 dB。
+        let mut m: Vec<f32> = Vec::new();
+        mix_into(&mut m, &[0.5, 0.5], 1.0, 1.0);
+        assert!((m[0] - 0.125).abs() < 1e-6 && (m[1] - 0.5).abs() < 1e-6);
+
+        // 两层叠加 = 线性混合;短层补零不改变总长。
+        let mut m: Vec<f32> = Vec::new();
+        mix_into(&mut m, &[0.5, 0.5, 0.2, 0.2], 1.0, 0.0);
+        mix_into(&mut m, &[0.1, 0.1], 1.0, 0.0);
+        assert_eq!(m.len(), 4);
+        assert!((m[0] - 0.6).abs() < 1e-6 && (m[2] - 0.2).abs() < 1e-6);
+
+        // gain 钳位到 0..8。
+        let mut m: Vec<f32> = Vec::new();
+        mix_into(&mut m, &[0.5, 0.5], 100.0, 0.0);
+        assert!((m[0] - 4.0).abs() < 1e-6);
     }
 }

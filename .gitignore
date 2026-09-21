@@ -107,3 +107,16 @@ build.log
 # local backup snapshot / temp index
 BACKUP_BEFORE_ORIGINAL_SWAP/
 stable_index.txt
+
+# Large model files inside src-tauri (56GB+ — must never be committed)
+src-tauri/models/
+
+# User recordings & temp outputs
+recordings/
+test_output/
+tmp_out_utai/
+test_out.wav
+
+# IDE / tool caches
+.cache/
+src-tauri/.cache/

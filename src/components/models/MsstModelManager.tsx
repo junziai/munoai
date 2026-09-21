@@ -30,6 +30,14 @@ import { backendErrorMessage, isBusyError, isCancelError } from "../../lib/backe
 import { maybeShowErrorModal } from "../../lib/errorDisplay";
 import { logToBackend } from "../../lib/log";
 import { VOICE_STRINGS } from "../workflow/nodes/VoiceModelPicker";
+import { downloadSongModel, listSongModels, deleteSongModel, type SongModelFile } from "../../lib/backendSong";
+import {
+  SONG_MODEL_CATALOG,
+  SONG_FAMILY_LABELS,
+  getSongInstallStatus,
+  songModelTotalSize,
+  type SongModelFamily,
+} from "../../lib/models/song-catalog";
 import {
   useVoiceModelStore,
   voiceVersionBadge,
@@ -1235,7 +1243,7 @@ function VoiceModelsTab({ lang }: { lang: string }) {
   // DIFFERENT singers = semantic drift + the crowding the user reported); the single selector
   // lives in the model meta line, replacing the static "N speakers" badge.
   const [voiceSpk, setVoiceSpk] = useState<Record<string, number>>({});
-  const [voiceType, setVoiceType] = useState<VoiceType>("rvc");
+  const [voiceType, setVoiceType] = useState<VoiceType | "song">("rvc");
   const [showImport, setShowImport] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
   // S146f: 音域边界编辑器展开时,四条滑条会占满整行 —— 试听按钮与它挤在同一行里视觉重叠
@@ -1245,11 +1253,22 @@ function VoiceModelsTab({ lang }: { lang: string }) {
   // range row / delete yield), same tab-level pattern as rangeEditing (S146f: 同排按钮要跟着让位).
   const [exportPick, setExportPick] = useState<string | null>(null);
   // Shared store — the SAME list the RVC/SoVITS workflow nodes read (one source of truth).
-  const models = useVoiceModelStore((s) => s.models[voiceType]);
+  const models = useVoiceModelStore((s) => s.models[voiceType === "song" ? "rvc" : voiceType]);
   const voiceError = useVoiceModelStore((s) => s.error);
   const { fetchModels, deleteModel, setAvatar, clearError } = useVoiceModelStore();
+  // Song models state
+  const [songModels, setSongModels] = useState<SongModelFile[]>([]);
+  const [songDownloading, setSongDownloading] = useState<{ id: string; downloaded: number; total: number; file: string } | null>(null);
+  const [songDeleteConfirm, setSongDeleteConfirm] = useState<string | null>(null);
   // built-in default vocoder facts — refetched on tab entry (cheap disk stat)
   const [defaultVoc, setDefaultVoc] = useState<DefaultVocoderInfo | null>(null);
+  
+  useEffect(() => {
+    if (voiceType === "song") {
+      void listSongModels().then(setSongModels);
+    }
+  }, [voiceType]);
+  
   useEffect(() => {
     if (voiceType !== "vocoder") return;
     void invoke<DefaultVocoderInfo>("get_default_vocoder_info")
@@ -1275,6 +1294,7 @@ function VoiceModelsTab({ lang }: { lang: string }) {
   const handleDelete = useCallback(async (name: string) => {
     // S60 audit: a running range test writes this model's sidecar at its tail (and an
     // audition writes a wav beside it — Rust also guards that one); block the delete.
+    if (voiceType === "song") return;
     const vm = useVoiceModelStore.getState();
     if (vm.rangeTesting[name] !== undefined || vm.auditionState?.name === name) {
       useAppStore.getState().showToast(
@@ -1331,31 +1351,220 @@ function VoiceModelsTab({ lang }: { lang: string }) {
         <button className={voiceType === "vocoder" ? "active" : ""} onClick={() => setVoiceType("vocoder")}>
           {t18({ zh: "声码器", en: "Vocoder", ja: "ボコーダー" }, lang)}
         </button>
+        <button className={voiceType === "song" ? "active" : ""} onClick={() => setVoiceType("song")}>
+          {t18({ zh: "生成歌曲", en: "Song Generation", ja: "楽曲生成" }, lang)}
+        </button>
         <div className="rm-filter-spacer" />
-        <button
-          className="rm-import-top-btn"
-          onClick={handleImportPackage}
-          title={t18({
-            zh: "从 .zip 模型包导入（本软件「导出」生成的包，含索引/聚类/扩散/头像）",
-            en: "Import from a .zip model package (produced by Export — includes index / cluster / diffusion / avatar)",
-            ja: "「書き出し」で作成した .zip モデルパッケージから取り込み（インデックス/クラスタ/拡散/アバターを含む）",
-          }, lang)}
-        >
-          {t18({ zh: "导入模型包", en: "Import Package", ja: "パッケージ取り込み" }, lang)}
-        </button>
-        <button className="primary rm-import-top-btn" onClick={() => setShowImport(true)}>
-          + {lang === "zh" ? "导入模型" : lang === "ja" ? "モデル取り込み" : "Import Model"}
-        </button>
+        {voiceType !== "song" && (
+          <>
+            <button
+              className="rm-import-top-btn"
+              onClick={handleImportPackage}
+              title={t18({
+                zh: "从 .zip 模型包导入（本软件「导出」生成的包，含索引/聚类/扩散/头像）",
+                en: "Import from a .zip model package (produced by Export — includes index / cluster / diffusion / avatar)",
+                ja: "「書き出し」で作成した .zip モデルパッケージから取り込み（インデックス/クラスタ/拡散/アバターを含む）",
+              }, lang)}
+            >
+              {t18({ zh: "导入模型包", en: "Import Package", ja: "パッケージ取り込み" }, lang)}
+            </button>
+            <button className="primary rm-import-top-btn" onClick={() => setShowImport(true)}>
+              + {lang === "zh" ? "导入模型" : lang === "ja" ? "モデル取り込み" : "Import Model"}
+            </button>
+          </>
+        )}
       </div>
-      {voiceType !== "vocoder" && <RangeBatchRow lang={lang} />}
+      {voiceType !== "vocoder" && voiceType !== "song" && <RangeBatchRow lang={lang} />}
 
       <div className="rm-voice-list">
-        {models.length === 0 && voiceType !== "vocoder" && (
+        {models.length === 0 && voiceType !== "vocoder" && voiceType !== "song" && (
           <p className="msst-empty">
             {lang === "zh"
               ? `暂无 ${voiceType.toUpperCase()} 模型`
               : `No ${voiceType.toUpperCase()} models`}
           </p>
+        )}
+        {voiceType === "song" && (
+          <>
+            <p className="rm-voice-hint">
+              {t18({
+                zh: "歌曲生成模型供「歌曲制作」功能使用。支持根据文本提示词和歌词生成完整歌曲，包括人声、伴奏、MIDI、歌词时间轴等。模型基于 Hugging Face 镜像下载，支持断点续传。",
+                en: "Song generation models power the Song Studio feature. Generate complete songs from text prompts and lyrics, including vocals, backing tracks, MIDI, and timestamped lyrics. Models are downloaded from Hugging Face mirror with resume support.",
+                ja: "楽曲生成モデルは「楽曲制作」機能で使用されます。テキストプロンプトと歌詞から完全な楽曲を生成し、ボーカル、伴奏、MIDI、タイムスタンプ付き歌詞を含みます。Hugging Face ミラーからダウンロード、レジューム対応。",
+              }, lang)}
+            </p>
+            {(Object.keys(SONG_FAMILY_LABELS) as SongModelFamily[]).map((family) => (
+              <div key={family}>
+                <div className="rm-voice-hint" style={{ marginTop: "12px", fontWeight: 600 }}>
+                  {t18(SONG_FAMILY_LABELS[family], lang)}
+                </div>
+                {SONG_MODEL_CATALOG.filter((m) => m.family === family).map((model) => {
+              const status = getSongInstallStatus(songModels, model);
+              const installed = status.installed;
+              const partial = !installed && status.ready > 0;
+              const isDownloading = songDownloading?.id === model.id;
+              const totalBytes = songModelTotalSize(model);
+              return (
+                <div key={model.id} className="rm-voice-item">
+                  <div className="rm-voice-item-info">
+                    <span className="rm-voice-item-name">{t18(model.label, lang)}</span>
+                    <span className="rm-voice-item-meta">
+                      <span className="msst-onnx-ok" title={t18({
+                        zh: `许可证：${model.license}`,
+                        en: `License: ${model.license}`,
+                        ja: `ライセンス：${model.license}`,
+                      }, lang)}>
+                        {model.license}
+                      </span>
+                      <span>{(totalBytes / (1024 * 1024 * 1024)).toFixed(2)} GB</span>
+                      <span title={t18({ zh: "显存需求", en: "VRAM", ja: "VRAM要件" }, lang)}>
+                        {t18({ zh: "显存", en: "VRAM", ja: "VRAM" }, lang)} ≈{model.vramGb}GB
+                      </span>
+                      <span>{model.languages}</span>
+                      {model.supportsMultiTrack && (
+                        <span className="msst-onnx-ok">{t18({ zh: "分轨", en: "Stems", ja: "分離トラック" }, lang)}</span>
+                      )}
+                      {model.supportsMidi && (
+                        <span className="msst-onnx-ok">MIDI</span>
+                      )}
+                      {installed && (
+                        <span className="msst-onnx-ok">
+                          {t18({ zh: "已安装", en: "Installed", ja: "インストール済み" }, lang)}
+                        </span>
+                      )}
+                      {partial && (
+                        <span title={t18({ zh: `缺少：${status.missing.join("、")}`, en: `Missing: ${status.missing.join(", ")}`, ja: `未取得：${status.missing.join("、")}` }, lang)}>
+                          {t18({ zh: "未完整", en: "Incomplete", ja: "未完了" }, lang)} {status.ready}/{status.required}
+                        </span>
+                      )}
+                    </span>
+                    <span className="rm-voice-item-meta" style={{ marginTop: "4px", fontSize: "12px", color: "var(--text-secondary)" }}>
+                      {t18(model.description, lang)}
+                    </span>
+                    <span className="rm-voice-item-meta" style={{ marginTop: "2px", fontSize: "11px" }}>
+                      <span style={{ color: "var(--text-tertiary)" }}>
+                        {t18({ zh: "来源：", en: "Source: ", ja: "ソース：" }, lang)}
+                      </span>
+                      {model.sourceRepo}
+                    </span>
+                    {isDownloading && songDownloading && (
+                      <div className="msst-progress-bar" style={{ marginTop: "8px" }}>
+                        <div
+                          className="msst-progress-fill"
+                          style={{
+                            width: songDownloading.total
+                              ? `${Math.min(100, (songDownloading.downloaded / songDownloading.total) * 100)}%`
+                              : "0%",
+                          }}
+                        />
+                        <span className="msst-progress-text">
+                          {songDownloading.total
+                            ? `${((songDownloading.downloaded / songDownloading.total) * 100).toFixed(1)}%`
+                            : t18({ zh: "准备中...", en: "Preparing...", ja: "準備中..." }, lang)}
+                          {songDownloading.file ? ` · ${songDownloading.file}` : ""}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                  <div className="rm-voice-item-actions">
+                    {!installed && !isDownloading && (
+                      <button
+                        className="primary"
+                        onClick={async () => {
+                          setSongDownloading({ id: model.id, downloaded: 0, total: totalBytes, file: "" });
+                          let completedBytes = 0;
+                          let currentFile = "";
+                          let unlisten: (() => void) | null = null;
+                          try {
+                            // 已就绪的文件（路径+大小都匹配）直接跳过 → 断点续下剩余文件
+                            const existing = await listSongModels();
+                            const done = new Set(
+                              existing.filter((f) => f.filename.startsWith(`${model.id}/`)).map((f) => `${f.filename}:${f.size}`),
+                            );
+                            unlisten = await listen<{ id: string; downloaded: number; total: number; stage: string }>(
+                              "song-download-progress",
+                              (event) => {
+                                if (event.payload.id !== model.id) return;
+                                setSongDownloading({
+                                  id: model.id,
+                                  downloaded: completedBytes + event.payload.downloaded,
+                                  total: totalBytes,
+                                  file: currentFile,
+                                });
+                              }
+                            );
+                            for (const f of model.files) {
+                              // 主路径或任一等价替代路径（如 xl-turbo/turbo 变体）已就绪则跳过。
+                              // 替代路径只按文件名匹配（变体权重体积不同，不能用 size 匹配）
+                              const donePaths = new Set(existing.filter((x) => x.filename.startsWith(`${model.id}/`)).map((x) => x.filename));
+                              const hasAlt = (f.alts ?? []).some((alt) => donePaths.has(`${model.id}/${alt}`));
+                              if (done.has(`${model.id}/${f.path}:${f.size}`) || hasAlt) {
+                                completedBytes += f.size;
+                                continue;
+                              }
+                              currentFile = f.path;
+                              setSongDownloading({ id: model.id, downloaded: completedBytes, total: totalBytes, file: f.path });
+                              await downloadSongModel(f.urls, model.id, f.path, f.sha256);
+                              completedBytes += f.size;
+                            }
+                            const updated = await listSongModels();
+                            setSongModels(updated);
+                            useAppStore.getState().showToast(
+                              t18({ zh: `已下载：${t18(model.label, lang)}`, en: `Downloaded: ${t18(model.label, lang)}`, ja: `ダウンロード完了：${t18(model.label, lang)}` }, lang),
+                              "success"
+                            );
+                          } catch (e) {
+                            useAppStore.getState().showToast(backendErrorMessage(e) ?? String(e), "error");
+                          } finally {
+                            unlisten?.();
+                            setSongDownloading(null);
+                          }
+                        }}
+                      >
+                        {partial
+                          ? t18({ zh: "继续下载", en: "Resume", ja: "続行" }, lang)
+                          : t18({ zh: "下载", en: "Download", ja: "ダウンロード" }, lang)}
+                      </button>
+                    )}
+                    {(installed || partial) && !isDownloading && songDeleteConfirm !== model.id && (
+                      <button onClick={() => setSongDeleteConfirm(model.id)}>
+                        {t18({ zh: "删除", en: "Delete", ja: "削除" }, lang)}
+                      </button>
+                    )}
+                    {songDeleteConfirm === model.id && (
+                      <>
+                        <button
+                          className="danger"
+                          onClick={async () => {
+                            try {
+                              // 传模型 id = 删除整个模型目录（含子目录文件）
+                              await deleteSongModel(model.id);
+                              setSongDeleteConfirm(null);
+                              const updated = await listSongModels();
+                              setSongModels(updated);
+                              useAppStore.getState().showToast(
+                                t18({ zh: `已删除：${t18(model.label, lang)}`, en: `Deleted: ${t18(model.label, lang)}`, ja: `削除完了：${t18(model.label, lang)}` }, lang),
+                                "success"
+                              );
+                            } catch (e) {
+                              useAppStore.getState().showToast(backendErrorMessage(e) ?? String(e), "error");
+                            }
+                          }}
+                        >
+                          {t18({ zh: "确认删除", en: "Confirm", ja: "確認" }, lang)}
+                        </button>
+                        <button onClick={() => setSongDeleteConfirm(null)}>
+                          {t18({ zh: "取消", en: "Cancel", ja: "キャンセル" }, lang)}
+                        </button>
+                      </>
+                    )}
+                  </div>
+                </div>
+              );
+                })}
+              </div>
+            ))}
+          </>
         )}
         {voiceType === "vocoder" && (
           // zero-knowledge banner: THE answer to "为什么我的声码器不能用于某个模型"
@@ -1546,7 +1755,7 @@ function VoiceModelsTab({ lang }: { lang: string }) {
               {rangeEditing !== m.name && (
                 <VoiceExportButton
                   m={m}
-                  voiceType={voiceType}
+                  voiceType={voiceType === "song" ? "rvc" : voiceType}
                   lang={lang}
                   picking={exportPick === m.name}
                   onPicking={(on) => { setExportPick(on ? m.name : null); if (on) setDeleteConfirm(null); }}
@@ -1565,7 +1774,7 @@ function VoiceModelsTab({ lang }: { lang: string }) {
         })}
       </div>
 
-      {showImport && (
+      {showImport && voiceType !== "song" && (
         <ImportDialog
           lang={lang}
           voiceType={voiceType}

@@ -211,6 +211,22 @@ export function parseLoadedBundle(projectJson: string, dir: string): LoadedProje
           }),
         };
       }
+      // P2-14 MIGRATION: 旧歌曲生成节点 songGenYue2/songGenAceStep → 统一的 songGen（模型写入
+      // params.model；旧 service_url 依赖废弃）。旧类型从未注册 UI（半成品），无真实用户数据，
+      // 这里兜底迁移保证旧工程打开不报错。与上方 S61 迁移共用同一加载咽喉点。
+      if (rest.workflow?.nodes.some((n) => ["songGenYue2", "songGenAceStep"].includes(n.nodeType as string))) {
+        rest.workflow = {
+          ...rest.workflow,
+          nodes: rest.workflow.nodes.map((n) => {
+            if (!["songGenYue2", "songGenAceStep"].includes(n.nodeType as string)) return n;
+            return {
+              ...n,
+              nodeType: "songGen" as const,
+              params: { ...n.params, model: n.nodeType === "songGenYue2" ? "yue2-3b" : "acestep-v1.5" },
+            };
+          }),
+        };
+      }
       let content = rest.content;
       if (content.type === "audioClip") {
         content = { ...content, sourcePath: resolve(content.sourcePath) };
@@ -445,10 +461,13 @@ export function parseLoadedBundle(projectJson: string, dir: string): LoadedProje
       const sfPresetId = sf && typeof sf === "object" ? sf.presetId : undefined;
       if (typeof sfFontId === "string" && sfFontId && typeof sfPresetId === "string" && sfPresetId) {
         const pn = sf && typeof sf === "object" ? sf.presetName : undefined;
+        // 3-9 渲染引擎:仅接受 "fluidsynth",其余值(含 absent)折叠回内置后端。
+        const bk = sf && typeof sf === "object" ? sf.backend : undefined;
         track.soundfont = {
           fontId: sfFontId,
           presetId: sfPresetId,
           ...(typeof pn === "string" && pn ? { presetName: pn } : {}),
+          ...(bk === "fluidsynth" ? { backend: "fluidsynth" as const } : {}),
         };
       } else {
         delete (track as { soundfont?: unknown }).soundfont;

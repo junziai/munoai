@@ -13,6 +13,7 @@ import { importAudioToNewTrack } from "../../lib/audio/import";
 import { flushAutosaveNow } from "../../lib/project/autosave";
 import {
   buildWorkflow,
+  templateNeedsAmt,
   templateNeedsSeparation,
   templateNeedsVoiceModel,
   type WizardTemplateId,
@@ -69,7 +70,76 @@ const TEMPLATE_CARDS: TemplateCard[] = [
       ja: "復刻＋伴奏移調＋並行採譜。声も調性も新しくオリジナルに。",
     },
   },
+  // 规划 12.2：原创化两条技术路线
+  {
+    id: "rebuild",
+    icon: "🏗️",
+    title: { zh: "原创重建（推荐发布）", en: "Original Rebuild", ja: "オリジナル再構築" },
+    desc: {
+      zh: "MIDI 重建路线：整曲转谱、人声换声——伴奏不留原波形，换音源重演奏，原创度最高。",
+      en: "MIDI rebuild: full transcription + new voice — no original waveform kept; highest originality.",
+      ja: "MIDI再構築：全曲採譜＋声交換。原波形を残さずオリジナル度最高。",
+    },
+  },
+  {
+    id: "repaint",
+    icon: "🖌️",
+    title: { zh: "快速重绘", en: "Quick Repaint", ja: "クイック再描画" },
+    desc: {
+      zh: "音频重绘路线：换声 + 移调 + 变速一步到位，快速出 Demo/灵感稿。",
+      en: "Audio repaint: new voice + transposed + retimed backing in one pass — fast demo drafts.",
+      ja: "音声再描画：声交換＋移調＋テンポ変更で即デモ化。",
+    },
+  },
+  // 规划 6-6:歌曲制作四模板(P2 歌曲节点族,不走 MSST 分离、不需要 AMT/声音模型)
+  {
+    id: "lyrics2song",
+    icon: "📝",
+    title: { zh: "词曲成歌", en: "Lyrics → Song", ja: "歌詞から作曲" },
+    desc: {
+      zh: "输入歌词和风格描述，一键生成整首歌（人声 + 伴奏），无需任何演唱录制。",
+      en: "Enter lyrics and a style prompt — generate a full song (vocals + backing) in one pass.",
+      ja: "歌詞とスタイルを入力し、フルソング（ボーカル+伴奏）を自動生成。",
+    },
+  },
+  {
+    id: "vocal2acc",
+    icon: "🎵",
+    title: { zh: "人声转伴奏", en: "Vocal → Accompaniment", ja: "ボーカルから伴奏" },
+    desc: {
+      zh: "上传清唱人声，自动补全伴奏与各声部，干声秒变完整编曲。",
+      en: "Feed in a dry vocal — auto-complete the backing and harmonies into a full arrangement.",
+      ja: "ボーカルのみの音源から伴奏・ハーモニーを自動補完。",
+    },
+  },
+  {
+    id: "stemsRebuild",
+    icon: "🎚️",
+    title: { zh: "分轨重建", en: "Stems Rebuild", ja: "分離トラック再構築" },
+    desc: {
+      zh: "把整首歌拆成人声/鼓/贝斯/其他四轨，各自落轨后自由重混、替换、再创作。",
+      en: "Split a song into vocals/drums/bass/other stems — remix, replace, and rework freely.",
+      ja: "楽曲をボーカル/ドラム/ベース/その他に分離し自由に再ミックス。",
+    },
+  },
+  {
+    id: "segRepaint",
+    icon: "🎨",
+    title: { zh: "片段重绘", en: "Segment Repaint", ja: "セグメント再描画" },
+    desc: {
+      zh: "框选歌曲片段 + 新风格提示词，只重绘这一段（改词、换曲风、修瑕疵）。",
+      en: "Pick a segment + a new style prompt — repaint just that part (new lyrics, genre, fixes).",
+      ja: "区間とスタイルを指定し、その部分だけ再生成（歌詞・曲風の差し替え）。",
+    },
+  },
 ];
+
+/** 原创化强度（rebuild/repaint）：变调半音 + 变速系数（规划 12.2 温和/标准/激进）。 */
+const INTENSITY_PRESETS = [
+  { id: "mild", label: { zh: "温和", en: "Mild", ja: "穏健" }, semitones: 1, speed: 1.0 },
+  { id: "standard", label: { zh: "标准", en: "Standard", ja: "標準" }, semitones: 2, speed: 1.03 },
+  { id: "aggressive", label: { zh: "激进", en: "Aggressive", ja: "強め" }, semitones: 3, speed: 1.06 },
+] as const;
 
 export function SuperOriginalWizard({ onClose }: { onClose: () => void }) {
   const { t, i18n } = useTranslation();
@@ -79,6 +149,7 @@ export function SuperOriginalWizard({ onClose }: { onClose: () => void }) {
   const [template, setTemplate] = useState<WizardTemplateId>("original");
   const [voiceName, setVoiceName] = useState("");
   const [semitones, setSemitones] = useState(2);
+  const [intensity, setIntensity] = useState<(typeof INTENSITY_PRESETS)[number]["id"]>("standard");
   const [busy, setBusy] = useState(false);
 
   const msstInstalled = useMsstModelStore((s) => s.installed);
@@ -138,7 +209,9 @@ export function SuperOriginalWizard({ onClose }: { onClose: () => void }) {
   const needsSep = templateNeedsSeparation(template);
 
   const missingPieces: string[] = [];
-  if (!amtBackend) missingPieces.push(t("wizard.missingAmt"));
+  // 规划 6-6:只有图里真含 amtMidi 的模板才检查转谱后端 —— 歌曲模板(词曲成歌/分轨重建等)
+  // 和纯换声模板(复刻/快速重绘)不再被 AMT 缺失误拦。
+  if (templateNeedsAmt(template) && !amtBackend) missingPieces.push(t("wizard.missingAmt"));
   if (needsSep && !sepModel) missingPieces.push(t("wizard.missingSep"));
   if (needsVoice && voiceModels.length === 0) missingPieces.push(t("wizard.missingVoice"));
 
@@ -164,11 +237,15 @@ export function SuperOriginalWizard({ onClose }: { onClose: () => void }) {
 
       // 2) 模板工作流写进新片段（系统级设置，静默入历史 —— 与导入的 loading→loaded 同规则）。
       const vm = voiceModels.find((m) => m.name === voiceName);
+      // rebuild/repaint 走强度预设（变调+变速）；其余模板沿用移调选项
+      const preset = INTENSITY_PRESETS.find((p) => p.id === intensity)!;
+      const usePreset = template === "rebuild" || template === "repaint";
       const wf = buildWorkflow(template, {
         vocalStemNames: sepModel?.stems,
         separationModelFile: sepModel?.filename,
         voiceModel: vm ? { name: vm.name, path: vm.path } : undefined,
-        transposeSemitones: semitones,
+        transposeSemitones: usePreset ? preset.semitones : semitones,
+        speedFactor: template === "repaint" ? preset.speed : undefined,
         amtBackend: amtBackend ?? "muscriptor",
       });
       useHistoryStore.getState().runSilent(() =>
@@ -264,6 +341,25 @@ export function SuperOriginalWizard({ onClose }: { onClose: () => void }) {
                 ))}
               </div>
               <div className="sow-opt-hint">{t("wizard.transposeHint")}</div>
+            </div>
+          )}
+          {/* 规划 12.2：rebuild/repaint 用"原创化强度"预设（变调 + 变速） */}
+          {(template === "rebuild" || template === "repaint") && (
+            <div className="sow-opt">
+              <label className="sow-opt-label">{t("wizard.intensity")}</label>
+              <div className="sow-semi-row">
+                {INTENSITY_PRESETS.map((p) => (
+                  <button
+                    type="button"
+                    key={p.id}
+                    className={`sow-semi${intensity === p.id ? " active" : ""}`}
+                    onClick={() => setIntensity(p.id)}
+                  >
+                    {t18(p.label, lang)}
+                  </button>
+                ))}
+              </div>
+              <div className="sow-opt-hint">{t("wizard.intensityHint")}</div>
             </div>
           )}
         </section>

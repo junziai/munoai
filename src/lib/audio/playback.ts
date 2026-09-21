@@ -385,7 +385,7 @@ export async function playAllTracks(
             const laneTail = source.connect(fadeInNode).connect(fadeOutNode);
             (envNode ? laneTail.connect(envNode) : laneTail).connect(laneGainNode).connect(trackGainNode).connect(panner);
             // S12: dry → destination (unchanged) + per-track FX sends into the aux buses.
-            connectTrackOutput(ctx, panner, { reverb: lt.reverbSend, delay: lt.delaySend }, getFxBusConfig());
+            connectTrackOutput(ctx, panner, { reverb: lt.reverbSend, delay: lt.delaySend }, getFxBusConfig(), track.id);
             source.onended = () => { if (gen !== playGeneration) return; endedCount++; if (schedulingDone && endedCount >= totalScheduled) onAllEnded(); };
             source.start(now + startDelay, audioOffset, playDuration);
             scheduledSources.push({
@@ -502,7 +502,7 @@ export async function playAllTracks(
       const origTail = source.connect(fadeInNode).connect(fadeOutNode);
       (envNode ? origTail.connect(envNode) : origTail).connect(trackGainNode).connect(panner);
       // S12: dry → destination (unchanged) + per-track FX sends into the aux buses.
-      connectTrackOutput(ctx, panner, { reverb: lt.reverbSend, delay: lt.delaySend }, getFxBusConfig());
+      connectTrackOutput(ctx, panner, { reverb: lt.reverbSend, delay: lt.delaySend }, getFxBusConfig(), track.id);
 
       source.onended = () => {
         // Ignore end events from a superseded generation — stopPlayback() (called when a new

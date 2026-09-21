@@ -10,17 +10,40 @@ import { t18 } from "../../../lib/models/msst-catalog";
 import { exportOneAudioFileToFolder, laneExportErrorMessage } from "../../../lib/audio/exportLaneAudio";
 import { useAmtStore } from "../../../store/amt";
 
-/** Build a collision-free MIDI destination path: <dir>/<base>.mid,
- *  <base>_2.mid, <base>_3.mid … mirroring the project's export naming. */
-async function uniqueMidiPath(dir: string, base: string): Promise<string> {
-  let candidate = `${dir}/${base}.mid`;
+/** Build a collision-free plain-file destination path: <dir>/<base>.<ext>,
+ *  <base>_2.<ext>, <base>_3.<ext> … mirroring the project's export naming. */
+async function uniqueFilePath(dir: string, base: string, ext: string): Promise<string> {
+  let candidate = `${dir}/${base}.${ext}`;
   let n = 2;
   // eslint-disable-next-line no-await-in-loop
   while (await exists(candidate).catch(() => false)) {
-    candidate = `${dir}/${base}_${n}.mid`;
+    candidate = `${dir}/${base}_${n}.${ext}`;
     n += 1;
   }
   return candidate;
+}
+
+/** Phase 5-1: spectrogram PNG artifact thumbnail — reads the cached PNG into a
+ *  blob URL (auto-revoked on unmount / path change). */
+function PngThumb({ path }: { path: string }) {
+  const [url, setUrl] = useState<string | null>(null);
+  useEffect(() => {
+    let alive = true;
+    let created: string | null = null;
+    readFile(path)
+      .then((bytes) => {
+        if (!alive) return;
+        created = URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: "image/png" }));
+        setUrl(created);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+      if (created) URL.revokeObjectURL(created);
+    };
+  }, [path]);
+  if (!url) return null;
+  return <img className="wf-preview-thumb" src={url} alt="" />;
 }
 
 /** S66 — per-node output audition (the v1-style listen-before-deposit, §user). One compact
@@ -144,11 +167,12 @@ export function NodeOutputPreview({
     const out = await open({ directory: true });
     if (!out || typeof out !== "string") return;
     try {
-      if (path.toLowerCase().endsWith(".mid")) {
-        // MIDI outputs are plain files — copy verbatim with the existing
-        // _2/_3 collision-free naming convention.
+      if (/\.(mid|png|json)$/i.test(path)) {
+        // Plain-file outputs (MIDI / PNG artifact / JSON dump) are copied
+        // verbatim with the existing _2/_3 collision-free naming convention.
+        const ext = path.slice(path.lastIndexOf(".") + 1).toLowerCase();
         const baseName = label ? `${nodeId}_${label}` : nodeId;
-        const dest = await uniqueMidiPath(out, baseName);
+        const dest = await uniqueFilePath(out, baseName, ext);
         await copyFile(path, dest);
       } else {
         await exportOneAudioFileToFolder(
@@ -173,8 +197,72 @@ export function NodeOutputPreview({
       {outputs.map((path, i) => {
         if (!path) return null; // sparse rehydrated slot
         const isMidi = path.toLowerCase().endsWith(".mid");
+        // Phase 5: report ports carry inline JSON strings (never file paths) —
+        // render a copy-only row; also gives complianceCheck's report a real UI.
+        const isJson = !isMidi && path.trimStart().startsWith("{");
+        const isPng = !isMidi && !isJson && path.toLowerCase().endsWith(".png");
         const isActive = active === i;
         const glyph = isActive && phase === "playing" ? "❚❚" : isActive && phase === "loading" ? "◌" : "▶";
+        if (isJson) {
+          return (
+            <div key={i} className="wf-preview-row">
+              <span className="wf-preview-btn" style={{ opacity: 0.7 }}>{"{ }"}</span>
+              {outputLabels?.[i] && (
+                <span className="wf-preview-label" title={outputLabels[i]}>
+                  {outputLabels[i]}
+                </span>
+              )}
+              <span className="wf-preview-scrub" style={{ opacity: 0.6 }}>
+                {t18({ zh: "JSON 报告", en: "JSON report", ja: "JSON レポート" }, i18n.language)}
+              </span>
+              <button
+                className="wf-preview-dl"
+                title={t18({ zh: "复制报告 JSON", en: "Copy report JSON", ja: "レポート JSON をコピー" }, i18n.language)}
+                onClick={() => {
+                  void navigator.clipboard
+                    .writeText(path)
+                    .then(() =>
+                      useAppStore
+                        .getState()
+                        .showToast(
+                          t18({ zh: "已复制", en: "Copied", ja: "コピーしました" }, i18n.language),
+                          "success",
+                        ),
+                    )
+                    .catch(() =>
+                      useAppStore
+                        .getState()
+                        .showToast(
+                          t18({ zh: "复制失败", en: "Copy failed", ja: "コピーに失敗しました" }, i18n.language),
+                          "error",
+                        ),
+                    );
+                }}
+              >
+                ⧉
+              </button>
+            </div>
+          );
+        }
+        if (isPng) {
+          return (
+            <div key={i} className="wf-preview-row wf-preview-row-png">
+              <PngThumb path={path} />
+              {outputLabels?.[i] && (
+                <span className="wf-preview-label" title={outputLabels[i]}>
+                  {outputLabels[i]}
+                </span>
+              )}
+              <button
+                className="wf-preview-dl"
+                title={t18({ zh: "下载此图片", en: "Download this image", ja: "この画像をダウンロード" }, i18n.language)}
+                onClick={() => void download(path, outputLabels?.[i])}
+              >
+                ⬇
+              </button>
+            </div>
+          );
+        }
         if (isMidi) {
           return (
             <div key={i} className="wf-preview-row">

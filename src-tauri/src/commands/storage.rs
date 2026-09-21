@@ -721,6 +721,34 @@ mod tests {
     }
 
     #[test]
+    fn merge_presets_upserts_and_skips_invalid() {
+        let mut arr = vec![
+            serde_json::json!({ "name": "A", "workflow": { "nodes": [1] } }),
+            serde_json::json!({ "name": "B", "workflow": { "nodes": [] } }),
+        ];
+        let incoming = vec![
+            // 同名覆盖
+            serde_json::json!({ "name": "A", "workflow": { "nodes": [9] } }),
+            // 新名追加
+            serde_json::json!({ "name": "C", "workflow": { "nodes": [3] } }),
+            // 残缺条目逐类跳过:空白名 / 缺名 / workflow 非对象 / workflow 缺失
+            serde_json::json!({ "name": "   ", "workflow": {} }),
+            serde_json::json!({ "workflow": {} }),
+            serde_json::json!({ "name": "D", "workflow": [1, 2] }),
+            serde_json::json!({ "name": "E" }),
+        ];
+        let imported = merge_presets(&mut arr, incoming);
+        assert_eq!(imported, 2);
+        assert_eq!(arr.len(), 3);
+        assert_eq!(
+            arr[0].get("workflow").unwrap().get("nodes").unwrap().get(0).unwrap(),
+            &serde_json::json!(9),
+            "同名条目被覆盖"
+        );
+        assert_eq!(arr[2].get("name").unwrap(), "C");
+    }
+
+    #[test]
     fn sweep_respects_protected_uspwork_and_sidecars() {
         let root = tmp_root("sweep");
         // protected decode copy + its sidecar
@@ -858,6 +886,41 @@ fn preset_file(state: &AppState) -> PathBuf {
     data_root(state).join("workflow_presets.json")
 }
 
+/// 读预设文件为条目数组(文件缺失或损坏时返回 `[]`,与保存路径的容错口径一致)。
+fn read_preset_array(path: &Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// 把一批导入条目合并进 `arr`(同名覆盖、新名追加),返回实际合并的条数。
+/// 残缺条目(名字为空/缺失,或 workflow 不是对象)整条跳过,不中断整批 ——
+/// 用户手改的导出文件不应把预设库写坏(规划 6-7)。
+fn merge_presets(arr: &mut Vec<serde_json::Value>, incoming: Vec<serde_json::Value>) -> u32 {
+    let mut imported = 0u32;
+    for entry in incoming {
+        let name = entry
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if name.trim().is_empty() || !entry.get("workflow").map_or(false, |w| w.is_object()) {
+            continue;
+        }
+        if let Some(ix) = arr
+            .iter()
+            .position(|v| v.get("name").and_then(|n| n.as_str()) == Some(name.as_str()))
+        {
+            arr[ix] = entry;
+        } else {
+            arr.push(entry);
+        }
+        imported += 1;
+    }
+    imported
+}
+
 /// 返回所有已保存的工作流预设(JSON 数组字符串;首次使用尚无文件时返回 `[]`)。
 #[tauri::command]
 pub fn load_workflow_presets(state: State<'_, Arc<AppState>>) -> Result<String, String> {
@@ -878,10 +941,7 @@ pub fn save_workflow_preset(
     let root = data_root(&state);
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     let path = preset_file(&state);
-    let mut arr: Vec<serde_json::Value> = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+    let mut arr = read_preset_array(&path);
     let entry = serde_json::json!({ "name": name, "workflow": workflow });
     if let Some(ix) = arr.iter().position(|v| v.get("name").and_then(|n| n.as_str()) == Some(name.as_str())) {
         arr[ix] = entry;
@@ -890,4 +950,36 @@ pub fn save_workflow_preset(
     }
     let out = serde_json::to_string_pretty(&arr).map_err(|e| e.to_string())?;
     std::fs::write(&path, out).map_err(|e| e.to_string())
+}
+
+/// 导出全部工作流预设到用户选定的 JSON 文件,返回导出的预设条数(规划 6-7)。
+#[tauri::command]
+pub fn export_workflow_presets(
+    state: State<'_, Arc<AppState>>,
+    dest: String,
+) -> Result<u32, String> {
+    let arr = read_preset_array(&preset_file(&state));
+    let out = serde_json::to_string_pretty(&arr).map_err(|e| e.to_string())?;
+    std::fs::write(&dest, out).map_err(|e| e.to_string())?;
+    Ok(arr.len() as u32)
+}
+
+/// 从用户选定的 JSON 文件导入工作流预设:同名覆盖、新名追加、残缺条目跳过,
+/// 返回实际导入的条数(规划 6-7)。
+#[tauri::command]
+pub fn import_workflow_presets(
+    state: State<'_, Arc<AppState>>,
+    src: String,
+) -> Result<u32, String> {
+    let raw = std::fs::read_to_string(&src).map_err(|e| e.to_string())?;
+    let incoming: Vec<serde_json::Value> =
+        serde_json::from_str(&raw).map_err(|e| format!("PRESET_PARSE: {e}"))?;
+    let root = data_root(&state);
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    let path = preset_file(&state);
+    let mut arr = read_preset_array(&path);
+    let imported = merge_presets(&mut arr, incoming);
+    let out = serde_json::to_string_pretty(&arr).map_err(|e| e.to_string())?;
+    std::fs::write(&path, out).map_err(|e| e.to_string())?;
+    Ok(imported)
 }

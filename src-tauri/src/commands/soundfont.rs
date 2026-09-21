@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use tauri::State;
 
-use crate::audio::soundfont::{self, RenderNote, SoundfontEntry};
+use crate::audio::soundfont::{self, RenderBend, RenderCc, RenderLayer, RenderNote, SoundfontEntry};
 use crate::AppState;
 
 fn sfonts_dir(state: &AppState) -> PathBuf {
@@ -62,21 +62,54 @@ pub async fn open_soundfonts_dir(state: State<'_, Arc<AppState>>) -> Result<Stri
 }
 
 /// 渲染乐器轨(离线 bake → WAV 缓存文件,前端 WebAudio 播放)。
-/// 返回 WAV 绝对路径;缓存在 cache_dir/render 下,键 = hash(font+preset+notes)。
+/// 返回 WAV 绝对路径;缓存在 cache_dir/render 下,
+/// 键 = hash(font+preset+notes+cc+bend+layers+backend)。
 #[tauri::command]
 pub async fn render_soundfont_notes(
     state: State<'_, Arc<AppState>>,
     font_id: String,
     preset_id: String,
     notes: Vec<RenderNote>,
+    cc: Option<Vec<RenderCc>>,
+    bend: Option<Vec<RenderBend>>,
+    // 3-1 分层音源:非空时按层渲染并混合(font_id/preset_id 仅用于缓存键与占位)。
+    layers: Option<Vec<RenderLayer>>,
     sample_rate: Option<u32>,
+    // 3-9 FluidSynth 通用化:"builtin"(默认,内置合成器) | "fluidsynth"(CLI 对照组)。
+    backend: Option<String>,
 ) -> Result<String, String> {
     let dir = sfonts_dir(&state);
     let render_dir = state.cache_dir.join("render");
     std::fs::create_dir_all(&render_dir).map_err(|e| format!("创建缓存目录失败: {}", e))?;
+    let ccs = cc.unwrap_or_default();
+    let bends = bend.unwrap_or_default();
+    let layers = layers.unwrap_or_default();
+    // 3-9 后端归一:空/未指定 → builtin;fluidsynth 不支持分层混合(层是内置渲染器概念)。
+    let backend = backend
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("builtin");
+    if backend == "fluidsynth" && !layers.is_empty() {
+        return Err("SOUNDFONT_BACKEND_LAYERS_UNSUPPORTED".into());
+    }
+    // 缓存键必须涵盖全部影响输出的输入(CC/弯音变化 → 不同 WAV)
     let mut key = format!("{}|{}|{}", font_id, preset_id, notes.len());
     for n in &notes {
         key.push_str(&format!("|{},{},{},{}", n.start, n.dur, n.key, n.vel));
+    }
+    for c in &ccs {
+        key.push_str(&format!("|c{},{},{}", c.start, c.cc, c.value));
+    }
+    for b in &bends {
+        key.push_str(&format!("|b{},{}", b.start, b.value));
+    }
+    for l in &layers {
+        key.push_str(&format!("|L{},{},{},{}", l.font_id, l.preset_id, l.gain, l.pan));
+    }
+    // 后端参与缓存键:仅 fluidsynth 追加标记(fold-away,builtin 既有缓存键不变)。
+    if backend == "fluidsynth" {
+        key.push_str("|bfs");
     }
     let hash = xxhash_rust::xxh3::xxh3_64(key.as_bytes());
     let out_path = render_dir.join(format!("sf_{}.wav", hash));
@@ -85,7 +118,26 @@ pub async fn render_soundfont_notes(
     }
     let _guard = state.begin_task("render");
     let sr = sample_rate.unwrap_or(44100);
-    soundfont::render_to_wav(&dir, &font_id, &preset_id, &notes, sr, &out_path)?;
+    if backend == "fluidsynth" {
+        // FluidSynth 走 MIDI 文件中转(秒 → 960 tick/秒),渲染完即删临时 .mid。
+        let midi_tmp = render_dir.join(format!("sf_{}.mid", hash));
+        crate::audio::fluidsynth::render_notes_to_wav(
+            &dir,
+            &font_id,
+            &preset_id,
+            &notes,
+            &ccs,
+            &bends,
+            sr,
+            &out_path,
+            &state.amt_models_dir,
+            &midi_tmp,
+        )?;
+    } else if layers.is_empty() {
+        soundfont::render_to_wav(&dir, &font_id, &preset_id, &notes, &ccs, &bends, sr, &out_path)?;
+    } else {
+        soundfont::render_layers_to_wav(&dir, &layers, &notes, &ccs, &bends, sr, &out_path)?;
+    }
     Ok(out_path.to_string_lossy().to_string())
 }
 
@@ -133,7 +185,7 @@ pub async fn audition_soundfont_note(
         key,
         vel,
     };
-    soundfont::render_to_wav(&dir, &font_id, &preset_id, &[note], 44100, &out_path)?;
+    soundfont::render_to_wav(&dir, &font_id, &preset_id, &[note], &[], &[], 44100, &out_path)?;
     Ok(Some(out_path.to_string_lossy().to_string()))
 }
 

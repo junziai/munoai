@@ -1,7 +1,8 @@
 //! SFZ 解析器(阶段2)。
 //!
 //! 支持 SFZ 1.0 常用 opcode + SFZ 2.0 的 <global>/<master> 层级继承:
-//! `<control> default_path`、`#include` 递归、`<global>/<master>` 模板、
+//! `<control> default_path`、`#include` 递归、`#define $宏` 变量替换、
+//! xfin/xfout 交叉淡入淡出、`<global>/<master>` 模板、
 //! `<group>` 组模板(继承 global,遇到新 `<group>` 重置)、`<region>` 实例。
 //! 解析结果 = `Vec<Region>`,与 SF2 共用合成引擎。
 //!
@@ -19,6 +20,7 @@ pub fn parse_sfz(path: &Path) -> Result<Vec<Region>, String> {
         default_path: String::new(),
         global: HashMap::new(),
         group: HashMap::new(),
+        defines: HashMap::new(),
         regions: Vec::new(),
         depth: 0,
     };
@@ -34,8 +36,27 @@ struct ParseCtx {
     default_path: String,
     global: HashMap<String, String>,
     group: HashMap<String, String>,
+    /// `#define $name → value` 宏表(include 递归共享)。
+    defines: HashMap<String, String>,
     regions: Vec<Region>,
     depth: u8,
+}
+
+/// `#define $name value` 宏替换:名字最长优先(防止 $delay 部分匹配 $delayL)。
+/// 行内无 `$` 或宏表为空时原样返回。
+fn substitute_defines(line: &str, defines: &HashMap<String, String>) -> String {
+    if !line.contains('$') || defines.is_empty() {
+        return line.to_string();
+    }
+    let mut names: Vec<&String> = defines.keys().collect();
+    names.sort_by_key(|n| std::cmp::Reverse(n.len()));
+    let mut out = line.to_string();
+    for name in names {
+        if out.contains(name.as_str()) {
+            out = out.replace(name.as_str(), &defines[name]);
+        }
+    }
+    out
 }
 
 fn parse_file(path: &Path, ctx: &mut ParseCtx) -> Result<(), String> {
@@ -56,6 +77,20 @@ fn parse_file(path: &Path, ctx: &mut ParseCtx) -> Result<(), String> {
             None => line,
         };
         let t = line.trim();
+        // #define $name value(3-6):宏记录进 ctx,后续行做文本替换
+        if let Some(rest) = t.strip_prefix("#define") {
+            let rest = rest.trim();
+            if let Some(sp) = rest.find(char::is_whitespace) {
+                let (name, value) = rest.split_at(sp);
+                if name.starts_with('$') {
+                    ctx.defines.insert(name.to_string(), value.trim().to_string());
+                }
+            }
+            continue;
+        }
+        // 宏替换:名字最长优先,防止 $delay 吃掉 $delayL 的前缀
+        let t = substitute_defines(t, &ctx.defines);
+        let t = t.trim();
         if let Some(rest) = t.strip_prefix("#include") {
             let inc = rest.trim().trim_matches('"').trim_matches('\'');
             if !inc.is_empty() {
@@ -69,9 +104,9 @@ fn parse_file(path: &Path, ctx: &mut ParseCtx) -> Result<(), String> {
             continue;
         }
         if t.starts_with('#') {
-            continue; // #define 等预处理指令不支持,跳过
+            continue; // 其它预处理指令不支持,跳过
         }
-        main_text.push_str(line);
+        main_text.push_str(t);
         main_text.push('\n');
     }
 
@@ -282,6 +317,13 @@ fn build_region(opcodes: &HashMap<String, String>, base_dir: &Path, default_path
     for (k, v) in opcodes {
         apply_opcode(&mut r, k, v);
     }
+    // fil_type:本引擎仅支持二阶低通;显式声明其它滤波类型时不滤波
+    // (在 opcode 表上做,因为 HashMap 迭代顺序不保证 fil_type 先于 cutoff)
+    if let Some(ft) = opcodes.get("fil_type").or_else(|| opcodes.get("fil1_type")) {
+        if !ft.trim().to_ascii_lowercase().starts_with("lpf") {
+            r.cutoff_hz = None;
+        }
+    }
     Some(r)
 }
 
@@ -453,6 +495,64 @@ fn apply_opcode(r: &mut Region, k: &str, v: &str) {
                 r.sw_last = Some(key);
             }
         }
+        "cutoff" | "cutoff1" => {
+            if let Some(x) = parse_f32(v) {
+                r.cutoff_hz = Some(x.clamp(20.0, 20000.0));
+            }
+        }
+        "resonance" | "resonance1" => {
+            if let Some(x) = parse_f32(v) {
+                // SFZ resonance 单位是 dB → 线性 Q
+                r.resonance_q = 10f32.powf(x.clamp(-96.0, 96.0) / 20.0).max(0.05);
+            }
+        }
+        // 交叉淡入淡出(3-6):xfin/xfout ramp 与 key/vel 主区间正交
+        "xfin_lokey" => {
+            if let Some(x) = parse_u32(v) {
+                r.xf_key_in.0 = x.min(127) as u8;
+            }
+        }
+        "xfin_hikey" => {
+            if let Some(x) = parse_u32(v) {
+                r.xf_key_in.1 = x.min(127) as u8;
+            }
+        }
+        "xfout_lokey" => {
+            if let Some(x) = parse_u32(v) {
+                r.xf_key_out.0 = x.min(127) as u8;
+            }
+        }
+        "xfout_hikey" => {
+            if let Some(x) = parse_u32(v) {
+                r.xf_key_out.1 = x.min(127) as u8;
+            }
+        }
+        "xfin_lovel" => {
+            if let Some(x) = parse_u32(v) {
+                r.xf_vel_in.0 = x.min(127) as u8;
+            }
+        }
+        "xfin_hivel" => {
+            if let Some(x) = parse_u32(v) {
+                r.xf_vel_in.1 = x.min(127) as u8;
+            }
+        }
+        "xfout_lovel" => {
+            if let Some(x) = parse_u32(v) {
+                r.xf_vel_out.0 = x.min(127) as u8;
+            }
+        }
+        "xfout_hivel" => {
+            if let Some(x) = parse_u32(v) {
+                r.xf_vel_out.1 = x.min(127) as u8;
+            }
+        }
+        "xf_keycurve" => {
+            r.xf_key_power = v.trim().eq_ignore_ascii_case("power");
+        }
+        "xf_velcurve" => {
+            r.xf_vel_power = v.trim().eq_ignore_ascii_case("power");
+        }
         _ => {}
     }
 }
@@ -482,5 +582,69 @@ mod tests {
         assert_eq!(map.get("lokey").unwrap(), "60");
         assert_eq!(map.get("hikey").unwrap(), "72");
         assert_eq!(map.get("volume").unwrap(), "-3.5");
+    }
+
+    #[test]
+    fn define_substitution() {
+        let mut defines = HashMap::new();
+        defines.insert("$delay".to_string(), "0.2".to_string());
+        defines.insert("$delayL".to_string(), "0.3".to_string());
+        // 名字最长优先:$delayL 不能被 $delay 吃掉前缀变成 "0.2L"
+        assert_eq!(substitute_defines("ampeg_delay=$delayL", &defines), "ampeg_delay=0.3");
+        assert_eq!(substitute_defines("ampeg_delay=$delay", &defines), "ampeg_delay=0.2");
+        // 无 $ 或空表:原样返回
+        assert_eq!(substitute_defines("lokey=60", &defines), "lokey=60");
+        assert_eq!(substitute_defines("lokey=$lo", &HashMap::new()), "lokey=$lo");
+    }
+
+    #[test]
+    fn xf_opcodes_parse() {
+        let mut r = Region::default();
+        let ops = parse_opcodes("sample=a.wav xfin_lokey=60 xfin_hikey=72 xfout_lovel=100");
+        for (k, v) in &ops {
+            apply_opcode(&mut r, k, v);
+        }
+        assert_eq!(r.xf_key_in, (60, 72));
+        assert_eq!(r.xf_vel_out.0, 100);
+        // power 曲线
+        let mut r2 = Region::default();
+        let ops2 = parse_opcodes("sample=a.wav xf_keycurve=power xf_velcurve=power");
+        for (k, v) in &ops2 {
+            apply_opcode(&mut r2, k, v);
+        }
+        assert!(r2.xf_key_power);
+        assert!(r2.xf_vel_power);
+    }
+
+    #[test]
+    fn parse_file_defines_end_to_end() {
+        let dir = std::env::temp_dir().join("muno_sfz_defines_test");
+        let sdir = dir.join("s");
+        std::fs::create_dir_all(&sdir).unwrap();
+        std::fs::write(sdir.join("a.wav"), b"stub").unwrap();
+        let sfz = dir.join("t.sfz");
+        std::fs::write(
+            &sfz,
+            "<control> default_path=s/\n#define $att 0.05\n<global> ampeg_attack=$att\n#define $lo 60\n<region> sample=a.wav lokey=$lo hikey=$lo\n",
+        )
+        .unwrap();
+        let mut ctx = ParseCtx {
+            base_dir: dir.clone(),
+            default_path: String::new(),
+            global: HashMap::new(),
+            group: HashMap::new(),
+            defines: HashMap::new(),
+            regions: Vec::new(),
+            depth: 0,
+        };
+        parse_file(&sfz, &mut ctx).unwrap();
+        assert_eq!(ctx.defines.get("$att").map(String::as_str), Some("0.05"));
+        assert_eq!(ctx.defines.get("$lo").map(String::as_str), Some("60"));
+        assert_eq!(ctx.global.get("ampeg_attack").map(String::as_str), Some("0.05"));
+        assert_eq!(ctx.regions.len(), 1, "采样存在时区域不应被丢弃");
+        let r = &ctx.regions[0];
+        assert_eq!((r.key_lo, r.key_hi), (60, 60));
+        assert!((r.attack - 0.05).abs() < 1e-6, "attack 应继承 global 的 $att:{}", r.attack);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

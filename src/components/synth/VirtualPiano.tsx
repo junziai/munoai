@@ -4,10 +4,8 @@ import { useAppStore } from "../../store/app";
 import { useHistoryStore } from "../../store/history";
 import { playSingleNote } from "../../lib/audio/previewNote";
 import { resolveMelodyTrackId } from "../../lib/arrangement/autoArrange";
-import { resolveTrackSourceAudio } from "../../lib/amtSource";
-import { analyzeTrackChords, detectTrackDrums } from "../../lib/analysis/trackAnalysisActions";
 import { ArrangeDialog } from "./ArrangeDialog";
-import { ChordMidiDialog } from "./ChordMidiDialog";
+import { MixerConsole } from "./MixerConsole";
 import "./VirtualPiano.css";
 
 /** MIDI note number for C3 (中央 C 下八度的 C) */
@@ -40,7 +38,7 @@ export function VirtualPiano() {
   const [open, setOpen] = useState(false);
   const [activeNotes, setActiveNotes] = useState<Set<number>>(new Set());
   const [arrangeTarget, setArrangeTarget] = useState<string | null>(null);
-  const [chordMidiTarget, setChordMidiTarget] = useState<string | null>(null);
+  const [consoleOpen, setConsoleOpen] = useState(false);
   const pressedKeys = useRef<Set<string>>(new Set());
   const inspectorTrackId = useAppStore((s) => s.inspectorTrackId);
 
@@ -58,32 +56,7 @@ export function VirtualPiano() {
     setArrangeTarget(tid);
   };
 
-  const openConvertMidi = () => {
-    const found = useProjectStore.getState().tracks.find((tr) => resolveTrackSourceAudio(tr)?.path);
-    const src = found ? resolveTrackSourceAudio(found) : undefined;
-    if (!found || !src?.path) { toast("没有找到带音频的轨道", "error"); return; }
-    useAppStore.getState().setAmtSource(src.path, src.name || found.name);
-    useAppStore.getState().openAmtConversion(found.id);
-  };
-
-  const openChordMidi = () => {
-    const tid = resolveMelodyTrackId();
-    if (!tid) { toast("请先选中或创建一条有音符的旋律轨", "error"); return; }
-    setChordMidiTarget(tid);
-  };
-
-  const runChordDetect = () => {
-    const tid = resolveMelodyTrackId();
-    if (!tid) { toast("请先选中或创建一条旋律/音频轨", "error"); return; }
-    analyzeTrackChords(tid);
-  };
-
-  const runDrumDetect = () => {
-    const found = useProjectStore.getState().tracks.find((tr) => resolveTrackSourceAudio(tr)?.path);
-    const src = found ? resolveTrackSourceAudio(found) : undefined;
-    if (!found || !src?.path) { toast("没有找到带音频的轨道", "error"); return; }
-    void detectTrackDrums(found.id, src.path);
-  };
+  // 注: 转MIDI / 和弦MIDI / 识别和弦 / 识别鼓点 已集成到轨道右键菜单 (TrackList)
 
   // 键盘事件 — 全局监听
   useEffect(() => {
@@ -183,10 +156,8 @@ export function VirtualPiano() {
         <button className="vp-quick" onClick={openSongStudio} title="打开歌曲制作工作台">🎧 歌曲制作</button>
         <button className="vp-quick" onClick={openSuperWizard} title="选歌 + 模板 → 一键生成原创歌曲">🪄 超级原创</button>
         <button className="vp-quick" onClick={openSmartArrange} title="AI 自动编曲 (鼓/贝斯/钢琴/铺底)">✨ 智能编曲</button>
-        <button className="vp-quick" onClick={openConvertMidi} title="AI 转谱:音频转 MIDI 音符轨">🎶 转MIDI</button>
-        <button className="vp-quick" onClick={openChordMidi} title="从旋律生成和弦伴奏轨">🎹 和弦MIDI</button>
-        <button className="vp-quick" onClick={runChordDetect} title="分析这条轨的和弦进行">🎼 识别和弦</button>
-        <button className="vp-quick" onClick={runDrumDetect} title="把音频轨的鼓点变成 MIDI 鼓轨">🥁 识别鼓点</button>
+        <span className="vp-sep" />
+        <button className="vp-quick" onClick={() => setConsoleOpen(true)} title="控制台: 所有轨道音量/平衡/静音独奏 + 总输出">🎛 控制台</button>
       </div>
       {open && (
         <div className="vp-keyboard">
@@ -232,7 +203,7 @@ export function VirtualPiano() {
         </div>
       )}
       {arrangeTarget && <ArrangeDialog trackId={arrangeTarget} onClose={() => setArrangeTarget(null)} />}
-      {chordMidiTarget && <ChordMidiDialog trackId={chordMidiTarget} onClose={() => setChordMidiTarget(null)} />}
+      {consoleOpen && <MixerConsole onClose={() => setConsoleOpen(false)} />}
     </div>
   );
 }

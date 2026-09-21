@@ -13,6 +13,7 @@ import { blankTrack } from "../../lib/trackFactory";
 import { copyTrackToClipboard, pasteWithFeedback, clipboardKind } from "../../lib/clipboard";
 import { VolumeFader, formatPan, formatDb } from "../common/VolumeFader";
 import { ContextMenu, type MenuItem } from "../common/ContextMenu";
+import { songTaskSubmenuItems } from "../../lib/song/daw-menu";
 import * as playback from "../../lib/audio/playback";
 import { useVoiceModelStore } from "../../store/voice-models";
 import { backendOf, backendLabel, pickVoiceForTrack } from "../../lib/vocal/voicePick";
@@ -371,10 +372,31 @@ export function TrackList({ width }: Props) {
       const isMelodyLike = !!tr && (tr.trackType === "instrument" || tr.trackType === "vocal");
       const isAudio = !!tr && tr.trackType === "audio";
       // Audio path for audio-track analysis (drums, chords, AMT)
-      const audioPath = tr
-        ? (tr.segments.find((s) => s.content.type === "audioClip")?.content as { type: "audioClip"; sourcePath: string } | undefined)?.sourcePath ?? null
-        : null;
+      const audioSegment = tr?.segments.find((s) => s.content.type === "audioClip");
+      const audioPath = audioSegment?.content.type === "audioClip" ? audioSegment.content.sourcePath : null;
       const hasNotes = isMelodyLike && tr!.segments.some((s) => s.content.type === "notes" && s.content.notes.length > 0);
+      const songSource = {
+        kind: "track" as const,
+        trackId: menu.trackId,
+        segmentId: audioSegment?.id,
+      };
+      const songReturnTarget = {
+        kind: "track" as const,
+        trackId: menu.trackId,
+        segmentId: audioSegment?.id,
+        align: true,
+      };
+      const openSongTool = (tool: "multiTrack" | "creative" | "cover" | "midi") => {
+        useAppStore.getState().setPendingSongTask({
+          task: tool === "midi" ? "sheet" : tool === "cover" ? "cover" : "lego",
+          source: songSource,
+          sourceLabel: tr.name,
+          returnTarget: songReturnTarget,
+          tool,
+        });
+        const app = useAppStore.getState();
+        if (!app.songStudioOpen) app.toggleSongStudio();
+      };
 
       // Per-item enable rules (smarter than a single `hasNotes` gate):
       //  - autoArrange / chordMidi: need NOTES (MIDI content to arrange FROM)
@@ -390,7 +412,7 @@ export function TrackList({ width }: Props) {
       const tipNoAudio = "需要音频轨 (带音频文件)";
       return [
         // —— AI 快捷入口（最简右键直达）——
-        { label: "🎵 AI 转谱 (AMT)…", disabled: amtDisabled, title: amtDisabled ? tipNoAudio : "用 AI 模型把音频转成 MIDI 音符轨 (需要 Tauri 后端)",
+        { label: "🎵 转MIDI (AI 转谱)…", disabled: amtDisabled, title: amtDisabled ? tipNoAudio : "用 AI 模型把音频转成 MIDI 音符轨 (需要 Tauri 后端)",
           onClick: () => { void tryOpenAmt(menu.trackId); } },
         { label: "⚡ 一键扒带编曲 (音频→转谱→配器)", disabled: amtDisabled, title: amtDisabled ? tipNoAudio : "音频先 AI 转谱,完成后自动打开智能编曲面板(自动定速/定调/出和弦)",
           onClick: () => {
@@ -405,6 +427,53 @@ export function TrackList({ width }: Props) {
           onClick: () => { analyzeTrackChords(menu.trackId); useAppStore.getState().showToast(i18n.t("chordTrack.analyzeDone"), "info"); } },
         { label: "🥁 识别鼓点", disabled: detectDrumsDisabled, title: detectDrumsDisabled ? tipNoAudio : "把这条音频轨的鼓点变成 MIDI 鼓轨",
           onClick: async () => { if (audioPath) { await detectTrackDrums(menu.trackId, audioPath); useAppStore.getState().showToast("鼓点识别完成", "success"); } } },
+        // —— 规划 10.2：歌曲模型子菜单（DAW → 歌曲制作带参打开；不改变现有项与顺序）——
+        ...(!!audioPath
+          ? [{
+              type: "submenu" as const,
+              label: i18n.t("songMenu.remixGroup"),
+              icon: "🎤",
+              items: songTaskSubmenuItems({
+                source: songSource,
+                sourceLabel: tr.name,
+                audioPath,
+                trackId: menu.trackId,
+                segmentId: audioSegment?.id,
+              }),
+            }]
+          : []),
+        {
+          type: "submenu" as const,
+          label: "🎵 歌曲生成工具",
+          icon: "🎵",
+          title: "AI 歌曲生成与编辑工具",
+          items: [
+            {
+              label: "🎛️ 高级多轨工作室",
+              title: "专业多轨编辑和制作",
+              disabled: !audioPath,
+              onClick: () => openSongTool("multiTrack"),
+            },
+            {
+              label: "🪄 创作助手",
+              title: "单乐器叠加、乐谱续写等快捷功能",
+              disabled: !audioPath,
+              onClick: () => openSongTool("creative"),
+            },
+            {
+              label: "🎤 翻唱助手",
+              title: "快速翻唱和风格转换",
+              disabled: !audioPath,
+              onClick: () => openSongTool("cover"),
+            },
+            {
+              label: "🎹 MIDI 编辑器",
+              title: "编辑和导出 MIDI 文件",
+              disabled: !audioPath && !hasNotes,
+              onClick: () => openSongTool("midi"),
+            },
+          ],
+        },
         // —— 文件夹分组 ——
         ...(tr.isFolder
           ? [

@@ -118,12 +118,27 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   RENDER_WRITE_FAILED: { key: "backend.RENDER_WRITE_FAILED" },
   // Song Studio (commands/song.rs) — external inference service + model management.
   SONG_ABC_WRITE_FAIL: { key: "backend.SONG_ABC_WRITE_FAIL" },
+  SONG_CACHE_DIR_ERROR: { key: "backend.SONG_CACHE_DIR_ERROR" },
+  SONG_CONFIG_ERROR: { key: "backend.SONG_CONFIG_ERROR" },
+  SONG_CONFIG_WRITE_FAILED: { key: "backend.SONG_CONFIG_WRITE_FAILED" },
+  // 常驻模式专属:守护进程起不来 / 起来了但迟迟不出结果。两者都会自动退回一次性模式重试,
+  // 所以文案要说清「已自动降级」,否则用户会以为这次生成整体失败了。
+  SONG_DAEMON_SPAWN_FAILED: { key: "backend.SONG_DAEMON_SPAWN_FAILED" },
+  SONG_DAEMON_TIMEOUT: { key: "backend.SONG_DAEMON_TIMEOUT", modal: true },
   SONG_DELETE_FAILED: { key: "backend.SONG_DELETE_FAILED" },
   SONG_DELETE_REJECTED: { key: "backend.SONG_DELETE_REJECTED" },
+  SONG_GENERATION_FAILED: { key: "backend.SONG_GENERATION_FAILED" },
+  SONG_KILL_FAILED: { key: "backend.SONG_KILL_FAILED" },
+  SONG_NO_DATA: { key: "backend.SONG_NO_DATA" },
+  SONG_NO_RESULT: { key: "backend.SONG_NO_RESULT" },
+  SONG_READ_FAILED: { key: "backend.SONG_READ_FAILED" },
   SONG_SERVICE_BAD_RESPONSE: { key: "backend.SONG_SERVICE_BAD_RESPONSE" },
   SONG_SERVICE_ERROR: { key: "backend.SONG_SERVICE_ERROR" },
   SONG_SERVICE_UNAVAILABLE: { key: "backend.SONG_SERVICE_UNAVAILABLE" },
   SONG_SERVICE_URL_EMPTY: { key: "backend.SONG_SERVICE_URL_EMPTY" },
+  SONG_SIDECAR_NOT_FOUND: { key: "backend.SONG_SIDECAR_NOT_FOUND" },
+  SONG_SPAWN_FAILED: { key: "backend.SONG_SPAWN_FAILED" },
+  SONG_WAIT_FAILED: { key: "backend.SONG_WAIT_FAILED" },
   AUDIO_EMPTY_INPUT: { key: "backend.AUDIO_EMPTY_INPUT" },
   // Slim installer: ffmpeg is a resource-manager on-demand download now; loading a
   // compressed format without it points the user at the resource manager's 必备/essential tab.
@@ -368,6 +383,8 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   PART_MISSING: { key: "backend.PART_MISSING" },
   PART_SHA256_MISMATCH: { key: "backend.PART_SHA256_MISMATCH" },
   PART_SIZE_MISMATCH: { key: "backend.PART_SIZE_MISMATCH" },
+  // 工作流预设导入：所选文件不是合法的 JSON 预设数组（storage.rs import_workflow_presets）。
+  PRESET_PARSE: { key: "backend.PRESET_PARSE" },
   PROBE_CONNECT_FAILED: { key: "backend.PROBE_CONNECT_FAILED" },
   PROBE_CONNECT_TIMEOUT: { key: "backend.PROBE_CONNECT_TIMEOUT" },
   PROBE_HTTP_ERROR: { key: "backend.PROBE_HTTP_ERROR" },
@@ -408,6 +425,9 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   SCORE2CV_SHAPE: { key: "backend.SCORE2CV_SHAPE" },
   SCORE2SVC_ZERO_FRAMES: { key: "backend.SCORE2SVC_ZERO_FRAMES" },
   SHARED_POOL_REUSED: { key: "backend.SHARED_POOL_REUSED" },
+  // P3 3-9 FluidSynth 通用化：render_soundfont_notes 的 backend="fluidsynth" 守门。
+  SOUNDFONT_BACKEND_LAYERS_UNSUPPORTED: { key: "backend.SOUNDFONT_BACKEND_LAYERS_UNSUPPORTED" },
+  SOUNDFONT_BACKEND_UNSUPPORTED: { key: "backend.SOUNDFONT_BACKEND_UNSUPPORTED" },
   SOVITS_NO_OUTPUT: { key: "backend.SOVITS_NO_OUTPUT" },
   SOVITS_VOL_FRAMES_MISMATCH: { key: "backend.SOVITS_VOL_FRAMES_MISMATCH" },
   // S146: the range-extension inverse is TD-PSOLA, which cannot place a single grain without

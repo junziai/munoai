@@ -958,10 +958,76 @@ ${L("stSlotDiffNote").replace("{steps}", String(slot.diffSteps))}`
     invoke<boolean>("get_diagnostic_mode").then(setDiagMode).catch(() => {});
   }, []);
   const handleDiagToggle = (v: boolean) => {
-    setDiagMode(v); // optimistic: the checkbox must not lag behind the click
+    setDiagMode(v);
     invoke("set_diagnostic_mode", { on: v }).catch(() => {
-      setDiagMode(!v); // …but a refused write must not leave the UI claiming it stuck
+      setDiagMode(!v);
     });
+  };
+
+  const [songResidentMode, setSongResidentMode] = useState(false);
+  const [songIdleTimeoutText, setSongIdleTimeoutText] = useState("");
+  useEffect(() => {
+    invoke<boolean>("get_song_resident_mode").then(setSongResidentMode).catch(() => {});
+    invoke<number>("get_song_resident_idle_timeout").then((sec) => setSongIdleTimeoutText(String(sec))).catch(() => {});
+  }, []);
+  const commitSongIdleTimeout = useCallback(async () => {
+    const sec = Math.max(60, parseInt(songIdleTimeoutText || "300", 10) || 300);
+    try {
+      await invoke("set_song_resident_idle_timeout", { seconds: sec });
+      setSongIdleTimeoutText(String(sec));
+    } catch {
+    }
+  }, [songIdleTimeoutText]);
+
+  // 常驻进程的实况。字段名跟 Rust 的 SongResidentStatus 一致(该结构没有 rename_all,
+  // 所以过来的是 snake_case 的 idle_timeout)。
+  const [songDaemonStatus, setSongDaemonStatus] = useState<{
+    running: boolean;
+    pid: number | null;
+    idle_timeout: number;
+  } | null>(null);
+  const [songDaemonBusy, setSongDaemonBusy] = useState(false);
+  const refreshSongDaemon = useCallback(async () => {
+    try {
+      setSongDaemonStatus(
+        await invoke<{ running: boolean; pid: number | null; idle_timeout: number }>(
+          "song_resident_status",
+        ),
+      );
+    } catch {
+      setSongDaemonStatus(null);
+    }
+  }, []);
+  // 进程可能在空闲超时后自行卸载 —— 面板开着的时候轮询一下,否则这里会一直显示
+  // 「运行中」骗人。5 秒一次,这个命令只是读一个 Mutex,代价可以忽略。
+  useEffect(() => {
+    void refreshSongDaemon();
+    if (!songResidentMode) return;
+    const timer = setInterval(() => void refreshSongDaemon(), 5000);
+    return () => clearInterval(timer);
+  }, [songResidentMode, refreshSongDaemon]);
+  const releaseSongDaemon = useCallback(async () => {
+    setSongDaemonBusy(true);
+    try {
+      await invoke("song_resident_shutdown");
+    } catch {
+    } finally {
+      setSongDaemonBusy(false);
+      void refreshSongDaemon();
+    }
+  }, [refreshSongDaemon]);
+  const handleSongResidentToggle = (v: boolean) => {
+    setSongResidentMode(v);
+    invoke("set_song_resident_mode", { enabled: v })
+      .then(() => {
+        // 关掉开关就该当场把进程收掉。只写配置的话,已经起来的守护进程会一直挂到空闲
+        // 超时才放显存 —— 那正是用户点这个开关想避免的事。
+        if (!v) return releaseSongDaemon();
+        return refreshSongDaemon();
+      })
+      .catch(() => {
+        setSongResidentMode(!v);
+      });
   };
 
   const handleUpdateCheck = useCallback(async () => {
@@ -1430,6 +1496,15 @@ ${L("stSlotDiffNote").replace("{steps}", String(slot.diffSteps))}`
         ja: "診断モードは現在オンです——学習は目に見えて遅くなります。次回の実行から有効になり、そのとき何を有効にしたかがログの先頭に記録されます。",
       },
       diagOpenLogs: { zh: "打开日志文件夹", en: "Open log folder", ja: "ログフォルダーを開く" },
+      songTitle: { zh: "歌曲生成", en: "Song Generation", ja: "楽曲生成" },
+      songResidentMode: { zh: "常驻模式（保持 sidecar 进程存活）", en: "Resident mode (keep sidecar alive)", ja: "常駐モード（サイドカーを維持）" },
+      songResidentModeNote: { zh: "默认关闭。开启后，Python 进程会在生成间保持存活，避免每次重新加载约 8GB 模型（首次加载耗时 20~30 秒）；但进程会在空闲超时后自动卸载模型到 CPU 以释放显存（仅保留进程和已导入的 torch 包，节省 Python 启动开销）。", en: "OFF by default. When enabled, the Python process stays alive between generations to avoid reloading ~8GB of models every time (first load takes 20–30s); idle timeout auto-unloads models to CPU to release VRAM (keeps process + imported torch, skips Python startup cost).", ja: "既定ではオフ。オンにすると、Python プロセスは生成間で存続し、約 8GB のモデルを毎回再読み込みする必要がなくなります（初回ロード 20～30 秒）。アイドルタイムアウトでモデルを CPU にアンロードして VRAM を解放（プロセスとインポート済み torch は維持し、Python 起動コストを省略）。" },
+      songIdleTimeout: { zh: "空闲超时（秒）", en: "Idle timeout (seconds)", ja: "アイドルタイムアウト（秒）" },
+      songIdleTimeoutNote: { zh: "最小 60 秒。超时后模型会卸载到 CPU 以释放显存，下次生成时自动重新加载到 GPU（约 5~8 秒）。", en: "Minimum 60s. After timeout, models unload to CPU to release VRAM; next generation auto-reloads to GPU (~5–8s).", ja: "最小 60 秒。タイムアウト後、モデルは CPU にアンロードされ VRAM を解放します。次の生成時に GPU へ自動再ロード（約 5～8 秒）。" },
+      songDaemonRunning: { zh: "常驻进程运行中（PID {pid}）", en: "Resident process running (PID {pid})", ja: "常駐プロセス実行中（PID {pid}）" },
+      songDaemonIdle: { zh: "当前没有常驻进程——下次生成时按需启动", en: "No resident process — it starts on demand at the next generation", ja: "常駐プロセスなし——次の生成時に必要に応じて起動します" },
+      songDaemonRelease: { zh: "立即释放显存", en: "Release VRAM now", ja: "VRAM を今すぐ解放" },
+      songDaemonReleasing: { zh: "释放中…", en: "Releasing…", ja: "解放中…" },
       diagSubmit: {
         zh: "复现之后，把日志文件夹里当天的日志交给我们，就能定位问题。",
         en: "After reproducing it, send us that day's file from the log folder and we can locate the fault.",
@@ -2538,6 +2613,56 @@ ${L("stSlotDiffNote").replace("{steps}", String(slot.diffSteps))}`
             </button>
           </div>
           <p className="settings-note">{L("diagSubmit")}</p>
+        </section>
+
+        <section className="settings-section" style={{ marginTop: 16 }}>
+          <h3 className="settings-section-title">{L("songTitle")}</h3>
+          <label className="training-check-row" style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
+            <input type="checkbox" checked={songResidentMode} onChange={(e) => handleSongResidentToggle(e.target.checked)} />
+            <span>{L("songResidentMode")}</span>
+          </label>
+          <p className="settings-note">{L("songResidentModeNote")}</p>
+          {songResidentMode && (
+            <div className="settings-field" style={{ marginTop: 6 }}>
+              <label>{L("songIdleTimeout")}</label>
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <input
+                  type="text"
+                  className="settings-source-url"
+                  style={{ width: 90, flex: "none" }}
+                  inputMode="numeric"
+                  value={songIdleTimeoutText}
+                  placeholder="300"
+                  onChange={(e) => setSongIdleTimeoutText(e.target.value.replace(/[^0-9]/g, ""))}
+                  onBlur={() => void commitSongIdleTimeout()}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                  }}
+                />
+                <span className="settings-value" style={{ maxWidth: "none" }}>秒</span>
+              </div>
+              <p className="settings-note" style={{ marginTop: 6 }}>{L("songIdleTimeoutNote")}</p>
+            </div>
+          )}
+          <div className="settings-field" style={{ marginTop: 6 }}>
+            <span className="settings-value" style={{ maxWidth: "none", fontSize: 11 }}>
+              {songDaemonStatus?.running
+                ? L("songDaemonRunning").replace("{pid}", String(songDaemonStatus.pid ?? "?"))
+                : L("songDaemonIdle")}
+            </span>
+          </div>
+          {songDaemonStatus?.running && (
+            <div className="settings-field">
+              <button
+                className="settings-btn"
+                onClick={() => void releaseSongDaemon()}
+                disabled={songDaemonBusy}
+                style={{ padding: "5px 12px", cursor: songDaemonBusy ? "not-allowed" : "pointer" }}
+              >
+                {songDaemonBusy ? L("songDaemonReleasing") : L("songDaemonRelease")}
+              </button>
+            </div>
+          )}
         </section>
       </div>
     </aside>

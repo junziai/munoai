@@ -6,6 +6,8 @@ import { useAppStore } from "../../store/app";
 import { useAudioStore } from "../../store/audio";
 import { useHistoryStore } from "../../store/history";
 import { useTranslation } from "react-i18next";
+import i18n from "../../i18n";
+import { songTaskSubmenuItems } from "../../lib/song/daw-menu";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { isTauri } from "../../lib/tauri";
 import { TICKS_PER_BEAT, PIXELS_PER_TICK, TRACK_HEADER_HEIGHT, LANE_HEIGHT, LANE_GROUP_BAR_HEIGHT, TRACK_ADD_FOOTER, AUDIO_EXT_RE } from "../../lib/constants";
@@ -1306,6 +1308,25 @@ export function Arrangement() {
           disabled: !!useAppStore.getState().midiExtracting[extractKey(segId, group)],
           onClick: () => { void extractMidiForLaneGroup(track.id, segId, group); },
         });
+        // —— 规划 10.4：lane 分支同样提供歌曲模型子菜单（源优先取该 lane 组的渲染产物）——
+        const clip = seg.content as { sourcePath?: string };
+        const lanePath =
+          seg.processedOutputs?.filter((o) => !o.loading && o.outputNodeId === group).slice(-1)[0]?.audioPath
+          ?? clip.sourcePath;
+        if (lanePath) {
+          items.push({
+            type: "submenu",
+            label: i18n.t("songMenu.remixGroup"),
+            icon: "🎤",
+            items: songTaskSubmenuItems({
+              source: { kind: "track", trackId: track.id, segmentId: segId },
+              sourceLabel: track.name,
+              audioPath: lanePath,
+              trackId: track.id,
+              segmentId: segId,
+            }),
+          });
+        }
       }
       return items;
     }
@@ -1395,6 +1416,22 @@ export function Arrangement() {
             onClick: () => useProjectStore.getState().setSegmentTempoDetect(track.id, segId, undefined),
           });
         }
+        // —— 规划 10.3：歌曲模型子菜单（片段 → 歌曲制作带参打开；插在拉伸系列之前，不删改现有项）——
+        const finalPath =
+          seg.processedOutputs?.filter((o) => !o.loading).slice(-1)[0]?.audioPath ?? clip.sourcePath;
+        items.push({
+          type: "submenu",
+          label: i18n.t("songMenu.remixGroup"),
+          icon: "🎤",
+          items: songTaskSubmenuItems({
+            source: { kind: "track", trackId: track.id, segmentId: segId },
+            sourceLabel: `${track.name}`,
+            audioPath: finalPath,
+            trackId: track.id,
+            segmentId: segId,
+          }),
+        });
+        items.push({ type: "divider" });
       }
     }
     // Empty-row right-click still offers 粘贴 (this row's track at the playhead) — S61.

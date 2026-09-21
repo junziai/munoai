@@ -1,5 +1,7 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
+import { useProjectStore } from "./project";
+import type { Track } from "../types/project";
 
 export interface AudioTrackData {
   filePath: string;
@@ -36,6 +38,7 @@ interface AudioState {
   setPreparing: (preparing: boolean) => void;
   setSeeking: (seeking: boolean) => void;
   bumpSchedule: () => void;
+  pruneUnusedAudioCache: () => void;
 }
 
 export const useAudioStore = create<AudioState>((set, get) => ({
@@ -90,4 +93,40 @@ export const useAudioStore = create<AudioState>((set, get) => ({
   setPreparing: (preparing) => set({ preparing }),
   setSeeking: (seeking) => set({ seeking }),
   bumpSchedule: () => set((s) => ({ scheduleVersion: s.scheduleVersion + 1 })),
+
+  pruneUnusedAudioCache: () => {
+    const projectStore = useProjectStore.getState();
+    const currentTracks: Track[] = projectStore.tracks;
+    
+    const usedPaths = new Set<string>();
+    currentTracks.forEach((track: Track) => {
+      track.segments?.forEach((segment) => {
+        if (segment.content.type === 'audioClip') {
+          usedPaths.add(segment.content.sourcePath);
+        }
+        segment.processedOutputs?.forEach((output) => {
+          usedPaths.add(output.audioPath);
+        });
+      });
+    });
+
+    set((s) => {
+      const newAudioFiles: Record<string, AudioTrackData> = {};
+      let prunedCount = 0;
+      
+      Object.entries(s.audioFiles).forEach(([path, data]) => {
+        if (usedPaths.has(path)) {
+          newAudioFiles[path] = data;
+        } else {
+          prunedCount++;
+        }
+      });
+
+      if (prunedCount > 0) {
+        console.log(`[AudioCache] Pruned ${prunedCount} unused audio file(s) from cache`);
+      }
+
+      return { audioFiles: newAudioFiles };
+    });
+  },
 }));

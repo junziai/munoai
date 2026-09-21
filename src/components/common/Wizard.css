@@ -262,13 +262,40 @@
   transition: background 0.12s ease, color 0.12s ease;
 }
 .startpage-recent-remove:hover { background: rgba(251, 113, 133, 0.15); color: #fb7185; }
+/* ── 空状态：插图 + 主标题 + 说明,替代原来的单行灰字 ── */
 .startpage-empty {
-  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 34px 20px;
   text-align: center;
-  color: var(--text-muted);
-  font-size: 12px;
   border: 1px dashed var(--border-subtle);
-  border-radius: 10px;
+  border-radius: 12px;
+  background: radial-gradient(120% 90% at 50% 0%, rgba(167, 139, 250, 0.07), transparent 70%);
+}
+.startpage-empty-art {
+  font-size: 40px;
+  line-height: 1;
+  opacity: 0.85;
+  filter: drop-shadow(0 4px 14px rgba(139, 92, 246, 0.35));
+  animation: empty-art-float 4s ease-in-out infinite;
+}
+.startpage-empty-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.startpage-empty-desc {
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-muted);
+  max-width: 34ch;
+}
+@keyframes empty-art-float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-5px); }
 }
 
 /* ── 重命名输入框 ── */
@@ -434,6 +461,54 @@
   max-height: 92vh;
   padding: 8px;
   animation: startpage-rise 0.22s ease;
+}
+
+/* ── 响应式：窄窗口下两栏塌成单栏,整体可纵向滚动;品牌头与 Hero 同步缩小 ──
+   960px 以下两栏各自宽度不足以承载 Hero(360px 高)+ 历史列表,改为上下堆叠。 */
+@media (max-width: 960px) {
+  .startpage-wrap {
+    grid-template-columns: 1fr;
+    gap: 20px;
+    width: 96vw;
+    overflow-y: auto;
+  }
+  .startpage-right {
+    max-height: none;
+    overflow-y: visible;
+  }
+  .startpage-hero { min-height: 220px; }
+  .startpage-brand-header { padding: 14px 0 8px; gap: 10px; }
+  .startpage-brand-logo { width: 40px; height: 40px; border-radius: 10px; }
+  .startpage-brand-name,
+  .startpage-brand-tagline { font-size: 26px; letter-spacing: 2px; }
+  .startpage-brand-sep { font-size: 22px; }
+}
+
+@media (max-width: 620px) {
+  .startpage-wrap { gap: 14px; padding: 4px; }
+  .startpage-hero { min-height: 170px; }
+  .startpage-brand-name,
+  .startpage-brand-tagline { font-size: 20px; letter-spacing: 1px; }
+  .startpage-brand-sep { font-size: 16px; }
+  .startpage-brand-logo { width: 32px; height: 32px; border-radius: 8px; }
+  .startpage-title { font-size: 18px; }
+  /* 窄屏隐藏长路径,只保留名字+时间,避免卡片被撑破 */
+  .startpage-recent-path { display: none; }
+}
+
+/* 尊重系统「减少动效」设置:关掉欢迎页所有装饰性无限动画 */
+@media (prefers-reduced-motion: reduce) {
+  .startpage-brand-logo,
+  .startpage-brand-name,
+  .startpage-brand-tagline,
+  .startpage-brand-sep,
+  .startpage-recent-item::after,
+  .startpage-recent-item.crashed,
+  .startpage-recent-crash-badge,
+  .startpage-hero::before,
+  .startpage-hero::after {
+    animation: none !important;
+  }
 }
 
 /* ── 左侧：新建区域 ── */
@@ -619,44 +694,51 @@
 .titlebar.splash-locked .skin-picker { display: none !important; }
 .titlebar.splash-locked .titlebar-center { flex: 1; justify-content: center; }
 
-/* ── 历史记录 "更多" 按钮 ── */
+/* ── 历史记录「查看全部」──
+   从原来的虚线大方块(混在卡片流里、像是又一个工程)改成列表下方的文字链接:
+   自身不再是卡片,视觉层级明显低于工程卡,但 hover 有下划线+箭头位移提示可点。 */
 .startpage-recent-more {
-  display: flex;
-  flex-direction: column;
+  align-self: flex-end;
+  display: inline-flex;
   align-items: center;
-  justify-content: center;
-  gap: 2px;
-  min-width: 110px;
-  padding: 18px 16px;
-  background: rgba(139, 92, 246, 0.08);
-  border: 1px dashed rgba(139, 92, 246, 0.45);
-  border-radius: 12px;
-  color: #c4b5fd;
+  gap: 6px;
+  margin-top: 2px;
+  padding: 6px 4px;
+  background: none;
+  border: none;
+  color: #a78bfa;
   cursor: pointer;
-  transition: all 0.18s ease;
-  font-family: var(--font-ui);
+  font-family: inherit;
+  font-size: 12px;
+  transition: color 0.15s ease;
 }
-.startpage-recent-more:hover {
-  background: rgba(139, 92, 246, 0.18);
-  border-color: rgba(139, 92, 246, 0.9);
-  color: #fff;
-  transform: translateY(-1px);
-  box-shadow: 0 4px 16px rgba(139, 92, 246, 0.25);
+.startpage-recent-more:hover { color: #ddd6fe; }
+.startpage-recent-more-label {
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  border-bottom: 1px solid transparent;
+  transition: border-color 0.15s ease;
+}
+.startpage-recent-more:hover .startpage-recent-more-label {
+  border-bottom-color: currentColor;
 }
 .startpage-recent-more-num {
-  font-size: 22px;
-  font-weight: 800;
-  line-height: 1;
-  background: linear-gradient(90deg, #a78bfa, #ffffff);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(139, 92, 246, 0.16);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.5;
 }
-.startpage-recent-more-label {
+.startpage-recent-more-arrow {
   font-size: 12px;
-  font-weight: 500;
-  letter-spacing: 1px;
-  opacity: 0.8;
+  transition: transform 0.15s ease;
+}
+.startpage-recent-more:hover .startpage-recent-more-arrow { transform: translateX(3px); }
+.startpage-recent-more:focus-visible {
+  outline: 2px solid rgba(167, 139, 250, 0.7);
+  outline-offset: 2px;
+  border-radius: 6px;
 }
 
 /* ── 更多历史弹窗 ── */
@@ -715,18 +797,27 @@
   background: rgba(255, 255, 255, 0.08);
   color: #fff;
 }
+/* 虚拟滚动容器：滚动由 react-window 的 List 自己接管(rows 绝对定位),
+   所以这里只负责给出确定的高度和内边距,不能再用 flex+gap 排列子节点。 */
 .startpage-modal-list {
+  min-height: 0;
   padding: 12px;
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
 }
-.startpage-modal-list .startpage-recent-item {
-  /* 弹窗里的卡片不要 hover 上浮动画，保持紧凑 */
+.startpage-vlist {
+  /* List 注入 overflow:auto;这里只收敛滚动条观感 */
+  scrollbar-width: thin;
+}
+/* 单个虚拟行：外层承接 List 给的 top/height,内层卡片撑满并留出行间距 */
+.startpage-vrow {
+  box-sizing: border-box;
+  padding-bottom: 8px;
+}
+.startpage-vrow .startpage-recent-item {
+  height: 100%;
   padding: 10px 14px;
 }
 .startpage-modal-list .startpage-recent-item:hover {
+  /* 弹窗里的卡片不要 hover 上浮，避免在虚拟行里抖动 */
   transform: none;
 }
 

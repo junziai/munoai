@@ -17,7 +17,7 @@ export function ChordBlockInNode(props: NodeProps) {
     { name: "💜 vi-IV-I-V", v: "Am | F | C | G" },
   ];
   return (
-    <NodeShell nodeId={props.id} label="Chord Block In" icon="🎼" color="#eab308" inputs={0} outputs={1}>
+    <NodeShell nodeId={props.id} label="Chord Block In" icon="🎼" color="#eab308" inputs={0} outputs={1} width={280}>
       <div className="sep-node-body"><div className="sep-params">
         <div style={{ fontSize: 10, color: "#eab308", padding: "0 0 6px 2px" }}>手动和弦 → 自动生成旋律/编曲</div>
         <textarea value={chords} onChange={(e)=>updateParams({chords:e.target.value})} rows={2}

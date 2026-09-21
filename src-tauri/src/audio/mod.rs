@@ -1,5 +1,5 @@
 pub mod audio_output;
-pub mod export;
+pub mod fluidsynth;
 pub mod resample;
 pub mod sf2;
 pub mod soundfont;
@@ -599,6 +599,26 @@ pub fn save_wav_f32(path: &Path, buffer: &AudioBuffer) -> Result<()> {
     let mut writer = hound::WavWriter::create(path, spec)
         .map_err(|e| crate::UtaiError::Audio(format!("Failed to create WAV: {}", e)))?;
     for &sample in &buffer.samples {
+        writer.write_sample(sample).map_err(|e| crate::UtaiError::Audio(format!("Write error: {}", e)))?;
+    }
+    writer.finalize().map_err(|e| crate::UtaiError::Audio(format!("Finalize error: {}", e)))?;
+    Ok(())
+}
+
+/// 16-bit writer for PRE-QUANTIZED samples — `apply_dither_16bit` already does
+/// the dithered quantization, so routing through save_wav would quantize twice
+/// (a second rounding pass that discards the dither's benefit). Same `*32767`
+/// symmetric scale as the rest of the codebase.
+pub fn save_wav_i16(path: &Path, samples: &[i16], sample_rate: u32, channels: u16) -> Result<()> {
+    let spec = hound::WavSpec {
+        channels,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec)
+        .map_err(|e| crate::UtaiError::Audio(format!("Failed to create WAV: {}", e)))?;
+    for &sample in samples {
         writer.write_sample(sample).map_err(|e| crate::UtaiError::Audio(format!("Write error: {}", e)))?;
     }
     writer.finalize().map_err(|e| crate::UtaiError::Audio(format!("Finalize error: {}", e)))?;

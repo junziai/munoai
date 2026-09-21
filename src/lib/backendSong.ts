@@ -23,35 +23,67 @@ export interface SongOutput {
   audio_path?: string;
   midi_path?: string;
   lrc_path?: string;
+  abc_path?: string;
+  stems?: Record<string, string>;
+  processing_time_secs?: number;
 }
 
 export interface SongGenRequest {
-  model?: string;
-  song_name?: string;
-  lyrics?: string;
-  prompt?: string;
-  negative_prompt?: string;
-  cot?: string;
-  cfg_scale?: number;
-  num_inference_steps?: number;
+  // Common parameters
+  model: string;
+  song_name: string;
+  lyrics: string;
+  prompt: string;
+  audio_duration: number;
   seed?: number;
-  audio_duration?: number;
-  guidance_scale?: number;
-  shift?: number;
-  bpm?: number;
-  key_scale?: string;
-  time_signature?: string;
-  language?: string;
-  vocal_gender?: string;
-  vocal_type?: string;
-  vocal_range?: string;
-  checkpoint?: string;
-  want_stems?: boolean;
-  want_midi?: boolean;
-  want_lrc?: boolean;
+  cfg_scale?: number;
   format?: string;
-  service_url: string;
   output_dir?: string;
+  ref_audio_input?: string;
+  audio2audio_enable?: boolean;
+  
+  // YuE-2 specific parameters
+  cot?: string;
+  abc?: string;
+  temperature?: number;
+  top_p?: number;
+  top_k?: number;
+  repetition_penalty?: number;
+  penalty_window?: number;
+  min_tokens?: number;
+  max_tokens?: number;
+  ode_steps?: number;
+  ode_method?: string;
+  
+  // ACE-Step specific parameters
+  vram_mode?: string;
+  inference_steps?: number;
+  guidance_scale?: number;
+  audio_format?: string;
+  mp3_bitrate?: string;
+  mp3_sample_rate?: number;
+  task?: string;
+  repaint_start?: number;
+  repaint_end?: number;
+  src_audio_path?: string;
+  /** ACE-Step v1.5 多轨任务（lego/extract/complete）扩展字段 */
+  track_name?: string;
+  complete_track_classes?: string[];
+  audio_cover_strength?: number;
+  edit_target_prompt?: string;
+  edit_target_lyrics?: string;
+  edit_n_min?: number;
+  edit_n_max?: number;
+  edit_n_avg?: number;
+  batch_size?: number;
+  
+  // HeartMuLa specific parameters
+  topk?: number;
+  
+  // Output products (applies to all models)
+  want_midi?: boolean;
+  want_stems?: boolean;
+  want_lrc?: boolean;
 }
 
 // ── Model directory / list / download / delete ──────────────────────────────
@@ -101,4 +133,8 @@ export function songGenerate(req: SongGenRequest): Promise<SongOutput[]> {
 
 export function abcToMidi(abc: string, outPath: string): Promise<string> {
   return invoke<string>("abc_to_midi", { abc, outPath });
+}
+
+export function autoStartService(model: string): Promise<string> {
+  return invoke<string>("auto_start_service", { model });
 }

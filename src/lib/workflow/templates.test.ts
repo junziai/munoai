@@ -103,6 +103,32 @@ describe("buildWorkflow", () => {
       expect(g.sorted.length).toBe(wf.nodes.length);
     }
   });
+
+  it("P2-14 歌曲模板：结构正确且能被图解析器接受", () => {
+    // 词曲一键成歌：歌词源/风格源 → songGen → 输出
+    const l2s = buildWorkflow("lyrics2song", {});
+    expect(l2s.nodes.filter((n) => n.nodeType !== "input").map((n) => n.nodeType))
+      .toEqual(["songLyrics", "songPrompt", "songGen", "output"]);
+    expect(l2s.connections).toContainEqual({ fromNode: "lyr", fromPort: 0, toNode: "gen", toPort: 0 });
+    expect(l2s.connections).toContainEqual({ fromNode: "sty", fromPort: 0, toNode: "gen", toPort: 1 });
+    // 片段重绘：input → songRepaint ← songPrompt → 输出
+    const sr = buildWorkflow("segRepaint", {});
+    expect(sr.connections).toContainEqual({ fromNode: "input", fromPort: 0, toNode: "rep", toPort: 0 });
+    expect(sr.connections).toContainEqual({ fromNode: "rep", fromPort: 0, toNode: "out", toPort: 0 });
+    // 人声转伴奏：songComplete 混音 + 3 声部分轨 → 输出 4 口
+    const v2a = buildWorkflow("vocal2acc", {});
+    expect(v2a.connections.filter((c) => c.fromNode === "comp").map((c) => c.fromPort)).toEqual([0, 1, 2, 3]);
+    // 分轨重建：songStems 四轨 → 输出 4 口
+    const st = buildWorkflow("stemsRebuild", {});
+    expect(st.nodes.find((n) => n.nodeType === "songStems")).toBeTruthy();
+    expect(st.connections.filter((c) => c.fromNode === "st").map((c) => c.fromPort)).toEqual([0, 1, 2, 3]);
+    // 四个模板都能被图解析器接受（无环/连通）
+    for (const t of ["lyrics2song", "segRepaint", "vocal2acc", "stemsRebuild"] as const) {
+      const wf = buildWorkflow(t, {});
+      const g = parseWorkflowGraph(wf);
+      expect(g.sorted.length).toBe(wf.nodes.length);
+    }
+  });
 });
 
 describe("template helpers", () => {

@@ -161,6 +161,21 @@ pub struct AppConfig {
     /// training slower", i.e. a regression we manufactured.
     #[serde(default)]
     pub diagnostic_mode: bool,
+    /// Song generation resident mode — keeps the Python sidecar alive between generations
+    /// to avoid cold-loading ~8GB of models every time. Default OFF (user's explicit request:
+    /// no permanent VRAM occupation). When enabled, the sidecar daemon runs a keepalive loop
+    /// and unloads models to CPU after idle_timeout to release VRAM while keeping the process
+    /// warm (skips Python startup + torch import cost).
+    #[serde(default)]
+    pub song_resident_mode: bool,
+    /// Idle timeout in seconds before unloading models to CPU (releasing VRAM). Only applies
+    /// when song_resident_mode is enabled. Default 300s (5 minutes).
+    #[serde(default = "default_song_idle_timeout")]
+    pub song_resident_idle_timeout: u32,
+}
+
+fn default_song_idle_timeout() -> u32 {
+    300
 }
 
 impl Default for AppConfig {
@@ -173,6 +188,8 @@ impl Default for AppConfig {
             pending_delete_dirs: Vec::new(),
             deleted_since_migration: Vec::new(),
             diagnostic_mode: false,
+            song_resident_mode: false,  // 强制禁用常驻模式，避免自动预加载模型
+            song_resident_idle_timeout: 300,
         }
     }
 }
@@ -1139,6 +1156,51 @@ pub fn set_diagnostic_mode(state: State<'_, Arc<AppState>>, on: bool) -> Result<
         if on { "ENABLED — training runs will be noticeably slower" } else { "disabled" }
     );
     Ok(())
+}
+
+#[tauri::command]
+pub fn get_song_resident_mode(state: State<'_, Arc<AppState>>) -> bool {
+    let cfg = load_config(&state.app_dir).unwrap_or_default();
+    cfg.song_resident_mode
+}
+
+#[tauri::command]
+pub fn set_song_resident_mode(state: State<'_, Arc<AppState>>, enabled: bool) -> Result<(), String> {
+    let mut cfg = load_config(&state.app_dir).unwrap_or_default();
+    cfg.song_resident_mode = enabled;
+    if let Err(e) = save_config(&state.app_dir, &cfg) {
+        tracing::warn!("Failed to save config: {}", e);
+    }
+    tracing::info!(
+        "Song resident mode {} (takes effect on the next song generation)",
+        if enabled { "ENABLED — sidecar stays alive, unloads to CPU after idle timeout" } else { "disabled" }
+    );
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_song_resident_idle_timeout(state: State<'_, Arc<AppState>>) -> u32 {
+    let cfg = load_config(&state.app_dir).unwrap_or_default();
+    cfg.song_resident_idle_timeout
+}
+
+#[tauri::command]
+pub fn set_song_resident_idle_timeout(state: State<'_, Arc<AppState>>, seconds: u32) -> Result<(), String> {
+    let seconds = seconds.max(60);
+    let mut cfg = load_config(&state.app_dir).unwrap_or_default();
+    cfg.song_resident_idle_timeout = seconds;
+    if let Err(e) = save_config(&state.app_dir, &cfg) {
+        tracing::warn!("Failed to save config: {}", e);
+    }
+    tracing::info!("Song resident idle timeout set to {} seconds", seconds);
+    Ok(())
+}
+
+/// 供其他模块（song.rs）读取常驻配置：返回 (是否常驻, 空闲超时秒数)。
+/// load_config 是模块私有的，这里给出唯一的跨模块入口，避免各处重复读 config.json。
+pub fn song_resident_settings(app_dir: &std::path::Path) -> (bool, u32) {
+    let cfg = load_config(app_dir).unwrap_or_default();
+    (cfg.song_resident_mode, cfg.song_resident_idle_timeout.max(60))
 }
 
 #[tauri::command]

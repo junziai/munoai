@@ -28,6 +28,27 @@ export interface InstrumentRenderNote {
   vel: number;
 }
 
+/** wire 上的控制器事件(Rust `RenderCc` 镜像;CC1 颤音 / CC11 表情 / CC64 踏板)。 */
+export interface InstrumentRenderCc {
+  start: number;
+  cc: number;
+  value: number;
+}
+
+/** wire 上的弯音事件(Rust `RenderBend` 镜像;value ∈ [-8192, 8191],0 = 居中)。 */
+export interface InstrumentRenderBend {
+  start: number;
+  value: number;
+}
+
+/** wire 上的分层音源(Rust `RenderLayer` 镜像,camelCase ← serde rename_all)。 */
+export interface InstrumentRenderLayer {
+  fontId: string;
+  presetId: string;
+  gain: number;
+  pan: number;
+}
+
 /** tick(段落相对,480 PPQ)→ 秒。tempo ≤ 0 时按 120 兜底(与编辑器预览同一约定)。 */
 function tickToSec(tick: number, tempo: number): number {
   const bpm = tempo > 0 ? tempo : 120;
@@ -38,7 +59,12 @@ function tickToSec(tick: number, tempo: number): number {
  *  presetName 是纯显示冗余,不进签名(改名不触发重渲染)。 */
 export function instrumentRenderSig(track: Track, seg: Segment, tempo: number): string {
   const sf = track.soundfont;
-  return `ins:${contentSig(seg.content)}|sf:${sf ? `${sf.fontId}/${sf.presetId}` : ""}|bpm:${tempo}`;
+  const layers = (track.soundfontLayers ?? [])
+    .map((l) => `${l.fontId}/${l.presetId}@${l.gain},${l.pan}`)
+    .join(";");
+  // 3-9 引擎参与签名:换引擎 = 换渲染输出,必须重烘焙(fold-away,absent ≡ builtin)。
+  const eng = sf?.backend === "fluidsynth" ? "fluidsynth" : "";
+  return `ins:${contentSig(seg.content)}|sf:${sf ? `${sf.fontId}/${sf.presetId}` : ""}|ly:${layers}|bpm:${tempo}|eng:${eng}`;
 }
 
 /** 乐器轨段落是否需要(重)烘焙:有音符 + 已选音源,且(无烘焙 | 签名漂移)。
@@ -120,7 +146,9 @@ export async function renderInstrumentPart(
       fontId: sf.fontId,
       presetId: sf.presetId,
       notes,
+      layers: track.soundfontLayers ?? [],
       sampleRate: 44100,
+      backend: sf.backend, // 3-9:undefined → None → 内置后端
     });
     const info = await invoke<AudioFileInfo>("load_audio_file", { path: wavPath });
     if (segRef()) {

@@ -20,25 +20,21 @@
 //!   EXPORT_WRITE_FAILED: {detail}
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use serde::Serialize;
 use tauri::State;
 
+use crate::audio::fluidsynth::{
+    audio_preset, exe_path as fluidsynth_exe, render as fluidsynth_render, AudioPreset,
+};
 use crate::AppState;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 工具与音源解析（统一以 models_dir 为根，spawn_blocking 内无需 AppState）
 // ─────────────────────────────────────────────────────────────────────────────
 
-const FLUIDSYNTH_REL: [&str; 4] = ["fluidsynth", "2.5.6", "bin", "fluidsynth.exe"];
 const MUSESCORE_REL: [&str; 4] = ["musescore", "4.7.4", "bin", "MuseScore4.exe"];
 const LEGACY_SOUNDFONT: &str = "MuseScore_General.sf2";
-
-fn fluidsynth_exe(models_dir: &Path) -> Option<PathBuf> {
-    let exe: PathBuf = FLUIDSYNTH_REL.iter().fold(models_dir.to_path_buf(), |acc, p| acc.join(p));
-    if exe.is_file() { Some(exe) } else { None }
-}
 
 fn musescore_exe(models_dir: &Path) -> Option<PathBuf> {
     let exe: PathBuf = MUSESCORE_REL.iter().fold(models_dir.to_path_buf(), |acc, p| acc.join(p));
@@ -256,115 +252,10 @@ pub fn amt_export_tools_status(state: State<'_, AppState>) -> AmtExportToolsStat
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// FluidSynth 渲染核心
+// FluidSynth 渲染核心 —— P3 3-9 通用化：exe 发现 / PATH 注入 / CLI 渲染已提升为
+// audio::fluidsynth 公共模块，与 render_soundfont_notes 的 "fluidsynth" 后端共享
+// 同一份实现；本模块经由顶部 use 以原名继续调用。
 // ─────────────────────────────────────────────────────────────────────────────
-
-struct AudioPreset {
-    sample_rate: u32,
-    format: &'static str,
-    suffix: &'static str,
-}
-
-fn audio_preset(preset: &str) -> AudioPreset {
-    match preset {
-        "compat" => AudioPreset { sample_rate: 44_100, format: "s16", suffix: "16bit-44.1kHz" },
-        _ => AudioPreset { sample_rate: 48_000, format: "s24", suffix: "24bit-48kHz" },
-    }
-}
-
-/// 参考 get_fluidsynth_subprocess_env：bin + lib 目录前置进 PATH，保证同目录 DLL 可见。
-fn fluidsynth_env(exe: &Path) -> std::collections::HashMap<String, String> {
-    let mut env: std::collections::HashMap<String, String> = std::env::vars().collect();
-    let bin_dir = exe.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-    let lib_dir = bin_dir.parent().map(|p| p.join("lib")).unwrap_or_default();
-    let mut entries: Vec<String> = Vec::new();
-    if !bin_dir.as_os_str().is_empty() {
-        entries.push(bin_dir.to_string_lossy().into_owned());
-    }
-    if lib_dir.is_dir() {
-        entries.push(lib_dir.to_string_lossy().into_owned());
-    }
-    if let Some(current) = env.get("PATH") {
-        entries.push(current.clone());
-    }
-    env.insert("PATH".to_string(), entries.join(";"));
-    env
-}
-
-/// 用 FluidSynth 把一个 MIDI 渲染成 WAV。命令行与参考 _synthesize 逐字一致。
-/// 管道用后台线程排空避免 pipe-full 死锁；整体 600s 超时保护（参考实现同值）。
-fn fluidsynth_render(exe: &Path, sf: &Path, midi: &Path, out: &Path, preset: &AudioPreset) -> Result<(), String> {
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("-ni")
-        .arg("-o").arg(format!("audio.file.format={}", preset.format))
-        .arg("-F").arg(out)
-        .arg("-r").arg(preset.sample_rate.to_string())
-        .arg(sf)
-        .arg(midi)
-        .envs(fluidsynth_env(exe))
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(crate::util::CREATE_NO_WINDOW);
-    }
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("EXPORT_RENDER_FAILED: spawn fluidsynth: {e}"))?;
-
-    // 后台线程读尽 stdout/stderr —— FluidSynth 输出很少，但必须排空防止写满管道卡死。
-    fn drain<R: std::io::Read + Send + 'static>(stream: Option<R>) -> Option<std::thread::JoinHandle<()>> {
-        stream.map(|mut reader| {
-            std::thread::spawn(move || {
-                let mut buf = [0u8; 4096];
-                while reader.read(&mut buf).map(|n| n > 0).unwrap_or(false) {}
-            })
-        })
-    }
-    let mut stdout_drain = drain(child.stdout.take());
-    let mut stderr_drain = drain(child.stderr.take());
-    let mut join_drains = || {
-        if let Some(h) = stdout_drain.take() {
-            let _ = h.join();
-        }
-        if let Some(h) = stderr_drain.take() {
-            let _ = h.join();
-        }
-    };
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(600);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if std::time::Instant::now() > deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    join_drains();
-                    return Err("EXPORT_RENDER_FAILED: FluidSynth timed out after 600s".into());
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => {
-                join_drains();
-                return Err(format!("EXPORT_RENDER_FAILED: wait fluidsynth: {e}"));
-            }
-        }
-    };
-    join_drains();
-
-    let rendered = out.is_file() && std::fs::metadata(out).map(|m| m.len() > 0).unwrap_or(false);
-    if !status.success() || !rendered {
-        return Err(format!(
-            "EXPORT_RENDER_FAILED: fluidsynth exit={:?} output_exists={}",
-            status.code(),
-            rendered
-        ));
-    }
-    Ok(())
-}
 
 fn absolutize(p: &str) -> PathBuf {
     let pb = PathBuf::from(p);

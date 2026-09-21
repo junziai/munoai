@@ -4,13 +4,17 @@
 //! (phdr→pbag→pgen / inst→ibag→igen / shdr)。
 //! preset zone(pgen)与 instrument zone(igen)合并成 Region;
 //! preset 层覆盖 instrument 层,keyRange/velRange 取交集。
+//! modulator(pmod/imod)按白名单烘焙进 Region:velocity → initialFilterFc、
+//! CC1 → vibLfoToPitch/modLfoToPitch(3-4);曲线近似线性。
 //! 立体声对(left/right + sampleLink)合并成双声道 SampleData。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::synth::{LoadedInstrument, LoopMode, Region, SampleData};
+use super::synth::{
+    LoadedInstrument, LoopMode, Region, SampleData, sf2_fc_cents_to_hz, sf2_q_cb_to_linear,
+};
 
 /// 生成器操作码(仅本引擎支持的子集)。
 /// 未引用的常量是 SF2 2.04 操作码表的文档性成员,保留以便对照规范。
@@ -40,6 +44,8 @@ mod gen {
     pub const SAMPLE_MODES: u16 = 54;
     pub const SCALE_TUNING: u16 = 56;
     pub const OVERRIDING_ROOT_KEY: u16 = 58;
+    pub const INITIAL_FILTER_FC: u16 = 590;
+    pub const INITIAL_FILTER_Q: u16 = 591;
 }
 
 /// 采样类型(shdr sampleType 低 4 位)。
@@ -84,8 +90,19 @@ struct Gen {
     amount: i16,
 }
 
+/// SF2 modulator 记录(pmod/imod,10 字节/条)。
+/// 3-4 只按 (src, dst) 白名单在 region 构建时烘焙,不做运行时调制引擎。
+struct Mod {
+    src: u16,
+    dst: u16,
+    amount: i16,
+    amt_src: u16,
+    transport: u16,
+}
+
 struct Zone {
     gens: Vec<Gen>,
+    mods: Vec<Mod>,
 }
 
 struct Shdr {
@@ -217,9 +234,31 @@ pub fn parse_sf2(path: &Path) -> Result<Sf2Font, String> {
         p += 38;
     }
 
+    // pmod/imod:10 字节/记录(src, dst, amount, amtSrc, transport)
+    let (pm_s, pm_e) = get(b"pmod");
+    let (im_s, im_e) = get(b"imod");
+    let read_mods = |s: usize, e: usize| -> Vec<Mod> {
+        let mut out = Vec::new();
+        let mut p = s;
+        while p + 10 <= e {
+            out.push(Mod {
+                src: b.u16(p),
+                dst: b.u16(p + 2),
+                amount: b.i16(p + 4),
+                amt_src: b.u16(p + 6),
+                transport: b.u16(p + 8),
+            });
+            p += 10;
+        }
+        out
+    };
+
     // pbag:4 字节/记录(genIdx, modIdx)
     let (pb_s, pb_e) = get(b"pbag");
-    let pbag_idx = |i: usize| b.u16(pb_s + i * 4) as usize;
+    let pbag_pair = |i: usize| -> (usize, usize) {
+        let o = pb_s + i * 4;
+        (b.u16(o) as usize, b.u16(o + 2) as usize)
+    };
 
     // pgen:4 字节/记录
     let (pg_s, pg_e) = get(b"pgen");
@@ -252,7 +291,10 @@ pub fn parse_sf2(path: &Path) -> Result<Sf2Font, String> {
 
     // ibag / igen
     let (ib_s, ib_e) = get(b"ibag");
-    let ibag_idx = |i: usize| b.u16(ib_s + i * 4) as usize;
+    let ibag_pair = |i: usize| -> (usize, usize) {
+        let o = ib_s + i * 4;
+        (b.u16(o) as usize, b.u16(o + 2) as usize)
+    };
     let (ig_s, ig_e) = get(b"igen");
 
     // shdr:46 字节/记录(最后一条 EOS 终端)
@@ -289,14 +331,15 @@ pub fn parse_sf2(path: &Path) -> Result<Sf2Font, String> {
             .unwrap_or_else(|| ibag_count.saturating_sub(1).max(*bag_start));
         let mut zones = Vec::new();
         for bi in *bag_start..bag_end.min(ibag_count) {
-            let g_start = ibag_idx(bi);
-            let g_end = if bi + 1 < ibag_count {
-                ibag_idx(bi + 1)
+            let (g_start, m_start) = ibag_pair(bi);
+            let (g_end, m_end) = if bi + 1 < ibag_count {
+                ibag_pair(bi + 1)
             } else {
-                (ig_e - ig_s) / 4
+                ((ig_e - ig_s) / 4, (im_e - im_s) / 10)
             };
             zones.push(Zone {
                 gens: read_gens(ig_s + g_start * 4, ig_s + g_end * 4),
+                mods: read_mods(im_s + m_start * 10, im_s + m_end * 10),
             });
         }
         inst_zones.push(zones);
@@ -361,16 +404,19 @@ pub fn parse_sf2(path: &Path) -> Result<Sf2Font, String> {
             .get(i + 1)
             .map(|(_, _, _, nb)| *nb)
             .unwrap_or(pbag_count.saturating_sub(1));
-        // preset zones
-        let mut pzones: Vec<Vec<Gen>> = Vec::new();
+        // preset zones(gens + mods)
+        let mut pzones: Vec<(Vec<Gen>, Vec<Mod>)> = Vec::new();
         for bi in *bag_start..bag_end.min(pbag_count) {
-            let g_start = pbag_idx(bi);
-            let g_end = if bi + 1 < pbag_count {
-                pbag_idx(bi + 1)
+            let (g_start, m_start) = pbag_pair(bi);
+            let (g_end, m_end) = if bi + 1 < pbag_count {
+                pbag_pair(bi + 1)
             } else {
-                (pg_e - pg_s) / 4
+                ((pg_e - pg_s) / 4, (pm_e - pm_s) / 10)
             };
-            pzones.push(read_gens(pg_s + g_start * 4, pg_s + g_end * 4));
+            pzones.push((
+                read_gens(pg_s + g_start * 4, pg_s + g_end * 4),
+                read_mods(pm_s + m_start * 10, pm_s + m_end * 10),
+            ));
         }
         if pzones.is_empty() {
             continue;
@@ -378,13 +424,13 @@ pub fn parse_sf2(path: &Path) -> Result<Sf2Font, String> {
         // global zone = 无 instrument gen 的 zone(取第一个)
         let pglobal: &[Gen] = pzones
             .iter()
-            .find(|z| !z.iter().any(|g| g.op == gen::INSTRUMENT))
-            .map(|z| z.as_slice())
+            .find(|(g, _)| !g.iter().any(|g| g.op == gen::INSTRUMENT))
+            .map(|(g, _)| g.as_slice())
             .unwrap_or(&[]);
 
         let mut regions: Vec<Region> = Vec::new();
         let mut samples: Vec<Arc<SampleData>> = Vec::new();
-        for pz in &pzones {
+        for (pz, pmods) in &pzones {
             let Some(inst_idx) = pz.iter().find(|g| g.op == gen::INSTRUMENT).map(|g| g.amount as usize) else {
                 continue;
             };
@@ -539,7 +585,32 @@ pub fn parse_sf2(path: &Path) -> Result<Sf2Font, String> {
                     offset: 0,
                     ..Default::default()
                 };
+                // SF2 modulator 白名单应用(3-4):vel→initialFilterFc(累加 cents)、
+                // CC1→vibLfoToPitch/modLfoToPitch(后写覆盖);amt_src 非零的忽略。
+                // zero 终端记录(src=0)不匹配任何白名单,自然无害。
+                let mut vel2filter_cents = 0.0f32;
+                let mut vib_depth = 50.0f32;
+                for m in pmods.iter().chain(iz.mods.iter()) {
+                    if m.amt_src != 0 {
+                        continue;
+                    }
+                    let is_vel = (m.src & 0x0080) == 0 && (m.src & 0x007F) == 2;
+                    let is_cc1 = (m.src & 0x0080) != 0 && (m.src & 0x007F) == 1;
+                    if is_vel && m.dst == gen::INITIAL_FILTER_FC {
+                        vel2filter_cents += m.amount as f32;
+                    } else if is_cc1 && (m.dst == 0 || m.dst == 1) {
+                        vib_depth = m.amount as f32;
+                    }
+                }
+                region.vel2filter_cents = vel2filter_cents;
+                region.vib_depth_cents = vib_depth;
                 region.attenuation_cb = attenuation;
+                // 低通滤波器(gen 590/591):absolute cents → Hz,Q cB → 线性
+                if let Some(c) = lookup(gen::INITIAL_FILTER_FC) {
+                    region.cutoff_hz = Some(sf2_fc_cents_to_hz(c.max(0) as f32));
+                }
+                region.resonance_q =
+                    sf2_q_cb_to_linear(lookup(gen::INITIAL_FILTER_Q).unwrap_or(0).max(0) as f32);
                 // 采样自带的循环(切好片后的 loop_range)与 zone 循环并存:
                 // zone 显式 loop 优先,否则用采样自带(在 synth 里合成)
                 if region.loop_start.is_none() {
@@ -658,6 +729,19 @@ mod tests {
         v
     }
 
+    /// modulator 记录:10 字节/条(src, dst, amount, amtSrc, transport)。
+    fn mods(list: &[(u16, u16, i16, u16, u16)]) -> Vec<u8> {
+        let mut v = Vec::new();
+        for (src, dst, amt, amt_src, transport) in list {
+            v.extend_from_slice(&src.to_le_bytes());
+            v.extend_from_slice(&dst.to_le_bytes());
+            v.extend_from_slice(&amt.to_le_bytes());
+            v.extend_from_slice(&amt_src.to_le_bytes());
+            v.extend_from_slice(&transport.to_le_bytes());
+        }
+        v
+    }
+
     /// 构造一个最小合法 SF2:1 preset / 1 zone / 1 mono 样本(key 60,无循环)。
     fn minimal_sf2() -> Vec<u8> {
         // INFO
@@ -697,10 +781,14 @@ mod tests {
         inst.extend_from_slice(&rec_name("EOI"));
         inst.extend_from_slice(&1u16.to_le_bytes()); // EOI bagNdx = 1(ibag 记录数)
         ck(&mut pdta, b"inst", &inst);
-        // ibag:bag0(genIdx 0, modIdx 0)+ 终点(genIdx 5, modIdx 1)
-        ck(&mut pdta, b"ibag", &gens(&[(0, 0), (5, 1)]));
-        // imod:1 条全零 terminal
-        ck(&mut pdta, b"imod", &vec![0u8; 10]);
+        // ibag:bag0(genIdx 0, modIdx 0)+ 终点(genIdx 5, modIdx 3 = 2 条 mod + terminal)
+        ck(&mut pdta, b"ibag", &gens(&[(0, 0), (5, 3)]));
+        // imod:vel→initialFilterFc(-1200 cents)+ CC1→vibLfoToPitch(80 cents)+ terminal(3-4)
+        ck(&mut pdta, b"imod", &mods(&[
+            (0x0502, 590, -1200, 0, 0),
+            (0x0081, 1, 80, 0, 0),
+            (0, 0, 0, 0, 0),
+        ]));
         // igen:keyRange(60,60) / sampleID 0 / attack / release / terminal
         ck(&mut pdta, b"igen", &gens(&[
             (43, 15420),  // keyRange lo=60 hi=60
@@ -756,6 +844,9 @@ mod tests {
         let r = &p.regions[0];
         assert_eq!((r.key_lo, r.key_hi), (60, 60));
         assert_eq!(r.keycenter, Some(60));
+        // 3-4:modulator 白名单烘焙进 region
+        assert_eq!(r.vel2filter_cents, -1200.0);
+        assert_eq!(r.vib_depth_cents, 80.0);
         assert_eq!(p.samples[0].frame_count(), 16);
         assert_eq!(p.samples[0].rate, 44100);
         assert!((p.samples[0].left[0] - 0.0).abs() < 1e-6);
