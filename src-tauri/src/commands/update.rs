@@ -38,7 +38,7 @@ use crate::AppState;
 /// pubkey). GitHub's `latest/download` redirect always points at the newest NON-prerelease release,
 /// so publishing a release with a `latest.json` asset is the whole update-push protocol.
 const UPDATE_ENDPOINT: &str =
-    "https://github.com/yasoukyoku/UtaiSynthesizer/releases/latest/download/latest.json";
+    "https://github.com/junziai/munoai/releases/latest/download/latest.json";
 
 /// No-bytes window after which the download attempt is abandoned (same posture as download.rs's
 /// stall watchdog: slow links make progress, dead links don't — never a whole-request timeout,
