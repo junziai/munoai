@@ -120,3 +120,8 @@ test_out.wav
 # IDE / tool caches
 .cache/
 src-tauri/.cache/
+
+# Internal dev docs & AI-tool local config (must never be public)
+.trae/
+.claude/
+docs/superpowers/
