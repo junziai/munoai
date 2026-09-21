@@ -69,7 +69,7 @@ UtaiSynthesizer は歌声合成 DAW（デジタル・オーディオ・ワーク
 
 ### 2.1 ダウンロードとインストール
 
-1. リリースページを開き、最新版のインストーラーをダウンロードします：<https://github.com/yasoukyoku/UtaiSynthesizer/releases>
+1. リリースページを開き、最新版のインストーラーをダウンロードします：<https://github.com/junziai/munoai/releases>
 2. `UtaiSynthesizer_x.y.z_x64-setup.exe` という名前のインストーラーをダウンロードして実行します。
 3. インストーラーは簡体中文 / English / 日本語に対応しています（この言語選択はインストーラー自体にのみ影響し、ソフト内の言語は別途設定します）。
 4. **現在のユーザーのフォルダ**にインストールされるため、管理者権限は不要です。
@@ -1602,8 +1602,8 @@ NVIDIA ユーザー向けの推論高速化ランタイムです（約 1.6 GB、
 
 - **QQ グループ**：[1058227212](https://qun.qq.com/universal-share/share?ac=1&authKey=3uD5AoM8e50y00vhOYOZsa2VI341dBNfr07S2IK9wraewz0rcFHpSzONYJ9QrTP7&busi_data=eyJncm91cENvZGUiOiIxMDU4MjI3MjEyIiwidG9rZW4iOiJONGpqQ2MzM3h3N3BDMVBMRzZiSUFOU05YWnRnbHBxdTZDUElZYlZOSGN3VnhCaEc5eWludlJBYlltK3hkdlFwIiwidWluIjoiMjc2Njc2NDM1NSJ9&data=VyWCaG06iaMLBFcfEx_fjE2Tme2X7YvJsUIUjJ51zk6XymaED6Z6TEC_zOvAdm9q2MbzbYbpuO4ukQHZ1GBHLw&svctype=4&tempid=h5_group_info)
 - **Discord**：<https://discord.com/invite/p3fGh942fJ>
-- **GitHub リポジトリ**：<https://github.com/yasoukyoku/UtaiSynthesizer> —— バグ報告は [Issue](https://github.com/yasoukyoku/UtaiSynthesizer/issues) へ。バージョン番号・再現手順・ログを添えてください（第 13 章参照）
-- **最新版のダウンロード**：<https://github.com/yasoukyoku/UtaiSynthesizer/releases>
+- **GitHub リポジトリ**：<https://github.com/junziai/munoai> —— バグ報告は [Issue](https://github.com/junziai/munoai/issues) へ。バージョン番号・再現手順・ログを添えてください（第 13 章参照）
+- **最新版のダウンロード**：<https://github.com/junziai/munoai/releases>
 
 これらのリンクはすべてソフト内にもあります：タイトルバーの「ヘルプとコミュニティ」メニューです。
 
